@@ -202,6 +202,7 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
 }
 
 // Stream a continuous HTTP GET (optionally with Range) and split into FAT32-friendly parts.
+// TODO(manifest/hashes): track expected parts/sizes/hashes to validate resume beyond size-only.
 static bool streamDownload(const std::string& url,
                            const std::string& authBasic,
                            bool useRange,
@@ -493,13 +494,19 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     // free space check for full ROM upfront (best effort)
     if (!ensureFreeSpace(baseDir, g.sizeBytes)) {
         logLine("Not enough free space for " + g.title);
-        status.lastDownloadError = "Not enough free space";
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.lastDownloadError = "Not enough free space";
+        }
         return false;
     }
 
     if (g.downloadUrl.empty()) {
         logLine("No download URL for " + g.title);
-        status.lastDownloadError = "No download URL";
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.lastDownloadError = "No download URL";
+        }
         return false;
     }
 
@@ -535,9 +542,12 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     }
     if (haveBytes > g.sizeBytes) haveBytes = g.sizeBytes;
 
-    status.currentDownloadSize.store(g.sizeBytes);
-    status.currentDownloadedBytes.store(haveBytes);
-    status.currentDownloadTitle = g.title;
+    {
+        std::lock_guard<std::mutex> lock(status.mutex);
+        status.currentDownloadSize.store(g.sizeBytes);
+        status.currentDownloadedBytes.store(haveBytes);
+        status.currentDownloadTitle = g.title;
+    }
     // Count any already-present bytes toward total downloaded so the bar doesn't regress
     uint64_t creditedExisting = 0;
     if (haveBytes > 0) {
@@ -636,7 +646,10 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
         }
     }
     if (!okStream) {
-        status.lastDownloadError = err.empty() ? "Download failed" : err;
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.lastDownloadError = err.empty() ? "Download failed" : err;
+        }
         logLine("Download failed: " + status.lastDownloadError);
         return false;
     }
@@ -655,14 +668,18 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     logLine("Finalize: moving temp to " + finalName);
     bool okFinal = finalizeParts(tmpDir, finalName);
     if (!okFinal) {
+        std::lock_guard<std::mutex> lock(status.mutex);
         status.lastDownloadError = "Finalize failed";
         return false;
     }
-    // Keep UI counters aligned with the completed file.
-    status.currentDownloadedBytes.store(g.sizeBytes);
-    status.totalDownloadedBytes.store(status.totalDownloadedBytes.load()); // unchanged, already includes current
+    {
+        std::lock_guard<std::mutex> lock(status.mutex);
+        // Keep UI counters aligned with the completed file.
+        status.currentDownloadedBytes.store(g.sizeBytes);
+        status.totalDownloadedBytes.store(status.totalDownloadedBytes.load()); // unchanged, already includes current
+        status.lastDownloadError.clear();
+    }
     logLine("Download complete: " + g.title);
-    status.lastDownloadError.clear();
     return true;
 }
 
@@ -678,39 +695,55 @@ static void workerLoop() {
     Status* st = gCtx.status;
     Config cfg = gCtx.cfg;
     if (!st) return;
-    // NOTE: this thread mutates Status without locks; UI reads are best-effort.
+    // NOTE: this thread mutates Status; use Status::mutex to guard non-atomic fields.
     st->downloadWorkerRunning.store(true);
-    st->lastDownloadFailed.store(false);
-    st->lastDownloadError.clear();
-    st->downloadCompleted = false;
-    st->totalDownloadBytes.store(0);
-    st->totalDownloadedBytes.store(0);
-    for (auto& g : st->downloadQueue) st->totalDownloadBytes.fetch_add(g.sizeBytes);
-    logLine("Worker start, total bytes=" + std::to_string(st->totalDownloadBytes.load()));
-    while (!st->downloadQueue.empty() && !gCtx.stopRequested.load()) {
+    {
+        std::lock_guard<std::mutex> lock(st->mutex);
         st->lastDownloadFailed.store(false);
         st->lastDownloadError.clear();
-        st->currentDownloadIndex = 0;
-        // Prime UI fields for the next item.
-        st->currentDownloadTitle = st->downloadQueue.front().title;
-        st->currentDownloadSize.store(st->downloadQueue.front().sizeBytes);
-        st->currentDownloadedBytes.store(0);
-        if (!downloadOne(st->downloadQueue.front(), *st, cfg)) {
-            logLine("Download failed or stopped for " + st->downloadQueue.front().title);
+        st->downloadCompleted = false;
+        st->totalDownloadBytes.store(0);
+        st->totalDownloadedBytes.store(0);
+        for (auto& g : st->downloadQueue) st->totalDownloadBytes.fetch_add(g.sizeBytes);
+    }
+    logLine("Worker start, total bytes=" + std::to_string(st->totalDownloadBytes.load()));
+    while (true) {
+        Game next;
+        {
+            std::lock_guard<std::mutex> lock(st->mutex);
+            if (st->downloadQueue.empty() || gCtx.stopRequested.load()) break;
+            st->lastDownloadFailed.store(false);
+            st->lastDownloadError.clear();
+            st->currentDownloadIndex = 0;
+            next = st->downloadQueue.front(); // copy
+            // Prime UI fields for the next item.
+            st->currentDownloadTitle = next.title;
+            st->currentDownloadSize.store(next.sizeBytes);
+            st->currentDownloadedBytes.store(0);
+        }
+        if (!downloadOne(next, *st, cfg)) {
+            logLine("Download failed or stopped for " + next.title);
             st->lastDownloadFailed.store(true);
-            // remove failed item so queue can continue to next
-            st->downloadQueue.erase(st->downloadQueue.begin());
-            recomputeTotals(*st);
+            {
+                std::lock_guard<std::mutex> lock(st->mutex);
+                if (!st->downloadQueue.empty()) st->downloadQueue.erase(st->downloadQueue.begin());
+                recomputeTotals(*st);
+            }
             continue;
         }
-        // success: drop from queue
-        st->downloadQueue.erase(st->downloadQueue.begin());
-        recomputeTotals(*st);
+        {
+            std::lock_guard<std::mutex> lock(st->mutex);
+            if (!st->downloadQueue.empty()) st->downloadQueue.erase(st->downloadQueue.begin());
+            recomputeTotals(*st);
+        }
     }
     st->downloadWorkerRunning.store(false);
-    if (st->downloadQueue.empty() && !gCtx.stopRequested.load() && !st->lastDownloadFailed.load()) {
-        st->downloadCompleted = true;
-        logLine("All downloads complete.");
+    {
+        std::lock_guard<std::mutex> lock(st->mutex);
+        if (st->downloadQueue.empty() && !gCtx.stopRequested.load() && !st->lastDownloadFailed.load()) {
+            st->downloadCompleted = true;
+            logLine("All downloads complete.");
+        }
     }
     logLine("Worker done.");
 }

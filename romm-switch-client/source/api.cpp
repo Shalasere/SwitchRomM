@@ -1,6 +1,7 @@
 #include "romm/api.hpp"
 #include "romm/logger.hpp"
 #include "mini/json.hpp"
+// TODO(http): centralize HTTP client with structured errors/timeouts and optional token auth.
 
 #ifndef UNIT_TEST
 #include <switch.h>

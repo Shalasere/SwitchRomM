@@ -352,7 +352,7 @@ static void drawText(SDL_Renderer* r, int x, int y, const std::string& txt, SDL_
 static void renderStatus(SDL_Renderer* renderer, const Status& status) {
     if (!renderer) return;
     // Note: this uses shared Status state updated by input/download worker.
-    // There is no synchronization here; reads are best-effort for UI.
+    // TODO(thread-safety): render should read from a snapshot under Status::mutex.
     if (gViewTraceFrames > 0) {
         romm::logDebug("Render trace view=" + std::string(viewName(status.currentView)) +
                        " selP=" + std::to_string(status.selectedPlatformIndex) +
@@ -826,6 +826,7 @@ int main(int argc, char** argv) {
     // Main loop: poll input -> update state -> render current view
     while (running && appletMainLoop()) {
         bool viewChangedThisFrame = false;
+        // TODO(nav): extract view transitions into a ViewController and align hints with mapping.
         // Adjust selection index based on current view (platforms/roms/queue)
         auto adjustSelection = [&](int dir) {
             if (status.currentView == Status::View::PLATFORMS) {
@@ -966,6 +967,7 @@ int main(int argc, char** argv) {
                     break;
                 case romm::Action::StartDownload:
                     // X in QUEUE: start downloads and show downloading view
+                    // TODO(queue UX): dedupe entries and surface per-item failures/history in UI.
                     if (status.currentView == Status::View::QUEUE && !status.downloadQueue.empty()) {
                         if (status.downloadWorkerRunning.load()) {
                             // Already running: just open the view without resetting counters.
@@ -1025,6 +1027,7 @@ int main(int argc, char** argv) {
             }
         }
 
+        // TODO(async covers): move cover fetch/decode off the render loop; keep placeholder texture.
         // JIT cover loading: when entering or changing selection in DETAIL, load cover; free when leaving.
         if (status.currentView == Status::View::DETAIL) {
             if (status.selectedRomIndex != lastCoverSel) {

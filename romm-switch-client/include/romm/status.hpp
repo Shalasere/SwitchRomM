@@ -4,10 +4,14 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <mutex>
 
 namespace romm {
 
 struct Status {
+    // TODO(thread-safety): use this mutex (or an event queue) to guard shared state between UI and worker.
+    mutable std::mutex mutex;
+
     bool validHost{false};
     bool validCredentials{false};
 
