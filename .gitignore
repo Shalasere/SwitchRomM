@@ -1,0 +1,9 @@
+**/build/
+**/romfs/
+romm-switch-client/build/
+romm-switch-client/config.json
+romm-switch-client/.env
+*.nro
+*.nacp
+*.elf
+*.map

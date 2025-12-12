@@ -1,0 +1,68 @@
+RomM Switch Client log start
+[APP] Startup.
+[APP] romfs mounted.
+[APP] Loaded HD44780 font from romfs (192 glyphs)
+[APP] Joysticks detected: 8
+[APP] Opened controller index 0
+[APP] Using SDL software renderer.
+[APP] Auto-sleep disabled; media playback state set to keep screen on.
+[APP] Config loaded.
+[APP]  server_url=http://your-romm-host:port
+[APP]  download_dir=sdmc:/romm_cache/switch
+[APP]  fat32_safe=true
+[APP] API: fetched platforms (16)
+[APP] View: PLATFORMS
+[UI] Controls slug: [PLATFORMS] A=open platform Y=queue Plus=exit D-Pad=scroll hold
+[SDL] SDL error: Failed loading glGetString: SDL_LoadFunction() not implemented
+[UI] Frame 0 view=0 selP=0 selR=0 plats=16 roms=0
+[SDL] SDL error: Failed loading glGetString: SDL_LoadFunction() not implemented
+[UI] Frame 1 view=0 selP=0 selR=0 plats=16 roms=0
+[SDL] SDL error: Failed loading glGetString: SDL_LoadFunction() not implemented
+[UI] Frame 2 view=0 selP=0 selR=0 plats=16 roms=0
+[SDL] SDL error: Failed loading glGetString: SDL_LoadFunction() not implemented
+[UI] Frame 3 view=0 selP=0 selR=0 plats=16 roms=0
+[SDL] SDL error: Failed loading glGetString: SDL_LoadFunction() not implemented
+[UI] Frame 4 view=0 selP=0 selR=0 plats=16 roms=0
+[INPUT] SDL controller button pressed code=12
+[INPUT] Mapped controller code 12 to action 2
+[INPUT] Input action: 2
+[INPUT] Ignoring SDL_JOYBUTTONDOWN code=15
+[INPUT] SDL controller button pressed code=11
+[INPUT] Mapped controller code 11 to action 1
+[INPUT] Input action: 1
+[INPUT] Ignoring SDL_JOYBUTTONDOWN code=13
+[INPUT] SDL controller button pressed code=1
+[INPUT] Mapped controller code 1 to action 5
+[INPUT] Input action: 5
+[APP] Fetching ROMs for platform id=19
+[APP] Parsed ROMs: 114 first=13 Sentinels Aegis Rim
+[APP]  second=Animal Crossing New Horizons
+[APP]  third=Astral Chain
+[APP] API: fetched games (114) for platform 19
+[APP] Fetched ROMs count=114 first=13 Sentinels Aegis Rim
+[UI] Render trace view=ROMS selP=9 selR=0 selQ=0
+[APP] View: ROMS
+[UI] Render ROMS dbg: count=114 showing=18 start=0 sel=0
+[UI]  ROM[0]=13 Sentinels Aegis Rim
+[UI] Controls slug: [ROMS] A=details B=back Y=queue Plus=exit D-Pad=scroll hold
+[INPUT] Ignoring SDL_JOYBUTTONDOWN code=0
+[UI] Render trace view=ROMS selP=9 selR=0 selQ=0
+[UI] Render ROMS dbg: count=114 showing=18 start=0 sel=0
+[UI]  ROM[0]=13 Sentinels Aegis Rim
+[INPUT] SDL controller button pressed code=12
+[INPUT] Mapped controller code 12 to action 2
+[INPUT] Input action: 2
+[INPUT] Ignoring SDL_JOYBUTTONDOWN code=15
+[UI] Render trace view=ROMS selP=9 selR=1 selQ=0
+[UI] Render ROMS dbg: count=114 showing=18 start=0 sel=1
+[UI]  ROM[0]=13 Sentinels Aegis Rim
+[UI] Render trace view=ROMS selP=9 selR=1 selQ=0
+[UI] Render trace view=ROMS selP=9 selR=1 selQ=0
+[UI] Render trace view=ROMS selP=9 selR=1 selQ=0
+[UI] Render trace view=ROMS selP=9 selR=1 selQ=0
+[UI] Render trace view=ROMS selP=9 selR=1 selQ=0
+[INPUT] SDL controller button pressed code=6
+[INPUT] Mapped controller code 6 to action 9
+[INPUT] Input action: 9
+[INPUT] Ignoring SDL_JOYBUTTONDOWN code=10
+[APP] Exiting main loop. running=0

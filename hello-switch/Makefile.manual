@@ -1,0 +1,58 @@
+# Manual devkitPro/libnx Makefile: no switch_rules magic
+
+DEVKITPRO ?= /opt/devkitpro
+DEVKITA64 ?= $(DEVKITPRO)/devkitA64
+
+# Toolchain
+PREFIX    := $(DEVKITA64)/bin/aarch64-none-elf-
+CC        := $(PREFIX)gcc
+CXX       := $(PREFIX)g++
+AR        := $(PREFIX)ar
+OBJCOPY   := $(PREFIX)objcopy
+
+# Tools
+TOOLS     := $(DEVKITPRO)/tools/bin
+ELF2NRO   := $(TOOLS)/elf2nro
+NACPTOOL  := $(TOOLS)/nacptool
+
+# Project
+TARGET    := hello-switch
+BUILD     := build
+SRC_DIR   := source
+SRC       := $(SRC_DIR)/main.c
+
+# Flags (add -fPIE/-pie for libnx)
+CFLAGS    := -O2 -ffunction-sections -fdata-sections -fPIE -std=gnu11 -D__SWITCH__
+CFLAGS    += -I$(DEVKITPRO)/libnx/include
+CFLAGS    += -I$(DEVKITPRO)/portlibs/switch/include
+LDFLAGS   := -specs=$(DEVKITPRO)/libnx/switch.specs -Wl,-Map,$(TARGET).map -Wl,-pie -fPIE
+LIBDIRS   := -L$(DEVKITPRO)/libnx/lib -L$(DEVKITPRO)/portlibs/switch/lib
+LIBS      := -lnx
+
+# Outputs
+ELF       := $(BUILD)/$(TARGET).elf
+NRO       := $(BUILD)/$(TARGET).nro
+NACP      := $(BUILD)/$(TARGET).nacp
+OBJS      := $(BUILD)/main.o
+
+.PHONY: all clean
+
+all: $(NRO)
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/main.o: $(SRC) | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(ELF): $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(LIBDIRS) -o $@ $^ $(LIBS)
+
+$(NACP):
+	$(NACPTOOL) --create "Hello Switch" "Homebrew" "1.0.0" $@
+
+$(NRO): $(ELF) $(NACP)
+	$(ELF2NRO) $(ELF) $(NRO) --nacp=$(NACP)
+
+clean:
+	rm -rf $(BUILD)
