@@ -39,9 +39,9 @@ make run                  # nxlink to a Switch in netloader mode
 ### Runtime config (.env)
 Put `.env` at `sdmc:/switch/romm_switch_client/.env` (sample):
 ```
-SERVER_URL=http://your-romm-host:port   # HTTP only; TLS not supported by the client
-USERNAME=demo
-PASSWORD=demo
+SERVER_URL=http://YOUR_ROMM_HOST:PORT      # HTTP only; TLS not supported by the client
+USERNAME=your_username
+PASSWORD=your_password
 PLATFORM=switch
 DOWNLOAD_DIR=sdmc:/romm_cache/switch
 HTTP_TIMEOUT_SECONDS=30
