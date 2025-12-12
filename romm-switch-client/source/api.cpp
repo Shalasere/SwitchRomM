@@ -2,7 +2,11 @@
 #include "romm/logger.hpp"
 #include "mini/json.hpp"
 
+#ifndef UNIT_TEST
 #include <switch.h>
+#else
+#include "switch_stubs.hpp"
+#endif
 #include <string>
 #include <vector>
 #include <cstring>
@@ -682,5 +686,25 @@ bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData
     outData.swap(resp.body);
     return true;
 }
+
+#ifdef UNIT_TEST
+namespace romm {
+namespace detail {
+
+bool parseHttpUrlTest(const std::string& url,
+                      std::string& host,
+                      std::string& port,
+                      std::string& path,
+                      std::string& err) {
+    return parseHttpUrl(url, host, port, path, err);
+}
+
+bool decodeChunkedBodyTest(const std::string& body, std::string& decoded) {
+    return decodeChunkedBody(body, decoded);
+}
+
+} // namespace detail
+} // namespace romm
+#endif
 
 } // namespace romm

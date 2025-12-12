@@ -6,7 +6,7 @@ This repo has two targets:
 
 ## Toolchain (Windows / devkitPro MSYS)
 1) Install devkitPro from https://devkitpro.org.  
-2) Open the “MSYS2 / MinGW 64-bit for devkitPro” shell.  
+2) Open the "MSYS2 / MinGW 64-bit for devkitPro" shell.  
 3) Install/update packages:
    ```sh
    pacman -Syu
@@ -41,7 +41,7 @@ make run                  # nxlink to a Switch in netloader mode
 ### Runtime config (.env)
 Place at `sdmc:/switch/romm_switch_client/.env` (sample):
 ```
-SERVER_URL=http://your-romm-host:port
+SERVER_URL=http://your-romm-host:port   # HTTP only; TLS not supported by the client
 USERNAME=demo
 PASSWORD=demo
 PLATFORM=switch
@@ -52,17 +52,43 @@ LOG_LEVEL=info          # debug|info|warn|error
 ```
 `config.json` remains supported but `.env` is preferred.
 
+### Docs
+- `docs/config.md` — config keys, defaults, SD paths.
+- `docs/controls.md` — current controller mapping.
+- `docs/downloads.md` — download pipeline and layout.
+- `docs/logging.md` — logging behavior and levels.
+
+### Controls (current mapping)
+- D-Pad: navigate lists
+- A (right): Back
+- B (bottom): Select/confirm
+- X (top): Open queue
+- Y (left): Start downloads (from queue)
+- Plus/Start: Quit
+Mappings are fixed in `source/input.cpp` (Nintendo-style layout); UI hints match these bindings.
+
 ### Current client features
-- SDL2 1280x720 UI: platforms → ROMs → detail, queue, downloading, error views.
+- SDL2 1280x720 UI: platforms -> ROMs -> detail, queue, downloading, error views.
 - RomM API integration: fetch platforms/ROMs, then per-ROM detail fetch to pick a specific file_id (.xci/.nsp).
 - Downloads: single HTTP GET per ROM, client-side FAT32/DBI splitting, resume when server supports Range, temp folder isolation, final archive-bit set on directories.
+- Networking: HTTP only (no TLS); intended for trusted LAN or for deployments where HTTPS is terminated upstream of RomM.
 - Logging: leveled (`LOG_LEVEL`); debug adds verbose UI/HTTP traces.
-- Font: HD44780 bitmap font loaded from `romfs/HD44780_font.txt` with a custom macron glyph for Ō/ō.
+- Font: HD44780 bitmap font loaded from `romfs/HD44780_font.txt` with a custom macron glyph for O/o.
 
 ## Repo layout
-- `hello-switch/` – minimal libnx sample.
-- `romm-switch-client/` – full client sources (SDL, downloader, config, logging, docs in `docs/`).
-- `.gitignore` – shared ignores.
+- `hello-switch/` - minimal libnx sample.
+- `romm-switch-client/` - full client sources (SDL, downloader, config, logging, docs in `docs/`).
+- `.gitignore` - shared ignores.
+
+## Tests (host)
+- Location: `tests/`
+- Build/run (requires a host C++17 compiler, not devkitPro):
+  ```sh
+  cd tests
+  make
+  ./romm_tests
+  ```
+Tests exercise HTTP URL parsing and chunked decoding in `api.cpp` using UNIT_TEST stubs (no Switch libs needed).
 
 ## Troubleshooting
 - `switch_rules` missing or link errors: ensure `DEVKITPRO` is set and packages are current (`pacman -Syu devkitA64 switch-dev switch-tools`).
