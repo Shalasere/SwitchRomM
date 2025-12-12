@@ -4,6 +4,8 @@ romm-switch-client/build/
 romm-switch-client/config.json
 romm-switch-client/.env
 romm-switch-client/log.txt
+romm-switch-client/tests/romm_tests
+romm-switch-client/tests/romm_tests.exe
 *.nro
 *.nacp
 *.elf

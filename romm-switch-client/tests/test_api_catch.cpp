@@ -27,6 +27,13 @@ TEST_CASE("parseHttpUrl rejects https") {
     REQUIRE_FALSE(err.empty());
 }
 
+TEST_CASE("parseHttpUrl missing host fails") {
+    std::string host, port, path, err;
+    bool ok = romm::parseHttpUrl("http:///path", host, port, path, err);
+    REQUIRE_FALSE(ok);
+    REQUIRE_FALSE(err.empty());
+}
+
 TEST_CASE("decodeChunkedBody valid") {
     std::string decoded;
     std::string body = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
@@ -55,6 +62,22 @@ TEST_CASE("decodeChunkedBody missing final CRLF") {
     std::string decoded;
     // Missing trailing CRLF after zero chunk
     std::string body = "1\r\na\r\n0\r\n";
+    bool ok = romm::decodeChunkedBody(body, decoded);
+    REQUIRE_FALSE(ok);
+}
+
+TEST_CASE("decodeChunkedBody incomplete data fails") {
+    std::string decoded;
+    // Declares 4 bytes, only 2 provided
+    std::string body = "4\r\nWi\r\n0\r\n\r\n";
+    bool ok = romm::decodeChunkedBody(body, decoded);
+    REQUIRE_FALSE(ok);
+}
+
+TEST_CASE("decodeChunkedBody bad CRLF after chunk") {
+    std::string decoded;
+    // No CRLF after data
+    std::string body = "1\r\naXX0\r\n\r\n";
     bool ok = romm::decodeChunkedBody(body, decoded);
     REQUIRE_FALSE(ok);
 }
