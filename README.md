@@ -1,66 +1,70 @@
-# Switch Homebrew Starter
+# Switch Homebrew Starter + RomM Switch Client
 
-This repo now holds a canonical libnx “hello-switch” sample to verify a fresh devkitPro setup before starting the real app.
+This repo has two targets:
+- `hello-switch/`: a minimal libnx sample to verify your devkitPro toolchain.
+- `romm-switch-client/`: SDL2/libnx RomM downloader client (current focus).
 
-## Fresh setup (Windows / devkitPro MSYS)
-1) Install devkitPro from https://devkitpro.org (choose the installer).  
-2) Open the “MSYS2 / MinGW 64-bit for devkitPro” shell from the Start menu.  
-3) Update/install toolchain packages:
+## Toolchain (Windows / devkitPro MSYS)
+1) Install devkitPro from https://devkitpro.org.  
+2) Open the “MSYS2 / MinGW 64-bit for devkitPro” shell.  
+3) Install/update packages:
    ```sh
    pacman -Syu
    pacman -S devkitA64 switch-dev switch-tools
    ```
-4) Verify env in that shell:
+4) Verify:
    ```sh
    echo $DEVKITPRO              # expect /opt/devkitpro
    aarch64-none-elf-gcc --version
    ls $DEVKITPRO/libnx/switch_rules
    ```
-   If `DEVKITPRO` is empty, run `source /etc/profile.d/devkit-env.sh` or restart the devkitPro shell.
+If `DEVKITPRO` is empty, `source /etc/profile.d/devkit-env.sh` or restart the devkitPro shell.
 
-macOS/Linux: follow the devkitPro pacman bootstrap from the docs, then install the same packages (`devkitA64 switch-dev switch-tools`) and run the same checks.
+macOS/Linux: use the devkitPro pacman bootstrap, then install the same packages.
 
-## Build and run the sample
+## Build and run (hello-switch)
 ```sh
 cd hello-switch
-make clean    # optional
-make          # builds build/hello-switch.nro
+make clean   # optional
+make         # build/hello-switch.nro
+make run     # sends via nxlink if hbmenu netloader (Y) is active
+```
+Manual deploy: copy `build/hello-switch.nro` to `sd:/switch/hello-switch/hello-switch.nro`.
 
-# Optional: send over network if hbmenu is in netloader mode (press Y)
-make run
+## Build and run (romm-switch-client)
+```sh
+cd romm-switch-client
+make clean && make        # produces romm-switch-client.nro
+make run                  # nxlink to a Switch in netloader mode
 ```
 
-## Deploy to SD card
-Copy `hello-switch/build/hello-switch.nro` to:
-- `sd:/switch/hello-switch/hello-switch.nro`
-Then launch hbmenu and run it.
+### Runtime config (.env)
+Place at `sdmc:/switch/romm_switch_client/.env` (sample):
+```
+SERVER_URL=http://your-romm-host:port
+USERNAME=demo
+PASSWORD=demo
+PLATFORM=switch
+DOWNLOAD_DIR=sdmc:/romm_cache/switch
+HTTP_TIMEOUT_SECONDS=30
+FAT32_SAFE=true
+LOG_LEVEL=info          # debug|info|warn|error
+```
+`config.json` remains supported but `.env` is preferred.
+
+### Current client features
+- SDL2 1280x720 UI: platforms → ROMs → detail, queue, downloading, error views.
+- RomM API integration: fetch platforms/ROMs, then per-ROM detail fetch to pick a specific file_id (.xci/.nsp).
+- Downloads: single HTTP GET per ROM, client-side FAT32/DBI splitting, resume when server supports Range, temp folder isolation, final archive-bit set on directories.
+- Logging: leveled (`LOG_LEVEL`); debug adds verbose UI/HTTP traces.
+- Font: HD44780 bitmap font loaded from `romfs/HD44780_font.txt` with a custom macron glyph for Ō/ō.
 
 ## Repo layout
-- `hello-switch/` — minimal console “Hello, Switch” sample (libnx only).  
-- `romm-switch-client/` — new SDL2-based skeleton for the RomM downloader client.  
-- `.gitignore` — ignores build artifacts across subdirectories.
-
-## RomM Switch Client (work in progress)
-- Build:  
-  ```sh
-  cd romm-switch-client
-  make
-  ```
-- Config expected at `sdmc:/switch/romm_switch_client/.env`, e.g.:
-  ```json
-  SERVER_URL=http://192.168.1.100:8080
-  USERNAME=demo
-  PASSWORD=demo
-  PLATFORM=switch
-  DOWNLOAD_DIR=sdmc:/romm_cache/switch
-  API_TOKEN=
-  HTTP_TIMEOUT_SECONDS=30
-  FAT32_SAFE=true
-  ```
-- A JSON config (`config.json`) is still accepted for compatibility, but `.env` is preferred.
-- Current state: SDL2 window + dummy platform/ROM lists, config parsing, basic input, placeholder download view. Networking and real downloads still to be implemented.
+- `hello-switch/` – minimal libnx sample.
+- `romm-switch-client/` – full client sources (SDL, downloader, config, logging, docs in `docs/`).
+- `.gitignore` – shared ignores.
 
 ## Troubleshooting
-- `switch_rules` not found: ensure `DEVKITPRO` is set and `$(DEVKITPRO)/libnx/switch_rules` exists; confirm you’re in the devkitPro MSYS shell.  
-- TLS or PIE/link errors: make sure you’re on current devkitA64/libnx (`pacman -Syu`), and use the canonical Makefile (not the manual one).  
-- `make run` fails: install `switch-tools` (`nxlink`), ensure hbmenu netloader is active and the Switch is reachable on your LAN.  
+- `switch_rules` missing or link errors: ensure `DEVKITPRO` is set and packages are current (`pacman -Syu devkitA64 switch-dev switch-tools`).
+- `make run` fails: install `switch-tools` (`nxlink`), ensure hbmenu netloader is active and the Switch is reachable on LAN.
+- Logging empty: check `LOG_LEVEL` in `.env` and that `sdmc:/switch/romm_switch_client/` exists and is writable.
