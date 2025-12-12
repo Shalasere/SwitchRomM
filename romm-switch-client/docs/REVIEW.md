@@ -54,3 +54,6 @@ Severity: [H]=High, [M]=Medium, [L]=Low. File refs approximate.
 - Re-check free space per part; handle write errors.
 - Refactor renderStatus into per-view functions; wrap sockets/files in RAII helpers.
 - Expand inline code comments (partially done) to orient new contributors.
+
+## Credits / Inspiration
+- Concepts and flow informed by the RomM muOS client: https://github.com/rommapp/muos-app
