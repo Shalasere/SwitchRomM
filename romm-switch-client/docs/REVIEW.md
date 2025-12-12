@@ -8,6 +8,7 @@ Last updated: 2025-12-12 (file_id downloads, macron UTF-8 fix, resume counter fi
 - **State**: `include/romm/status.hpp` - shared UI/download state. `include/romm/models.hpp` - Platform/Game. `include/romm/config.hpp` - server/auth/download_dir/fat32_safe.
 - **Input**: `source/input.cpp` - SDL controller mapping (A=Back, B=Select, X=Queue, Y=Start Download, Plus=Quit; Nintendo layout) with debounce; raw JOY events ignored; log_level read from .env (upper/lower accepted).
 - **Data/API**: `source/api.cpp` - minimal HTTP GET over sockets (Basic auth), parses JSON via `mini/json.hpp`; fetches `/api/roms/{id}` and selects `.xci/.nsp` via `file_id` (no hidden_folder zips), builds `/content/<fs_name>?file_ids=<id>`; Range preflight probes support.
+- **Covers**: cover_url parsed from list or detailed ROM, relative URLs prefixed with serverUrl; fetch/texture upload still to be verified on device (TODO: make cover loading reliable in DETAIL view).
 - **Downloader**: `source/downloader.cpp` - background worker downloads queue items sequentially; FAT32-safe parts (0xFFFF0000 bytes); temp dirs from truncated title/fsName; skips completed parts; deletes partial fragments; single-part finalize has rename/copy fallback; multi-part finalize sets concatenation/archive bit for DBI; queue not locked (overall % can dip briefly if you enqueue mid-run). Resume keeps overall/current in sync after retries; uses one GET per ROM with large recv buffer.
 
 ## Logic Flows (per view)
