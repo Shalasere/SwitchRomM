@@ -3,6 +3,7 @@
 romm-switch-client/build/
 romm-switch-client/config.json
 romm-switch-client/.env
+romm-switch-client/log.txt
 *.nro
 *.nacp
 *.elf
