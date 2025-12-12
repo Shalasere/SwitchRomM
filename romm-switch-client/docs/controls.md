@@ -8,4 +8,4 @@ Current Nintendo-style mapping (fixed in `source/input.cpp`):
 - Y (left): Start downloads (from queue)
 - Plus / Start: Quit
 
-UI hints are intended to match these bindings. If you change mappings in code, update the hints and README accordingly.
+UI hints match these bindings. If you change mappings, update hints/README too.

@@ -1,8 +1,8 @@
 # Switch Homebrew Starter + RomM Switch Client
 
-This repo has two targets:
-- `hello-switch/`: a minimal libnx sample to verify your devkitPro toolchain.
-- `romm-switch-client/`: SDL2/libnx RomM downloader client (current focus).
+Two things here:
+- `hello-switch/`: minimal libnx sample to check your devkitPro setup.
+- `romm-switch-client/`: SDL2/libnx RomM downloader (the one you want).
 
 ## Toolchain (Windows / devkitPro MSYS)
 1) Install devkitPro from https://devkitpro.org.  
@@ -18,9 +18,7 @@ This repo has two targets:
    aarch64-none-elf-gcc --version
    ls $DEVKITPRO/libnx/switch_rules
    ```
-If `DEVKITPRO` is empty, `source /etc/profile.d/devkit-env.sh` or restart the devkitPro shell.
-
-macOS/Linux: use the devkitPro pacman bootstrap, then install the same packages.
+If `DEVKITPRO` is empty, `source /etc/profile.d/devkit-env.sh` or restart the devkitPro shell. macOS/Linux: use the devkitPro pacman bootstrap, then install the same packages.
 
 ## Build and run (hello-switch)
 ```sh
@@ -39,7 +37,7 @@ make run                  # nxlink to a Switch in netloader mode
 ```
 
 ### Runtime config (.env)
-Place at `sdmc:/switch/romm_switch_client/.env` (sample):
+Put `.env` at `sdmc:/switch/romm_switch_client/.env` (sample):
 ```
 SERVER_URL=http://your-romm-host:port   # HTTP only; TLS not supported by the client
 USERNAME=demo
@@ -50,7 +48,7 @@ HTTP_TIMEOUT_SECONDS=30
 FAT32_SAFE=true
 LOG_LEVEL=info          # debug|info|warn|error
 ```
-`config.json` remains supported but `.env` is preferred.
+`config.json` also works, but `.env` is preferred.
 
 ### Docs
 - `docs/config.md` — config keys, defaults, SD paths.
@@ -65,15 +63,15 @@ LOG_LEVEL=info          # debug|info|warn|error
 - X (top): Open queue
 - Y (left): Start downloads (from queue)
 - Plus/Start: Quit
-Mappings are fixed in `source/input.cpp` (Nintendo-style layout); UI hints match these bindings.
+Mappings are fixed in `source/input.cpp` (Nintendo layout); UI hints match.
 
 ### Current client features
-- SDL2 1280x720 UI: platforms -> ROMs -> detail, queue, downloading, error views.
-- RomM API integration: fetch platforms/ROMs, then per-ROM detail fetch to pick a specific file_id (.xci/.nsp).
-- Downloads: single HTTP GET per ROM, client-side FAT32/DBI splitting, resume when server supports Range, temp folder isolation, final archive-bit set on directories.
-- Networking: HTTP only (no TLS); intended for trusted LAN or for deployments where HTTPS is terminated upstream of RomM.
-- Logging: leveled (`LOG_LEVEL`); debug adds verbose UI/HTTP traces.
-- Font: HD44780 bitmap font loaded from `romfs/HD44780_font.txt` with a custom macron glyph for O/o.
+- SDL2 UI (1280x720): platforms -> ROMs -> detail, queue, downloading, error.
+- RomM API: lists platforms/ROMs, then fetches per-ROM file_id (.xci/.nsp).
+- Downloads: one HTTP GET per ROM, FAT32/DBI splits, Range resume, temp isolation, archive bit set.
+- Networking: HTTP only (no TLS); run on trusted LAN or put TLS in front of RomM.
+- Logging: leveled (`LOG_LEVEL`); debug is noisy.
+- Font: HD44780 bitmap font from `romfs/HD44780_font.txt` with macron glyph.
 
 ## Repo layout
 - `hello-switch/` - minimal libnx sample.
@@ -82,13 +80,18 @@ Mappings are fixed in `source/input.cpp` (Nintendo-style layout); UI hints match
 
 ## Tests (host)
 - Location: `tests/`
-- Build/run (requires a host C++17 compiler, not devkitPro):
+- Build/run (host C++17 compiler + `make`, not devkitPro):
   ```sh
   cd tests
-  make
-  ./romm_tests
+  make                 # uses host g++/make; run from MSYS2 MinGW64 on Windows
+  ./romm_tests         # Catch2 runner; use -s or --list-tests for detail
   ```
-Tests exercise HTTP URL parsing and chunked decoding in `api.cpp` using UNIT_TEST stubs (no Switch libs needed).
+Tests cover HTTP-only URL parsing (defaults + rejects https) and strict chunked decoding (valid/malformed, extensions, missing CRLF). No Switch libs needed.
+- Windows (MSYS2/MinGW64): install host tools if missing:
+  ```
+  pacman -S gcc make
+  ```
+Use the **MSYS2 MinGW64** shell (not PowerShell/MSYS). Override compiler if needed: `CXX=/usr/bin/g++ make`.
 
 ## Troubleshooting
 - `switch_rules` missing or link errors: ensure `DEVKITPRO` is set and packages are current (`pacman -Syu devkitA64 switch-dev switch-tools`).

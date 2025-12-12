@@ -1,12 +1,12 @@
 # Downloads
 
 ### How it works
-- One streaming HTTP GET per ROM. We stop exactly at Content-Length. If preflight sees `Accept-Ranges: bytes`, we attempt resume of partially present data; otherwise the ROM restarts on interruption. **HTTP only; no TLS.** Use on a trusted LAN or terminate TLS in front of RomM.
-- Client-side split into FAT32/DBI format: parts of size `0xFFFF0000` (00, 01, 02 ...) inside a temp dir.
-- Temps live under `<download_dir>/temp/<safe-12>.tmp/00.part`. After full download we:
-  - **Single-part**: rename/copy `00.part` to `<download_dir>/<Title or fsName>.<ext>` with a copy fallback if the SD rename fails (we log strerror); then the temp folder is removed.
-  - **Multi-part**: rename `.part` -> `00/01...`, move the temp dir to `<download_dir>/<Title or fsName>.<ext>/`, and set the concatenation/archive bit so DBI treats it as one title.
-- File selection: we always fetch `/api/roms/{id}` and pick the best `.xci/.nsp` from `files[]`, building `/api/roms/{id}/content/<fs_name>?file_ids=<id>`. We do **not** use hidden-folder zip downloads.
+- One streaming HTTP GET per ROM. We stop at Content-Length. If preflight sees `Accept-Ranges: bytes`, we resume partial data; otherwise the ROM restarts. **HTTP only; no TLS.** Use on trusted LAN or put TLS in front of RomM.
+- Client-side split into FAT32/DBI parts: `0xFFFF0000` (00, 01, 02 ...) inside a temp dir.
+- Temps live under `<download_dir>/temp/<safe-12>.tmp/00.part`. After full download:
+  - **Single-part**: rename/copy `00.part` to `<download_dir>/<Title or fsName>.<ext>`; temp folder removed.
+  - **Multi-part**: rename `.part` -> `00/01...`, move temp to `<download_dir>/<Title or fsName>.<ext>/`, set archive bit so DBI treats it as one title.
+- File selection: fetch `/api/roms/{id}`, pick best `.xci/.nsp` from `files[]`, build `/api/roms/{id}/content/<fs_name>?file_ids=<id>`. No hidden-folder zips.
 
 ### HUD
 - Shows Current and Overall progress. When all files are finalized, HUD switches to "Downloads complete".

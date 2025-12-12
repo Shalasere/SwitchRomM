@@ -21,7 +21,7 @@ int main() {
 
     {
         std::string host, port, path, err;
-        bool ok = romm::detail::parseHttpUrlTest("http://example.com:8080/path?x=1", host, port, path, err);
+        bool ok = romm::parseHttpUrl("http://example.com:8080/path?x=1", host, port, path, err);
         t.expect(ok, "parseHttpUrl http ok");
         t.expect(host == "example.com", "parseHttpUrl host");
         t.expect(port == "8080", "parseHttpUrl port");
@@ -30,7 +30,7 @@ int main() {
 
     {
         std::string host, port, path, err;
-        bool ok = romm::detail::parseHttpUrlTest("https://bad.com", host, port, path, err);
+        bool ok = romm::parseHttpUrl("https://bad.com", host, port, path, err);
         t.expect(!ok, "parseHttpUrl rejects https");
         t.expect(!err.empty(), "parseHttpUrl https err set");
     }
@@ -38,7 +38,7 @@ int main() {
     {
         std::string decoded;
         std::string body = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-        bool ok = romm::detail::decodeChunkedBodyTest(body, decoded);
+        bool ok = romm::decodeChunkedBody(body, decoded);
         t.expect(ok, "decodeChunkedBody valid");
         t.expect(decoded == "Wikipedia", "decodeChunkedBody content");
     }
@@ -46,7 +46,7 @@ int main() {
     {
         std::string decoded;
         std::string body = "4\r\nWiki\r\nZ\r\nbad\r\n0\r\n\r\n"; // malformed chunk size
-        bool ok = romm::detail::decodeChunkedBodyTest(body, decoded);
+        bool ok = romm::decodeChunkedBody(body, decoded);
         t.expect(!ok, "decodeChunkedBody malformed");
     }
 

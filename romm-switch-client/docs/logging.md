@@ -1,15 +1,15 @@
 # Logging
 
-The client writes logs to `sdmc:/switch/romm_switch_client/log.txt`, mirrors to stdout/nxlink, and issues a debug SVC string so you can see output without nxlink.
+Logs go to `sdmc:/switch/romm_switch_client/log.txt`, mirrored to stdout/nxlink, and a debug SVC string so you can see output without nxlink.
 
-- Default level: `info`. Configure via `.env` or `config.json` with `log_level=debug|info|warn|error`.
-- Tags: `[APP]` core lifecycle (default for most logs), `[API]` API helper debug/info, `[DL]` downloader heartbeat/finalize, `[UI]` render traces, `[SDL]` SDL init issues.
-- High-chatter debug entries (render traces, download heartbeats, per-file listings) only emit when `log_level=debug`.
-- Info-level essentials kept: startup, config echo, API fetch counts, queue actions, download start/finalize/results. Input/controller codes stay at debug to reduce noise.
+- Default: `info`. Set `log_level=debug|info|warn|error` in `.env`/`config.json`.
+- Tags: `[APP]` lifecycle (default), `[API]` API info/debug, `[DL]` download heartbeat/finalize, `[UI]` render traces, `[SDL]` SDL init issues.
+- Debug-only noise (render traces, download heartbeats, per-file listings) only when `log_level=debug`.
+- Info keeps startup, config echo, API counts, queue actions, download start/finalize/results. Input/controller codes stay at debug to keep logs readable.
 
 Environment example (`sdmc:/switch/romm_switch_client/.env`):
 ```
 log_level=info
 ```
 
-Tip: set `log_level=debug` only when diagnosing downloads/UI; keep `info` to reduce SD writes and keep logs readable.
+Tip: use `debug` only when diagnosing; keep `info` to reduce SD writes and keep logs readable.

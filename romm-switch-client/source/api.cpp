@@ -14,10 +14,12 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#ifndef UNIT_TEST
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <sys/time.h>
+#endif
 
 namespace romm {
 
@@ -58,11 +60,11 @@ static std::string urlEncode(const std::string& in) {
     return oss.str();
 }
 
-static bool parseHttpUrl(const std::string& url,
-                         std::string& host,
-                         std::string& portStr,
-                         std::string& path,
-                         std::string& err)
+bool parseHttpUrl(const std::string& url,
+                  std::string& host,
+                  std::string& portStr,
+                  std::string& path,
+                  std::string& err)
 {
     if (url.rfind("http://", 0) != 0) {
         err = "Only http:// URLs are supported (TLS not implemented)";
@@ -98,7 +100,7 @@ static bool parseHttpUrl(const std::string& url,
     return true;
 }
 
-static bool decodeChunkedBody(const std::string& body, std::string& decoded) {
+bool decodeChunkedBody(const std::string& body, std::string& decoded) {
     decoded.clear();
     size_t pos = 0;
     while (pos < body.size()) {
@@ -119,9 +121,17 @@ static bool decodeChunkedBody(const std::string& body, std::string& decoded) {
         while (!lenLine.empty() && isspace(static_cast<unsigned char>(lenLine.back())))
             lenLine.pop_back();
 
-        long chunkSize = std::strtol(lenLine.c_str(), nullptr, 16);
-        if (chunkSize <= 0) {
-            // zero chunk or invalid; we're done
+        char* endptr = nullptr;
+        errno = 0;
+        long chunkSize = std::strtol(lenLine.c_str(), &endptr, 16);
+        bool badNumber = (endptr == lenLine.c_str()) || (errno == ERANGE);
+        if (badNumber) {
+            return false;
+        }
+        if (chunkSize == 0) {
+            // Require trailing CRLF after the zero-size chunk.
+            if (lineEnd + 4 > body.size()) return false;
+            if (body[lineEnd + 2] != '\r' || body[lineEnd + 3] != '\n') return false;
             return true;
         }
         pos = lineEnd + 2; // skip CRLF
@@ -139,6 +149,7 @@ static bool decodeChunkedBody(const std::string& body, std::string& decoded) {
     return true;
 }
 
+#ifndef UNIT_TEST
 // Low-level HTTP request: no JSON assumptions.
 // Returns true if we got *any* HTTP response (even 4xx/5xx).
 // resp.statusCode will be 0 on protocol/parse failure.
@@ -284,6 +295,18 @@ static bool httpRequest(const std::string& method,
 
     return true;
 }
+#else
+// Stubbed httpRequest for UNIT_TEST builds (network not exercised).
+static bool httpRequest(const std::string&,
+                        const std::string&,
+                        const std::vector<std::pair<std::string, std::string>>&,
+                        int,
+                        HttpResponse&,
+                        std::string& err) {
+    err = "httpRequest not available in UNIT_TEST build";
+    return false;
+}
+#endif
 
 // Simple retry wrapper for JSON GET requests.
 // Retries on transport errors/timeouts, not on HTTP 4xx.
@@ -686,25 +709,5 @@ bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData
     outData.swap(resp.body);
     return true;
 }
-
-#ifdef UNIT_TEST
-namespace romm {
-namespace detail {
-
-bool parseHttpUrlTest(const std::string& url,
-                      std::string& host,
-                      std::string& port,
-                      std::string& path,
-                      std::string& err) {
-    return parseHttpUrl(url, host, port, path, err);
-}
-
-bool decodeChunkedBodyTest(const std::string& body, std::string& decoded) {
-    return decodeChunkedBody(body, decoded);
-}
-
-} // namespace detail
-} // namespace romm
-#endif
 
 } // namespace romm
