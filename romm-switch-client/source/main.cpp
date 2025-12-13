@@ -680,7 +680,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         SDL_RenderFillRect(renderer, &listBg);
         drawText(renderer, 64, 70, "Total size: " + humanSize(total), fg, 2);
         if (snap.downloadQueue.empty()) {
-            std::string msg = snap.downloadCompleted ? "All downloads complete." : "Queue empty. Press B in detail to add.";
+            std::string msg = snap.downloadCompleted ? "All downloads complete." : "Queue empty. Press A in detail to add.";
             drawText(renderer, 64, 120, msg, fg, 2);
         }
         for (size_t i = 0; i < visible; ++i) {
