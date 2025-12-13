@@ -108,6 +108,12 @@ bool loadConfig(Config& outCfg, std::string& outError) {
         return false;
     }
 
+    // Enforce http-only for now (TLS not implemented).
+    if (outCfg.serverUrl.rfind("https://", 0) == 0) {
+        outError = "https:// not supported; use http:// or a local TLS terminator.";
+        return false;
+    }
+
     return true;
 }
 

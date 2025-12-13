@@ -351,8 +351,8 @@ static void drawText(SDL_Renderer* r, int x, int y, const std::string& txt, SDL_
 // Views: PLATFORMS, ROMS, DETAIL, QUEUE, DOWNLOADING, ERROR.
 static void renderStatus(SDL_Renderer* renderer, const Status& status) {
     if (!renderer) return;
-    // Note: this uses shared Status state updated by input/download worker.
-    // TODO(thread-safety): render should read from a snapshot under Status::mutex.
+    // Note: guard shared Status state while reading.
+    std::lock_guard<std::mutex> lock(status.mutex);
     if (gViewTraceFrames > 0) {
         romm::logDebug("Render trace view=" + std::string(viewName(status.currentView)) +
                        " selP=" + std::to_string(status.selectedPlatformIndex) +
@@ -676,7 +676,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         header = "ERROR";
     }
 
-    switch (status.currentView) {
+        switch (status.currentView) {
         case Status::View::PLATFORMS:
             controls = "[PLATFORMS] A=open platform Y=queue Plus=exit D-Pad=scroll hold";
             break;
