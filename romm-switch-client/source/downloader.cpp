@@ -1,6 +1,7 @@
 #include "romm/downloader.hpp"
 #include "romm/logger.hpp"
 #include "romm/filesystem.hpp"
+#include "romm/api.hpp"
 #include "romm/util.hpp"
 #include "romm/raii.hpp"
 #include <switch.h>
@@ -40,6 +41,12 @@ struct DownloadContext {
 };
 
 DownloadContext gCtx; // global download context shared with worker
+
+static void recomputeTotals(Status& st) {
+    uint64_t remaining = 0;
+    for (auto& g : st.downloadQueue) remaining += g.sizeBytes;
+    st.totalDownloadBytes.store(st.totalDownloadedBytes.load() + remaining);
+}
 
 // Best-effort recursive directory delete used for cleaning stale temp folders.
 static void removeDirRecursive(const std::string& path) {
@@ -83,15 +90,8 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
     auto doRequest = [&](const std::string& method, const std::string& extraHeader, int& outCode, std::string& headers) -> bool {
         outCode = 0;
         headers.clear();
-        if (url.rfind("http://", 0) != 0) return false;
-        std::string rest = url.substr(7);
-        auto slash = rest.find('/');
-        std::string hostport = (slash == std::string::npos) ? rest : rest.substr(0, slash);
-        std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
-        std::string host = hostport;
-        std::string portStr = "80";
-        auto colon = hostport.find(':');
-        if (colon != std::string::npos) { host = hostport.substr(0, colon); portStr = hostport.substr(colon + 1); }
+        std::string host, portStr, path, perr;
+        if (!romm::parseHttpUrl(url, host, portStr, path, perr)) return false;
         struct addrinfo hints{};
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
@@ -196,15 +196,8 @@ static bool streamDownload(const std::string& url,
                            Status& status,
                            const Config& cfg,
                            std::string& err) {
-    if (url.rfind("http://", 0) != 0) { err = "Only http:// supported"; return false; }
-    std::string rest = url.substr(7);
-    auto slash = rest.find('/');
-    std::string hostport = (slash == std::string::npos) ? rest : rest.substr(0, slash);
-    std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
-    std::string host = hostport;
-    std::string portStr = "80";
-    auto colon = hostport.find(':');
-    if (colon != std::string::npos) { host = hostport.substr(0, colon); portStr = hostport.substr(colon + 1); }
+    std::string host, portStr, path, perr;
+    if (!romm::parseHttpUrl(url, host, portStr, path, perr)) { err = perr; return false; }
 
     struct addrinfo hints{};
     hints.ai_family = AF_INET;
@@ -664,13 +657,6 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     }
     logLine("Download complete: " + g.title);
     return true;
-}
-
-// Recompute totalDownloadBytes to reflect remaining queue plus what has already been downloaded.
-static void recomputeTotals(Status& st) {
-    uint64_t remaining = 0;
-    for (auto& g : st.downloadQueue) remaining += g.sizeBytes;
-    st.totalDownloadBytes.store(st.totalDownloadedBytes.load() + remaining);
 }
 
 // Background worker: processes the downloadQueue sequentially, updating Status.

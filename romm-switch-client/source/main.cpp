@@ -351,18 +351,52 @@ static void drawText(SDL_Renderer* r, int x, int y, const std::string& txt, SDL_
 // Views: PLATFORMS, ROMS, DETAIL, QUEUE, DOWNLOADING, ERROR.
 static void renderStatus(SDL_Renderer* renderer, const Status& status) {
     if (!renderer) return;
-    // Note: guard shared Status state while reading.
-    std::lock_guard<std::mutex> lock(status.mutex);
+
+    struct Snapshot {
+        Status::View view{Status::View::PLATFORMS};
+        std::vector<romm::Platform> platforms;
+        std::vector<romm::Game> roms;
+        std::vector<romm::Game> downloadQueue;
+        int selectedPlatformIndex{0};
+        int selectedRomIndex{0};
+        int selectedQueueIndex{0};
+        Status::View prevQueueView{Status::View::PLATFORMS};
+        bool downloadCompleted{false};
+        bool downloadWorkerRunning{false};
+        bool lastDownloadFailed{false};
+        std::string lastDownloadError;
+        std::string currentDownloadTitle;
+        std::string lastError;
+    } snap;
+
+    {
+        std::lock_guard<std::mutex> guard(status.mutex);
+        snap.view = status.currentView;
+        snap.platforms = status.platforms;
+        snap.roms = status.roms;
+        snap.downloadQueue = status.downloadQueue;
+        snap.selectedPlatformIndex = status.selectedPlatformIndex;
+        snap.selectedRomIndex = status.selectedRomIndex;
+        snap.selectedQueueIndex = status.selectedQueueIndex;
+        snap.prevQueueView = status.prevQueueView;
+        snap.downloadCompleted = status.downloadCompleted;
+        snap.downloadWorkerRunning = status.downloadWorkerRunning.load();
+        snap.lastDownloadFailed = status.lastDownloadFailed.load();
+        snap.lastDownloadError = status.lastDownloadError;
+        snap.currentDownloadTitle = status.currentDownloadTitle;
+        snap.lastError = status.lastError;
+    }
+
     if (gViewTraceFrames > 0) {
-        romm::logDebug("Render trace view=" + std::string(viewName(status.currentView)) +
-                       " selP=" + std::to_string(status.selectedPlatformIndex) +
-                       " selR=" + std::to_string(status.selectedRomIndex) +
-                       " selQ=" + std::to_string(status.selectedQueueIndex),
+        romm::logDebug("Render trace view=" + std::string(viewName(snap.view)) +
+                       " selP=" + std::to_string(snap.selectedPlatformIndex) +
+                       " selR=" + std::to_string(snap.selectedRomIndex) +
+                       " selQ=" + std::to_string(snap.selectedQueueIndex),
                        "UI");
         gViewTraceFrames--;
     }
-    if (status.currentView != gLastLoggedView) {
-        switch (status.currentView) {
+    if (snap.view != gLastLoggedView) {
+        switch (snap.view) {
             case Status::View::PLATFORMS: romm::logLine("View: PLATFORMS"); break;
             case Status::View::ROMS: romm::logLine("View: ROMS"); gRomsDebugFrames = 3; break;
             case Status::View::DETAIL: romm::logLine("View: DETAIL"); gRomsDebugFrames = 2; break;
@@ -371,14 +405,13 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
             case Status::View::ERROR: romm::logLine("View: ERROR"); break;
             default: break;
         }
-        gLastLoggedView = status.currentView;
+        gLastLoggedView = snap.view;
     }
 
     SDL_Color headerBar{40, 80, 140, 255};
     SDL_Color footerBar{12, 12, 18, 255};
 
-    // Basic color coding per view
-    switch (status.currentView) {
+    switch (snap.view) {
         case Status::View::PLATFORMS:
             SDL_SetRenderDrawColor(renderer, 6, 46, 112, 255);
             headerBar = {38, 108, 200, 255};
@@ -386,7 +419,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         case Status::View::ROMS:
             SDL_SetRenderDrawColor(renderer, 0, 70, 96, 255);
             headerBar = {20, 142, 186, 255};
-            break; // teal-blue for ROM list
+            break;
         case Status::View::DETAIL:
             SDL_SetRenderDrawColor(renderer, 12, 26, 72, 255);
             headerBar = {54, 110, 210, 255};
@@ -422,21 +455,19 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         drawText(renderer, 32, 720 - 36, text, hint, 2);
     };
 
-    // Progress bar when downloading (global)
     uint64_t totalBytes = status.totalDownloadBytes.load();
-    uint64_t totalDoneRaw = status.totalDownloadedBytes.load(); // intended to include current ROM writes
+    uint64_t totalDoneRaw = status.totalDownloadedBytes.load();
     uint64_t curBytes = status.currentDownloadSize.load();
     uint64_t curDone = status.currentDownloadedBytes.load();
-    // Display guard: never show overall behind current in case counters drift during resume.
     uint64_t totalDone = (curDone > totalDoneRaw) ? curDone : totalDoneRaw;
     const bool downloadsDone =
-        status.downloadCompleted ||
+        snap.downloadCompleted ||
         (totalBytes > 0 && totalDone >= totalBytes &&
-         status.downloadQueue.empty() && !status.downloadWorkerRunning.load());
+         snap.downloadQueue.empty() && !snap.downloadWorkerRunning);
 
-    if (status.currentView == Status::View::DOWNLOADING && totalBytes > 0) {
+    if (snap.view == Status::View::DOWNLOADING && totalBytes > 0) {
         float pctTotal = static_cast<float>(totalDone) /
-                          static_cast<float>(std::max<uint64_t>(totalBytes, 1));
+                         static_cast<float>(std::max<uint64_t>(totalBytes, 1));
         float pctCurrent = (curBytes > 0)
             ? static_cast<float>(curDone) / static_cast<float>(curBytes)
             : 0.0f;
@@ -448,7 +479,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
 
         if (downloadsDone) {
             drawText(renderer, outline.x, outline.y - 28, "Downloads complete", fg, 2);
-            drawText(renderer, outline.x, outline.y + 50, "All files finalized. Press B to return.", fg, 2);
+            drawText(renderer, outline.x, outline.y + 50, "All files finalized. Press A to return.", fg, 2);
         } else {
             int barWidth = static_cast<int>(pctTotal * 600);
             SDL_Rect bar{ (1280 - 640) / 2, 720/2 - 20, barWidth, 40 };
@@ -457,7 +488,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
             SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
             SDL_RenderDrawRect(renderer, &outline);
             int pctInt = static_cast<int>(pctTotal * 100.0f);
-            drawText(renderer, outline.x, outline.y - 28, "Downloading " + status.currentDownloadTitle, fg, 2);
+            drawText(renderer, outline.x, outline.y - 28, "Downloading " + snap.currentDownloadTitle, fg, 2);
             if (curBytes > 0) {
                 int pctCurInt = static_cast<int>(pctCurrent * 100.0f);
                 drawText(renderer, outline.x, outline.y + 50,
@@ -469,7 +500,6 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
                      "Overall  " + std::to_string(pctInt) + "% (" +
                      humanSize(totalDone) + " / " +
                      humanSize(totalBytes) + ")", fg, 2);
-            // Show a tiny spinner while waiting for the first bytes so the user knows the UI is alive.
             if (totalDone == 0) {
                 static const char* dots[] = {"", ".", "..", "..."};
                 const int phase = (gFrameCounter / 20) % 4;
@@ -477,40 +507,38 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
                          std::string("Connecting") + dots[phase] + " waiting for data",
                          {200,220,255,255}, 2);
             }
-            if (status.lastDownloadFailed) {
-                drawText(renderer, outline.x, outline.y + 110, "Failed: " + status.lastDownloadError, {255,80,80,255}, 2);
+            if (snap.lastDownloadFailed) {
+                drawText(renderer, outline.x, outline.y + 110, "Failed: " + snap.lastDownloadError, {255,80,80,255}, 2);
             }
         }
-    } else if (status.currentView == Status::View::DOWNLOADING) {
+    } else if (snap.view == Status::View::DOWNLOADING) {
         SDL_Color fg{255,255,255,255};
         drawText(renderer, (1280/2) - 120, 720/2 - 40, "Connecting...", fg, 2);
         drawText(renderer, (1280/2) - 120, 720/2 + 0, "Waiting for data...", fg, 2);
-        if (status.lastDownloadFailed) {
-            drawText(renderer, (1280/2) - 120, 720/2 + 30, "Failed: " + status.lastDownloadError, {255,80,80,255}, 2);
+        if (snap.lastDownloadFailed) {
+            drawText(renderer, (1280/2) - 120, 720/2 + 30, "Failed: " + snap.lastDownloadError, {255,80,80,255}, 2);
         }
     }
 
-    // Clamp selection indices to avoid out-of-range
-    int selPlat = status.selectedPlatformIndex;
-    int selRom = status.selectedRomIndex;
+    int selPlat = snap.selectedPlatformIndex;
+    int selRom = snap.selectedRomIndex;
     if (selPlat < 0) selPlat = 0;
-    if (selPlat >= (int)status.platforms.size() && !status.platforms.empty())
-        selPlat = (int)status.platforms.size() - 1;
+    if (selPlat >= (int)snap.platforms.size() && !snap.platforms.empty())
+        selPlat = (int)snap.platforms.size() - 1;
     if (selRom < 0) selRom = 0;
-    if (selRom >= (int)status.roms.size() && !status.roms.empty())
-        selRom = (int)status.roms.size() - 1;
+    if (selRom >= (int)snap.roms.size() && !snap.roms.empty())
+        selRom = (int)snap.roms.size() - 1;
 
     auto sanitize = [](const std::string& s) {
         std::string out;
         out.reserve(s.size());
         for (size_t i = 0; i < s.size(); ++i) {
             unsigned char c = static_cast<unsigned char>(s[i]);
-            // Detect UTF-8 Ō/ō (C5 8C / C5 8D) and collapse to marker 0x01.
             if (c == 0xC5 && i + 1 < s.size()) {
                 unsigned char c2 = static_cast<unsigned char>(s[i + 1]);
                 if (c2 == 0x8C || c2 == 0x8D) {
-                    out.push_back('\x01');
-                    ++i; // skip next byte
+                    out.push_back('');
+                    ++i;
                     continue;
                 }
             }
@@ -531,48 +559,48 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
 
     std::string header;
     std::string controls;
-    if (status.currentView == Status::View::PLATFORMS) {
-        header = "PLATFORMS count=" + std::to_string(status.platforms.size()) +
+    if (snap.view == Status::View::PLATFORMS) {
+        header = "PLATFORMS count=" + std::to_string(snap.platforms.size()) +
                  " sel=" + std::to_string(selPlat);
         SDL_Color fg{255,255,255,255};
-        int listHeight = static_cast<int>(status.platforms.size()) * 26 + 32;
+        int listHeight = static_cast<int>(snap.platforms.size()) * 26 + 32;
         if (listHeight < 120) listHeight = 120;
         SDL_Rect listBg{48, 60, 560, listHeight};
         SDL_SetRenderDrawColor(renderer, 24, 70, 140, 180);
         SDL_RenderFillRect(renderer, &listBg);
-        for (size_t i = 0; i < status.platforms.size(); ++i) {
+        for (size_t i = 0; i < snap.platforms.size(); ++i) {
             SDL_Rect r{ 64, 72 + static_cast<int>(i)*26, 520, 24 };
-            if (static_cast<int>(i) == selPlat)
+            if ((int)i == selPlat)
                 SDL_SetRenderDrawColor(renderer, 70, 140, 240, 255);
             else
                 SDL_SetRenderDrawColor(renderer, 40, 70, 120, 200);
             SDL_RenderFillRect(renderer, &r);
-            drawText(renderer, r.x + 14, r.y + 6, ellipsize(status.platforms[i].name, 40), fg, 2);
+            drawText(renderer, r.x + 14, r.y + 6, ellipsize(snap.platforms[i].name, 40), fg, 2);
         }
-    } else if (status.currentView == Status::View::ROMS) {
+    } else if (snap.view == Status::View::ROMS) {
         std::string platLabel;
-        if (selPlat >= 0 && selPlat < (int)status.platforms.size()) {
-            platLabel = ellipsize(status.platforms[selPlat].name, 18);
+        if (selPlat >= 0 && selPlat < (int)snap.platforms.size()) {
+            platLabel = ellipsize(snap.platforms[selPlat].name, 18);
         }
         header = "ROMS " + (platLabel.empty() ? "" : ("[" + platLabel + "] ")) +
-                 "count=" + std::to_string(status.roms.size()) +
+                 "count=" + std::to_string(snap.roms.size()) +
                  " sel=" + std::to_string(selRom);
         SDL_Color fg{255,255,255,255};
-        size_t visible = status.roms.size() < 18 ? status.roms.size() : 18;
+        size_t visible = snap.roms.size() < 18 ? snap.roms.size() : 18;
         size_t start = 0;
-        if (!status.roms.empty()) {
+        if (!snap.roms.empty()) {
             if (selRom >= (int)(start + visible)) start = selRom - visible + 1;
             if (selRom < (int)start) start = selRom;
-            if (start + visible > status.roms.size()) start = status.roms.size() - visible;
+            if (start + visible > snap.roms.size()) start = snap.roms.size() - visible;
         }
         if (gRomsDebugFrames > 0) {
-            romm::logDebug("Render ROMS dbg: count=" + std::to_string(status.roms.size()) +
+            romm::logDebug("Render ROMS dbg: count=" + std::to_string(snap.roms.size()) +
                            " showing=" + std::to_string(visible) +
                            " start=" + std::to_string(start) +
                            " sel=" + std::to_string(selRom),
                            "UI");
-            if (!status.roms.empty()) {
-                romm::logDebug(" ROM[0]=" + ellipsize(status.roms[0].title, 60), "UI");
+            if (!snap.roms.empty()) {
+                romm::logDebug(" ROM[0]=" + ellipsize(snap.roms[0].title, 60), "UI");
             }
             gRomsDebugFrames--;
         }
@@ -583,28 +611,28 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         SDL_Rect listBg{48, 64, 1040, listHeight};
         SDL_SetRenderDrawColor(renderer, 12, 90, 120, 180);
         SDL_RenderFillRect(renderer, &listBg);
-        if (status.roms.empty()) {
+        if (snap.roms.empty()) {
             drawText(renderer, 64, 96, "No ROMs found for this platform.", fg, 2);
         }
         for (size_t i = 0; i < visible; ++i) {
             size_t idx = start + i;
             SDL_Rect r{ 64, 88 + static_cast<int>(i)*26, 1008, 22 };
-            if (static_cast<int>(idx) == selRom)
+            if ((int)idx == selRom)
                 SDL_SetRenderDrawColor(renderer, 80, 150, 240, 255);
             else
                 SDL_SetRenderDrawColor(renderer, 34, 90, 140, 200);
             SDL_RenderFillRect(renderer, &r);
-            if (idx < status.roms.size()) {
-                drawText(renderer, r.x + 12, r.y + 4, ellipsize(status.roms[idx].title, 64), fg, 2);
-                std::string sz = humanSize(status.roms[idx].sizeBytes);
+            if (idx < snap.roms.size()) {
+                drawText(renderer, r.x + 12, r.y + 4, ellipsize(snap.roms[idx].title, 64), fg, 2);
+                std::string sz = humanSize(snap.roms[idx].sizeBytes);
                 drawText(renderer, r.x + 760, r.y + 4, sz, fg, 2);
             }
         }
-    } else if (status.currentView == Status::View::DETAIL) {
+    } else if (snap.view == Status::View::DETAIL) {
         header = "DETAIL";
         SDL_Color fg{255,255,255,255};
-        if (selRom >= 0 && selRom < (int)status.roms.size()) {
-            const auto& g = status.roms[selRom];
+        if (selRom >= 0 && selRom < (int)snap.roms.size()) {
+            const auto& g = snap.roms[selRom];
             header = "DETAIL [" + ellipsize(g.title, 22) + "]";
             SDL_Rect cover{70, 110, 240, 240};
             if (gCoverTexture) {
@@ -624,24 +652,24 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
             drawText(renderer, info.x + 16, info.y + 56, "Size=" + humanSize(g.sizeBytes), fg, 2);
             drawText(renderer, info.x + 16, info.y + 96, "ID=" + ellipsize(g.id, 22), fg, 2);
             drawText(renderer, info.x + 16, info.y + 136, "FsName=" + ellipsize(g.fsName, 34), fg, 2);
-            std::string qCount = "Queue size=" + std::to_string(status.downloadQueue.size());
+            std::string qCount = "Queue size=" + std::to_string(snap.downloadQueue.size());
             drawText(renderer, info.x + 16, info.y + 176, qCount, fg, 2);
-            drawText(renderer, 80, 420, "A=Queue and open queue   B=Back   Y=Queue view", fg, 2);
+            drawText(renderer, 80, 420, "A=Queue and open queue   B=Back   X=Queue view", fg, 2);
         } else {
             drawText(renderer, 80, 120, "No ROM selected.", fg, 2);
         }
-    } else if (status.currentView == Status::View::QUEUE) {
+    } else if (snap.view == Status::View::QUEUE) {
         uint64_t total = 0;
-        for (auto& q : status.downloadQueue) total += q.sizeBytes;
-        header = "QUEUE items=" + std::to_string(status.downloadQueue.size()) +
+        for (auto& q : snap.downloadQueue) total += q.sizeBytes;
+        header = "QUEUE items=" + std::to_string(snap.downloadQueue.size()) +
                  " total=" + humanSize(total);
         SDL_Color fg{255,255,255,255};
-        size_t visible = status.downloadQueue.size() < 18 ? status.downloadQueue.size() : 18;
+        size_t visible = snap.downloadQueue.size() < 18 ? snap.downloadQueue.size() : 18;
         size_t start = 0;
-        if (!status.downloadQueue.empty()) {
-            if (status.selectedQueueIndex >= (int)(start + visible)) start = status.selectedQueueIndex - visible + 1;
-            if (status.selectedQueueIndex < (int)start) start = status.selectedQueueIndex;
-            if (start + visible > status.downloadQueue.size()) start = status.downloadQueue.size() - visible;
+        if (!snap.downloadQueue.empty()) {
+            if (snap.selectedQueueIndex >= (int)(start + visible)) start = snap.selectedQueueIndex - visible + 1;
+            if (snap.selectedQueueIndex < (int)start) start = snap.selectedQueueIndex;
+            if (start + visible > snap.downloadQueue.size()) start = snap.downloadQueue.size() - visible;
         }
         int listHeight = static_cast<int>(visible) * 26 + 60;
         int maxListHeight = 720 - 96 - 60;
@@ -651,45 +679,45 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         SDL_SetRenderDrawColor(renderer, 90, 60, 150, 180);
         SDL_RenderFillRect(renderer, &listBg);
         drawText(renderer, 64, 70, "Total size: " + humanSize(total), fg, 2);
-        if (status.downloadQueue.empty()) {
-            std::string msg = status.downloadCompleted ? "All downloads complete." : "Queue empty. Press A in detail to add.";
+        if (snap.downloadQueue.empty()) {
+            std::string msg = snap.downloadCompleted ? "All downloads complete." : "Queue empty. Press B in detail to add.";
             drawText(renderer, 64, 120, msg, fg, 2);
         }
         for (size_t i = 0; i < visible; ++i) {
             size_t idx = start + i;
             SDL_Rect r{ 64, 120 + static_cast<int>(i)*26, 1008, 22 };
-            if (static_cast<int>(idx) == status.selectedQueueIndex)
+            if ((int)idx == snap.selectedQueueIndex)
                 SDL_SetRenderDrawColor(renderer, 150, 110, 230, 255);
             else
                 SDL_SetRenderDrawColor(renderer, 110, 70, 180, 200);
             SDL_RenderFillRect(renderer, &r);
-            if (idx < status.downloadQueue.size()) {
-                const auto& g = status.downloadQueue[idx];
+            if (idx < snap.downloadQueue.size()) {
+                const auto& g = snap.downloadQueue[idx];
                 drawText(renderer, r.x + 10, r.y + 4, ellipsize(g.title, 58), fg, 2);
                 std::string sz = humanSize(g.sizeBytes);
                 drawText(renderer, r.x + 740, r.y + 4, sz, fg, 2);
             }
         }
-    } else if (status.currentView == Status::View::DOWNLOADING) {
+    } else if (snap.view == Status::View::DOWNLOADING) {
         header = "DOWNLOADING sel=" + std::to_string(status.currentDownloadIndex);
-    } else if (status.currentView == Status::View::ERROR) {
+    } else if (snap.view == Status::View::ERROR) {
         header = "ERROR";
     }
 
-        switch (status.currentView) {
+    switch (snap.view) {
         case Status::View::PLATFORMS:
-            controls = "[PLATFORMS] A=open platform Y=queue Plus=exit D-Pad=scroll hold";
+            controls = "[PLATFORMS] A=open platform B=back X=queue Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::ROMS:
-            controls = "[ROMS] A=details B=back Y=queue Plus=exit D-Pad=scroll hold";
+            controls = "[ROMS] A=details B=back X=queue Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::DETAIL:
-            controls = "[DETAIL] A=queue+open B=back Y=queue Plus=exit";
+            controls = "[DETAIL] A=queue+open B=back X=queue Plus=exit";
             break;
         case Status::View::QUEUE:
-            controls = status.downloadWorkerRunning.load()
-                ? "[QUEUE] X=view downloading B=back Plus=exit D-Pad=scroll hold"
-                : "[QUEUE] X=start downloads B=back Plus=exit D-Pad=scroll hold";
+            controls = snap.downloadWorkerRunning
+                ? "[QUEUE] Y=view downloading B=back Plus=exit D-Pad=scroll hold"
+                : "[QUEUE] Y=start downloads B=back Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::DOWNLOADING:
             controls = "[DOWNLOADING] B=back Plus=exit";
@@ -699,16 +727,14 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
             break;
     }
 
-    // Log footer slug whenever it changes so we can diagnose mapping vs. on-screen hints.
     static std::string gLastControls;
     if (controls != gLastControls) {
-    romm::logDebug("Controls slug: " + controls, "UI");
+        romm::logDebug("Controls slug: " + controls, "UI");
         gLastControls = controls;
     }
 
     if (!header.empty()) {
-        // Append view tag for runtime debug
-        header += " [" + std::string(viewName(status.currentView)) + "]";
+        header += " [" + std::string(viewName(snap.view)) + "]";
         drawHeaderBar(header);
     }
     if (!controls.empty()) {
