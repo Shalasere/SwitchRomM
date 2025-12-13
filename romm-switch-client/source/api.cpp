@@ -1,5 +1,7 @@
 #include "romm/api.hpp"
 #include "romm/logger.hpp"
+#include "romm/util.hpp"
+#include "romm/raii.hpp"
 #include "mini/json.hpp"
 // TODO(http): centralize HTTP client with structured errors/timeouts and optional token auth.
 
@@ -30,36 +32,6 @@ struct HttpResponse {
     std::string headersRaw;
     std::string body;
 };
-
-static std::string base64(const std::string& in) {
-    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    int val = 0, valb = -6;
-    for (uint8_t c : in) {
-        val = (val << 8) + c;
-        valb += 8;
-        while (valb >= 0) {
-            out.push_back(tbl[(val >> valb) & 0x3F]);
-            valb -= 6;
-        }
-    }
-    if (valb > -6) out.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
-    while (out.size() % 4) out.push_back('=');
-    return out;
-}
-
-static std::string urlEncode(const std::string& in) {
-    std::ostringstream oss;
-    for (unsigned char c : in) {
-        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-            oss << c;
-        } else {
-            oss << '%' << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << (int)c
-                << std::nouppercase << std::dec;
-        }
-    }
-    return oss.str();
-}
 
 bool parseHttpUrl(const std::string& url,
                   std::string& host,
@@ -179,8 +151,8 @@ static bool httpRequest(const std::string& method,
         return false;
     }
 
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) {
+    romm::UniqueFd sockFd(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
+    if (!sockFd) {
         err = "Socket creation failed";
         freeaddrinfo(res);
         return false;
@@ -191,14 +163,13 @@ static bool httpRequest(const std::string& method,
         timeval tv{};
         tv.tv_sec  = timeoutSec;
         tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(sockFd.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sockFd.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
-    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+    if (connect(sockFd.fd, res->ai_addr, res->ai_addrlen) != 0) {
         err = "Connect failed";
         freeaddrinfo(res);
-        close(sock);
         return false;
     }
     freeaddrinfo(res);
@@ -217,11 +188,10 @@ static bool httpRequest(const std::string& method,
     // Send all
     size_t totalSent = 0;
     while (totalSent < reqStr.size()) {
-        ssize_t n = send(sock, reqStr.data() + totalSent,
+        ssize_t n = send(sockFd.fd, reqStr.data() + totalSent,
                          reqStr.size() - totalSent, 0);
         if (n <= 0) {
             err = "Send failed";
-            close(sock);
             return false;
         }
         totalSent += static_cast<size_t>(n);
@@ -231,7 +201,7 @@ static bool httpRequest(const std::string& method,
     std::string raw;
     char buf[8192];
     while (true) {
-        ssize_t n = recv(sock, buf, sizeof(buf), 0);
+        ssize_t n = recv(sockFd.fd, buf, sizeof(buf), 0);
         if (n > 0) {
             raw.append(buf, buf + n);
         } else if (n == 0) {
@@ -239,11 +209,9 @@ static bool httpRequest(const std::string& method,
         } else {
             // timeout or error
             err = "Recv failed or timed out";
-            close(sock);
             return false;
         }
     }
-    close(sock);
 
     if (raw.empty()) {
         err = "Empty HTTP response";
@@ -512,7 +480,7 @@ static bool parseGames(const std::string& body,
 bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError) {
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
-        auth = base64(cfg.username + ":" + cfg.password);
+        auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
     }
 
     HttpResponse resp;
@@ -540,7 +508,7 @@ bool fetchGamesForPlatform(const Config& cfg,
 {
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
-        auth = base64(cfg.username + ":" + cfg.password);
+        auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
     }
 
     HttpResponse resp;
@@ -574,7 +542,7 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
 
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
-        auth = base64(cfg.username + ":" + cfg.password);
+        auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
     }
 
     HttpResponse resp;
@@ -681,7 +649,7 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
     g.fileId = bestId;
     if (bestSize > 0) g.sizeBytes = bestSize;
     g.downloadUrl = cfg.serverUrl + "/api/roms/" + g.id +
-                    "/content/" + urlEncode(bestName) +
+                    "/content/" + romm::util::urlEncode(bestName) +
                     "?file_ids=" + bestId;
 
     logInfo("Selected file via files[] id=" + bestId + " name=" + bestName +
@@ -692,7 +660,7 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
 bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData, std::string& outError) {
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
-        auth = base64(cfg.username + ":" + cfg.password);
+        auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
     }
     HttpResponse resp;
     std::string err;

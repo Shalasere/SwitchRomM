@@ -1,6 +1,8 @@
 #include "romm/downloader.hpp"
 #include "romm/logger.hpp"
 #include "romm/filesystem.hpp"
+#include "romm/util.hpp"
+#include "romm/raii.hpp"
 #include <switch.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -51,23 +53,6 @@ static void removeDirRecursive(const std::string& path) {
     }
 }
 
-static std::string base64(const std::string& in) {
-    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    int val = 0, valb = -6;
-    for (uint8_t c : in) {
-        val = (val << 8) + c;
-        valb += 8;
-        while (valb >= 0) {
-            out.push_back(tbl[(val >> valb) & 0x3F]);
-            valb -= 6;
-        }
-    }
-    if (valb > -6) out.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
-    while (out.size() % 4) out.push_back('=');
-    return out;
-}
-
 // Check (best effort) if there is enough free space at path for neededBytes + margin.
 static bool ensureFreeSpace(const std::string& path, uint64_t neededBytes) {
     struct statvfs vfs{};
@@ -113,29 +98,28 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
         struct addrinfo* res = nullptr;
         int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
         if (ret != 0 || !res) { if (res) freeaddrinfo(res); return false; }
-        int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-        if (sock < 0) { freeaddrinfo(res); return false; }
+        romm::UniqueFd sock(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
+        if (!sock) { freeaddrinfo(res); return false; }
         if (timeoutSec > 0) {
             struct timeval tv{}; tv.tv_sec = timeoutSec;
-            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         }
-        if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); close(sock); return false; }
+        if (connect(sock.fd, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); return false; }
         freeaddrinfo(res);
         std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n";
         if (!authBasic.empty()) req += "Authorization: Basic " + authBasic + "\r\n";
         if (!extraHeader.empty()) req += extraHeader + "\r\n";
         req += "\r\n";
-        send(sock, req.c_str(), req.size(), 0);
+        send(sock.fd, req.c_str(), req.size(), 0);
         std::string headerAccum;
         char buf[1024];
         while (true) {
-            ssize_t n = recv(sock, buf, sizeof(buf), 0);
+            ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
             if (n <= 0) break;
             headerAccum.append(buf, buf + n);
             if (headerAccum.find("\r\n\r\n") != std::string::npos) break;
         }
-        close(sock);
         auto hdrEnd = headerAccum.find("\r\n\r\n");
         if (hdrEnd == std::string::npos) return false;
         std::string headerBlock = headerAccum.substr(0, hdrEnd);
@@ -228,17 +212,17 @@ static bool streamDownload(const std::string& url,
     struct addrinfo* res = nullptr;
     int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
     if (ret != 0 || !res) { if (res) freeaddrinfo(res); err = "DNS failed"; return false; }
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { freeaddrinfo(res); err = "Socket failed"; return false; }
+    romm::UniqueFd sock(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
+    if (!sock) { freeaddrinfo(res); err = "Socket failed"; return false; }
     if (cfg.httpTimeoutSeconds > 0) {
         struct timeval tv{}; tv.tv_sec = cfg.httpTimeoutSeconds;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
     // Bump receive buffer for faster pulls.
     int rcvbuf = 256 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); close(sock); err = "Connect failed"; return false; }
+    setsockopt(sock.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    if (connect(sock.fd, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); err = "Connect failed"; return false; }
     freeaddrinfo(res);
 
     std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n";
@@ -247,7 +231,7 @@ static bool streamDownload(const std::string& url,
         req += "Range: bytes=" + std::to_string(startOffset) + "-\r\n";
     }
     req += "\r\n";
-    send(sock, req.c_str(), req.size(), 0);
+    send(sock.fd, req.c_str(), req.size(), 0);
 
     // Read headers
     std::string headerAccum;
@@ -259,8 +243,8 @@ static bool streamDownload(const std::string& url,
     uint64_t contentLength = 0;
     uint64_t expectedBody = totalSize - startOffset;
     while (!headersDone) {
-        ssize_t n = recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) { err = "No HTTP headers received"; close(sock); return false; }
+        ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
+        if (n <= 0) { err = "No HTTP headers received"; return false; }
         headerAccum.append(buf, buf + n);
         auto hdrEnd = headerAccum.find("\r\n\r\n");
         if (hdrEnd == std::string::npos) continue;
@@ -273,8 +257,8 @@ static bool streamDownload(const std::string& url,
         if (!statusLine.empty() && statusLine.back() == '\r') statusLine.pop_back();
         std::istringstream sl(statusLine);
         std::string httpVer; sl >> httpVer >> statusCode;
-        if (useRange && statusCode != 206) { err = "Range not honored (status " + std::to_string(statusCode) + ")"; close(sock); return false; }
-        if (!useRange && statusCode != 200) { err = "HTTP status " + std::to_string(statusCode); close(sock); return false; }
+        if (useRange && statusCode != 206) { err = "Range not honored (status " + std::to_string(statusCode) + ")"; return false; }
+        if (!useRange && statusCode != 200) { err = "HTTP status " + std::to_string(statusCode); return false; }
         std::string line;
         while (std::getline(hs, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -293,7 +277,6 @@ static bool streamDownload(const std::string& url,
         }
         if (contentLength && expectedBody && contentLength < expectedBody) {
             err = "Short body (Content-Length " + std::to_string(contentLength) + " < expected " + std::to_string(expectedBody) + ")";
-            close(sock);
             return false;
         }
     }
@@ -348,7 +331,7 @@ static bool streamDownload(const std::string& url,
         size_t bodyBytes = headerAccum.size() - bodyStartOffset;
         size_t toUse = static_cast<size_t>(std::min<uint64_t>((uint64_t)bodyBytes, expectedBody));
         if (toUse > 0) {
-            if (!writeSpan(globalOffset, headerAccum.data() + bodyStartOffset, toUse)) { close(sock); return false; }
+            if (!writeSpan(globalOffset, headerAccum.data() + bodyStartOffset, toUse)) { return false; }
             status.currentDownloadedBytes.fetch_add(toUse);
             status.totalDownloadedBytes.fetch_add(toUse);
         }
@@ -358,11 +341,11 @@ static bool streamDownload(const std::string& url,
     uint64_t bytesSinceBeat = 0;
     const uint64_t kLogEvery = 100ULL * 1024ULL * 1024ULL; // ~100MB
     while (globalOffset - startOffset < expectedBody && !gCtx.stopRequested.load()) {
-        ssize_t n = recv(sock, buf, sizeof(buf), 0);
+        ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
         if (n <= 0) break;
         size_t toUse = static_cast<size_t>(std::min<uint64_t>((uint64_t)n, expectedBody - (globalOffset - startOffset)));
         if (toUse > 0) {
-            if (!writeSpan(globalOffset, buf, toUse)) { close(sock); return false; }
+            if (!writeSpan(globalOffset, buf, toUse)) { return false; }
             status.currentDownloadedBytes.fetch_add(toUse);
             status.totalDownloadedBytes.fetch_add(toUse);
             bytesSinceBeat += toUse;
@@ -379,7 +362,7 @@ static bool streamDownload(const std::string& url,
             }
         }
     }
-    close(sock);
+    sock.reset();
     closePart();
 
     uint64_t received = globalOffset - startOffset;
@@ -484,7 +467,7 @@ static bool finalizeParts(const std::string& tmpDir, const std::string& finalDir
 static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
-        auth = base64(cfg.username + ":" + cfg.password);
+        auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
     }
     std::string baseDir = cfg.downloadDir;
     ensureDirectory(baseDir);

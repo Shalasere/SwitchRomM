@@ -1,6 +1,7 @@
 #define CATCH_CONFIG_MAIN
 #include "catch.hpp"
 #include "api_test_hooks.hpp"
+#include "romm/util.hpp"
 
 TEST_CASE("parseHttpUrl basic http") {
     std::string host, port, path, err;
@@ -80,4 +81,15 @@ TEST_CASE("decodeChunkedBody bad CRLF after chunk") {
     std::string body = "1\r\naXX0\r\n\r\n";
     bool ok = romm::decodeChunkedBody(body, decoded);
     REQUIRE_FALSE(ok);
+}
+
+TEST_CASE("base64Encode matches expected") {
+    REQUIRE(romm::util::base64Encode("user:pass") == "dXNlcjpwYXNz");
+    REQUIRE(romm::util::base64Encode("") == "");
+}
+
+TEST_CASE("urlEncode handles safe and unsafe chars") {
+    REQUIRE(romm::util::urlEncode("simple") == "simple");
+    REQUIRE(romm::util::urlEncode("Hello World") == "Hello%20World");
+    REQUIRE(romm::util::urlEncode("a+b/c") == "a%2Bb%2Fc");
 }
