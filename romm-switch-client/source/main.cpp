@@ -479,7 +479,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
 
         if (downloadsDone) {
             drawText(renderer, outline.x, outline.y - 28, "Downloads complete", fg, 2);
-            drawText(renderer, outline.x, outline.y + 50, "All files finalized. Press A to return.", fg, 2);
+            drawText(renderer, outline.x, outline.y + 50, "All files finalized. Press B to return.", fg, 2);
         } else {
             int barWidth = static_cast<int>(pctTotal * 600);
             SDL_Rect bar{ (1280 - 640) / 2, 720/2 - 20, barWidth, 40 };
@@ -720,7 +720,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
                 : "X=start downloads B=back Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::DOWNLOADING:
-            controls = "[DOWNLOADING] B=back Plus=exit";
+            controls = "B=back Plus=exit";
             break;
         default:
             controls = "Plus=exit";
