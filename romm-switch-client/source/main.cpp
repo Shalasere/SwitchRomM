@@ -706,18 +706,18 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
 
     switch (snap.view) {
         case Status::View::PLATFORMS:
-            controls = "[PLATFORMS] A=open platform B=back Y=queue Plus=exit D-Pad=scroll hold";
+            controls = "A=open platform B=back Y=queue Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::ROMS:
-            controls = "[ROMS] A=details B=back Y=queue Plus=exit D-Pad=scroll hold";
+            controls = "A=details B=back Y=queue Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::DETAIL:
-            controls = "[DETAIL] A=queue+open B=back Y=queue Plus=exit";
+            controls = "A=queue+open B=back Y=queue Plus=exit";
             break;
         case Status::View::QUEUE:
             controls = snap.downloadWorkerRunning
-                ? "[QUEUE] X=view downloading B=back Plus=exit D-Pad=scroll hold"
-                : "[QUEUE] X=start downloads B=back Plus=exit D-Pad=scroll hold";
+                ? "X=view downloading B=back Plus=exit D-Pad=scroll hold"
+                : "X=start downloads B=back Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::DOWNLOADING:
             controls = "[DOWNLOADING] B=back Plus=exit";
