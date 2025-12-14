@@ -654,7 +654,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
             drawText(renderer, info.x + 16, info.y + 136, "FsName=" + ellipsize(g.fsName, 34), fg, 2);
             std::string qCount = "Queue size=" + std::to_string(snap.downloadQueue.size());
             drawText(renderer, info.x + 16, info.y + 176, qCount, fg, 2);
-            drawText(renderer, 80, 420, "A=Queue and open queue   B=Back   X=Queue view", fg, 2);
+            drawText(renderer, 80, 420, "A=Queue and open queue   B=Back   Y=Queue view", fg, 2);
         } else {
             drawText(renderer, 80, 120, "No ROM selected.", fg, 2);
         }
@@ -706,18 +706,18 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
 
     switch (snap.view) {
         case Status::View::PLATFORMS:
-            controls = "[PLATFORMS] A=open platform B=back X=queue Plus=exit D-Pad=scroll hold";
+            controls = "[PLATFORMS] A=open platform B=back Y=queue Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::ROMS:
-            controls = "[ROMS] A=details B=back X=queue Plus=exit D-Pad=scroll hold";
+            controls = "[ROMS] A=details B=back Y=queue Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::DETAIL:
-            controls = "[DETAIL] A=queue+open B=back X=queue Plus=exit";
+            controls = "[DETAIL] A=queue+open B=back Y=queue Plus=exit";
             break;
         case Status::View::QUEUE:
             controls = snap.downloadWorkerRunning
-                ? "[QUEUE] Y=view downloading B=back Plus=exit D-Pad=scroll hold"
-                : "[QUEUE] Y=start downloads B=back Plus=exit D-Pad=scroll hold";
+                ? "[QUEUE] X=view downloading B=back Plus=exit D-Pad=scroll hold"
+                : "[QUEUE] X=start downloads B=back Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::DOWNLOADING:
             controls = "[DOWNLOADING] B=back Plus=exit";
