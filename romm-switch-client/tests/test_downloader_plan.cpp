@@ -52,6 +52,52 @@ TEST_CASE("preflight fallback 206 with content-range") {
     REQUIRE(code == 206);
 }
 
+TEST_CASE("httpRequestStreamMock short-read vs content-length") {
+    // Body is shorter than declared Content-Length => should error.
+    const std::string raw =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 10\r\n"
+        "\r\n"
+        "short";
+
+    romm::HttpResponse resp;
+    size_t total = 0;
+    std::string err;
+    bool ok = romm::httpRequestStreamMock(raw, resp,
+        [&](const char* /*data*/, size_t len) {
+            total += len;
+            return true;
+        },
+        err);
+
+    REQUIRE_FALSE(ok);
+    REQUIRE(err == "Short read");
+    REQUIRE(total == 5);
+}
+
+TEST_CASE("httpRequestStreamMock exact content-length passes") {
+    const std::string raw =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "hello";
+
+    romm::HttpResponse resp;
+    size_t total = 0;
+    std::string err;
+    bool ok = romm::httpRequestStreamMock(raw, resp,
+        [&](const char* /*data*/, size_t len) {
+            total += len;
+            return true;
+        },
+        err);
+
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(resp.statusCode == 200);
+    REQUIRE(total == 5);
+}
+
 TEST_CASE("part planning sanity: number of parts vs size") {
     constexpr uint64_t kPartSize = 0xFFFF0000ULL; // 4 GiB-ish
 

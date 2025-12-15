@@ -21,3 +21,14 @@ TEST_CASE("parseHttpUrl accepts http URLs") {
     REQUIRE(port == "80");
     REQUIRE(path == "/");
 }
+
+TEST_CASE("parseHttpUrl fails on missing host or malformed") {
+    std::string host, port, path, err;
+    bool ok = romm::parseHttpUrl("http:///path", host, port, path, err);
+    REQUIRE_FALSE(ok);
+    REQUIRE_FALSE(err.empty());
+
+    ok = romm::parseHttpUrl("http://", host, port, path, err);
+    REQUIRE_FALSE(ok);
+    REQUIRE_FALSE(err.empty());
+}

@@ -497,10 +497,11 @@ bool httpRequestStreamMock(const std::string& rawResponse,
             err = "Sink aborted";
             return false;
         }
-    }
-    if (contentLength > 0 && body.size() < contentLength) {
-        err = "Short read";
-        return false;
+        // Only enforce short-read if a body was present; header-only mocks (preflight) are allowed.
+        if (contentLength > 0 && body.size() < contentLength) {
+            err = "Short read";
+            return false;
+        }
     }
     return true;
 }

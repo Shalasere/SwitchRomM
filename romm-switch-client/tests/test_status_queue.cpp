@@ -68,3 +68,21 @@ TEST_CASE("enqueue dedup by fileId/fsName") {
         REQUIRE(st.downloadQueue.size() == 1);
     }
 }
+
+TEST_CASE("progress counters accumulate safely") {
+    romm::Status st;
+    st.currentDownloadedBytes.store(0);
+    st.totalDownloadedBytes.store(0);
+    st.currentDownloadSize.store(100);
+    st.totalDownloadBytes.store(200);
+
+    // Simulate two chunks written.
+    st.currentDownloadedBytes.fetch_add(40);
+    st.totalDownloadedBytes.fetch_add(40);
+    st.currentDownloadedBytes.fetch_add(60);
+    st.totalDownloadedBytes.fetch_add(60);
+
+    REQUIRE(st.currentDownloadedBytes.load() == 100);
+    REQUIRE(st.totalDownloadedBytes.load() == 100);
+    // Totals can exceed current size if multiple items are considered; here they match.
+}

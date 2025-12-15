@@ -52,6 +52,7 @@ Severity: [H]=High, [M]=Medium, [L]=Low. File refs approximate.
 - **Resume robustness**: Add per-ROM manifest (sizes/hashes), mid-part resume, and explicit failed-item retention in the queue UI.
 - **Download UX**: Show per-ROM state (pending/downloading/failed/done), surface last error in DOWNLOADING, and add free-space re-checks before each part.
 - **Covers/UI**: Keep async cover loading; placeholder when absent; avoid blocking render thread.
+- **Plutonium UI refactor**: Explore migrating SDL UI to Plutonium for cleaner view separation and Switch-native widgets, preserving current control mapping.
 - **Logging**: Add optional size cap/rotation; keep debug heartbeats behind log_level.
 - **Refactors**: Split `renderStatus` into per-view helpers; wrap sockets/files in RAII (helpers exist); keep controls fixed per `docs/controls.md`.
 

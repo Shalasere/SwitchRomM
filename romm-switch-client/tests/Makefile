@@ -19,6 +19,7 @@ SOURCES := ../source/api.cpp \
            test_downloader_plan.cpp \
            test_status_queue.cpp \
            test_config.cpp \
+           test_thread_safety.cpp \
            logger_stub.cpp
 
 all: $(TARGET)
