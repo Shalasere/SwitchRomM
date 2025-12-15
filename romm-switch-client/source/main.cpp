@@ -13,6 +13,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstdio>
+#include <ctime>
 #include "stb_image.h"
 // Fallback declarations in case the minimal stb header wasn't visible for some reason
 extern "C" unsigned char *stbi_load_from_memory(const unsigned char *buffer, int len, int *x, int *y, int *channels_in_file, int desired_channels);
@@ -439,12 +440,21 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
     }
     SDL_RenderClear(renderer);
 
-    auto drawHeaderBar = [&](const std::string& text) {
+    auto drawHeaderBar = [&](const std::string& left, const std::string& right) {
         SDL_Rect bar{0, 0, 1280, 52};
         SDL_SetRenderDrawColor(renderer, headerBar.r, headerBar.g, headerBar.b, 255);
         SDL_RenderFillRect(renderer, &bar);
         SDL_Color fg{255,255,255,255};
-        drawText(renderer, 32, 14, text, fg, 2);
+        // Left-aligned header text.
+        drawText(renderer, 32, 14, left, fg, 2);
+        // Right-aligned system info.
+        if (!right.empty()) {
+            int charW = 6 * 2; // glyph width (5) + spacing, scaled by 2
+            int textW = static_cast<int>(right.size()) * charW;
+            int x = 1280 - 32 - textW;
+            if (x < 32) x = 32;
+            drawText(renderer, x, 14, right, fg, 2);
+        }
     };
 
     auto drawFooterBar = [&](const std::string& text) {
@@ -454,6 +464,26 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         SDL_Color hint{200, 220, 255, 255};
         drawText(renderer, 32, 720 - 36, text, hint, 2);
     };
+
+    // Cache system time/battery once per second to avoid overcalling services.
+    static time_t lastTimeSec = 0;
+    static std::string sysInfo;
+    time_t now = time(nullptr);
+    if (now != lastTimeSec) {
+        lastTimeSec = now;
+        char buf[16]{};
+        struct tm tm{};
+        localtime_r(&now, &tm);
+        std::snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        u32 batt = 0;
+        if (R_SUCCEEDED(psmGetBatteryChargePercentage(&batt))) {
+            std::ostringstream oss;
+            oss << buf << "  " << batt << "%";
+            sysInfo = oss.str();
+        } else {
+            sysInfo = buf;
+        }
+    }
 
     uint64_t totalBytes = status.totalDownloadBytes.load();
     uint64_t totalDoneRaw = status.totalDownloadedBytes.load();
@@ -734,8 +764,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
     }
 
     if (!header.empty()) {
-        header += " [" + std::string(viewName(snap.view)) + "]";
-        drawHeaderBar(header);
+        drawHeaderBar(header, sysInfo);
     }
     if (!controls.empty()) {
         drawFooterBar(controls);
@@ -761,6 +790,8 @@ int main(int argc, char** argv) {
 #endif
     nifmInitialize(NifmServiceType_User);
     fsdevMountSdmc();
+    timeInitialize();
+    psmInitialize();
 
     // Initialize logging after SD is mounted so early messages persist.
     romm::initLogFile();
@@ -1159,6 +1190,8 @@ exit_app:
     if (pad) SDL_GameControllerClose(pad);
     SDL_Quit();
     if (romfsReady) romfsExit();
+    psmExit();
+    timeExit();
     fsdevUnmountAll();
     nifmExit();
     socketExit();

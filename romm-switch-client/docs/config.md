@@ -14,5 +14,5 @@ Put `.env` at `sdmc:/switch/romm_switch_client/.env`. `config.json` in the same 
 
 ## Files created by the client
 - Downloads: `<DOWNLOAD_DIR>/<Title or fsName>` (single file) or `<DOWNLOAD_DIR>/<Title or fsName>/00 01 ...` (multi-part DBI layout).
-- Temps: `<DOWNLOAD_DIR>/temp/<safe-12>.tmp/*.part` (safe to delete after failures/stops).
+- Temps: `<DOWNLOAD_DIR>/temp/<safe-12>.tmp/*.part` and `manifest.json` (safe to delete after failures/stops).
 - Log: `sdmc:/switch/romm_switch_client/log.txt`.
