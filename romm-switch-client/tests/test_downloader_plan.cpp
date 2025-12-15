@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "api_test_hooks.hpp"
 #include "romm/api.hpp"
+#include "romm/downloader.hpp"
 #include "romm/models.hpp"
 
 namespace {
@@ -111,4 +112,28 @@ TEST_CASE("part planning sanity: number of parts vs size") {
     REQUIRE(partsFor(kPartSize + 1) == 2);
     REQUIRE(partsFor(kPartSize * 2) == 2);
     REQUIRE(partsFor(kPartSize * 2 + 1234) == 3);
+}
+
+TEST_CASE("parseLengthAndRangesForTest extracts length and ranges") {
+    std::string hdrs =
+        "Content-Length: 12345\r\n"
+        "Accept-Ranges: bytes\r\n";
+    bool ranges = false;
+    uint64_t len = 0;
+    REQUIRE(romm::parseLengthAndRangesForTest(hdrs, ranges, len));
+    REQUIRE(ranges);
+    REQUIRE(len == 12345);
+
+    hdrs = "Content-Range: bytes 0-0/999\r\n";
+    ranges = false; len = 0;
+    REQUIRE(romm::parseLengthAndRangesForTest(hdrs, ranges, len));
+    REQUIRE(len == 999);
+}
+
+TEST_CASE("parseLengthAndRangesForTest fails without length info") {
+    std::string hdrs = "Accept-Ranges: bytes\r\n";
+    bool ranges = false;
+    uint64_t len = 0;
+    REQUIRE_FALSE(romm::parseLengthAndRangesForTest(hdrs, ranges, len));
+    REQUIRE(len == 0);
 }

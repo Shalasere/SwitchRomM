@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <utility>
 
 namespace romm {
 
@@ -50,5 +51,13 @@ struct Status {
 
     std::string lastError;
 };
+
+// Helper to run a callable while holding the status mutex, returning its result.
+// Keeps locking policy consistent across UI and worker paths.
+template <typename F>
+auto withStatusLock(Status& st, F&& fn) -> decltype(fn()) {
+    std::lock_guard<std::mutex> lock(st.mutex);
+    return fn();
+}
 
 } // namespace romm

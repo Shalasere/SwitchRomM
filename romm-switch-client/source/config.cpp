@@ -3,6 +3,7 @@
 #include "mini/json.hpp"
 #include <fstream>
 #include <cctype>
+#include <sstream>
 
 namespace romm {
 
@@ -18,11 +19,9 @@ static void trim(std::string& s) {
     s = s.substr(i);
 }
 
-static bool parseEnv(const std::string& path, Config& outCfg) {
-    std::ifstream f(path);
-    if (!f) return false;
+static bool parseEnvStream(std::istream& in, Config& outCfg) {
     std::string line;
-    while (std::getline(f, line)) {
+    while (std::getline(in, line)) {
         if (line.empty()) continue;
         if (line[0] == '#' || line[0] == ';') continue;
         auto pos = line.find('=');
@@ -46,6 +45,12 @@ static bool parseEnv(const std::string& path, Config& outCfg) {
         } else if (key == "log_level") outCfg.logLevel = toLower(val);
     }
     return true;
+}
+
+static bool parseEnv(const std::string& path, Config& outCfg) {
+    std::ifstream f(path);
+    if (!f) return false;
+    return parseEnvStream(f, outCfg);
 }
 
 static bool parseJson(const std::string& path, Config& outCfg, std::string& outError) {
@@ -116,5 +121,28 @@ bool loadConfig(Config& outCfg, std::string& outError) {
 
     return true;
 }
+
+#ifdef UNIT_TEST
+bool parseEnvString(const std::string& contents, Config& outCfg, std::string& outError) {
+    outCfg = Config{};
+    // Force required fields to be explicitly provided in tests.
+    outCfg.downloadDir.clear();
+    std::istringstream iss(contents);
+    if (!parseEnvStream(iss, outCfg)) {
+        outError = "Failed to parse env string";
+        return false;
+    }
+    // mimic normal flow: basic validation
+    if (outCfg.serverUrl.empty() || outCfg.downloadDir.empty()) {
+        outError = "Config missing server_url or download_dir.";
+        return false;
+    }
+    if (outCfg.serverUrl.rfind("https://", 0) == 0) {
+        outError = "https:// not supported; use http:// or a local TLS terminator.";
+        return false;
+    }
+    return true;
+}
+#endif
 
 } // namespace romm

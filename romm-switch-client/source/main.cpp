@@ -851,6 +851,8 @@ int main(int argc, char** argv) {
 
     // Main loop: poll input -> update state -> render current view
     while (running && appletMainLoop()) {
+        // If a previous worker has finished, join and release it so we can start a fresh session.
+        romm::reapDownloadWorkerIfDone();
         bool viewChangedThisFrame = false;
         // TODO(nav): extract view transitions into a ViewController and align hints with mapping.
         // Adjust selection index based on current view (platforms/roms/queue)
@@ -890,93 +892,131 @@ int main(int argc, char** argv) {
                     break;
                 case romm::Action::Select: {
                     // A/Select: context-sensitive (fetch ROMs, open detail, or enqueue)
-                    if (status.currentView == Status::View::PLATFORMS) {
-                        if (!status.platforms.empty() && status.selectedPlatformIndex >= 0 &&
-                            status.selectedPlatformIndex < (int)status.platforms.size()) {
-                            std::string pid = status.platforms[status.selectedPlatformIndex].id;
-                            romm::logLine("Fetching ROMs for platform id=" + pid);
-                            std::string err;
-                            if (romm::fetchGamesForPlatform(config, pid, status, err)) {
-                                resetNav();
-                                status.currentView = Status::View::ROMS;
-                                status.selectedRomIndex = 0;
-                                gViewTraceFrames = 8;
-                                romm::logLine("Fetched ROMs count=" + std::to_string(status.roms.size()) +
-                                              (status.roms.empty() ? "" : " first=" + status.roms[0].title));
-                                viewChangedThisFrame = true;
-                            } else {
-                                status.currentView = Status::View::ERROR;
-                                status.lastError = err;
-                                romm::logLine("Failed to fetch ROMs: " + err);
+                    Status::View currentView;
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        currentView = status.currentView;
+                    }
+                    if (currentView == Status::View::PLATFORMS) {
+                        int sel = -1;
+                        std::string pid;
+                        {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            if (!status.platforms.empty() &&
+                                status.selectedPlatformIndex >= 0 &&
+                                status.selectedPlatformIndex < (int)status.platforms.size()) {
+                                sel = status.selectedPlatformIndex;
+                                pid = status.platforms[sel].id;
                             }
-                        } else {
-                            romm::logLine("Select on PLATFORMS but index out of range.");
                         }
-                    } else if (status.currentView == Status::View::ROMS && !status.roms.empty()) {
-                        status.currentView = Status::View::DETAIL;
+                        if (sel < 0 || pid.empty()) {
+                            romm::logLine("Select on PLATFORMS but index out of range.");
+                            break;
+                        }
+                        romm::logLine("Fetching ROMs for platform id=" + pid);
+                        std::string err;
+                        if (romm::fetchGamesForPlatform(config, pid, status, err)) {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            resetNav();
+                            status.currentView = Status::View::ROMS;
+                            status.selectedRomIndex = 0;
+                            gViewTraceFrames = 8;
+                            romm::logLine("Fetched ROMs count=" + std::to_string(status.roms.size()) +
+                                          (status.roms.empty() ? "" : " first=" + status.roms[0].title));
+                            viewChangedThisFrame = true;
+                        } else {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            status.currentView = Status::View::ERROR;
+                            status.lastError = err;
+                            romm::logLine("Failed to fetch ROMs: " + err);
+                        }
+                    } else if (currentView == Status::View::ROMS) {
+                        {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            if (!status.roms.empty()) {
+                                status.currentView = Status::View::DETAIL;
+                                viewChangedThisFrame = true;
+                                romm::logLine("Open DETAIL for idx=" + std::to_string(status.selectedRomIndex));
+                            }
+                        }
                         gViewTraceFrames = 8;
-                        viewChangedThisFrame = true;
-                        romm::logLine("Open DETAIL for idx=" + std::to_string(status.selectedRomIndex));
-                      } else if (status.currentView == Status::View::DETAIL && !status.roms.empty()) {
-                          if (status.selectedRomIndex >= 0 && status.selectedRomIndex < (int)status.roms.size()) {
-                          // Fetch DetailedRom files[] to pick the best downloadable asset (xci/nsp).
-                          romm::Game enriched = status.roms[status.selectedRomIndex];
-                          std::string err;
-                          if (!romm::enrichGameWithFiles(config, enriched, err)) {
-                              status.currentView = Status::View::ERROR;
-                              status.lastError = err;
-                              romm::logLine("Failed to enrich ROM with files: " + err);
-                              break;
-                          }
-                          // Persist enriched fields back into the ROM list and queue under lock.
+                      } else if (currentView == Status::View::DETAIL) {
+                          int sel = -1;
                           {
                               std::lock_guard<std::mutex> lock(status.mutex);
-                              status.roms[status.selectedRomIndex] = enriched;
-                              status.downloadQueue.push_back(enriched);
-                              status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
-                              status.prevQueueView = Status::View::DETAIL;
+                              if (status.selectedRomIndex >= 0 && status.selectedRomIndex < (int)status.roms.size()) {
+                                  sel = status.selectedRomIndex;
+                              }
                           }
-                          romm::logLine("Queued ROM: " + enriched.title +
-                                        " | Queue size=" + std::to_string(status.downloadQueue.size()));
-                          status.currentView = Status::View::QUEUE; // show queued list immediately
-                          gViewTraceFrames = 8;
-                          viewChangedThisFrame = true;
+                          if (sel >= 0) {
+                              romm::Game enriched;
+                              {
+                                  std::lock_guard<std::mutex> lock(status.mutex);
+                                  enriched = status.roms[sel];
+                              }
+                              std::string err;
+                              if (!romm::enrichGameWithFiles(config, enriched, err)) {
+                                  std::lock_guard<std::mutex> lock(status.mutex);
+                                  status.currentView = Status::View::ERROR;
+                                  status.lastError = err;
+                                  romm::logLine("Failed to enrich ROM with files: " + err);
+                                  break;
+                              }
+                                  {
+                                      std::lock_guard<std::mutex> lock(status.mutex);
+                                      status.roms[sel] = enriched;
+                                      status.downloadQueue.push_back(enriched);
+                                      status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
+                                      status.downloadCompleted = false; // new work pending, clear stale banner
+                                      status.prevQueueView = Status::View::DETAIL;
+                                      status.currentView = Status::View::QUEUE;
+                                  }
+                                  romm::logLine("Queued ROM: " + enriched.title +
+                                                " | Queue size=" + std::to_string(status.downloadQueue.size()));
+                              gViewTraceFrames = 8;
+                              viewChangedThisFrame = true;
                           }
                     }
                     break;
                 }
                 case romm::Action::Back: {
                     // B/Back: navigate up one level or return from queue
-                    romm::logLine(std::string("Back pressed in view=") + viewName(status.currentView));
-                    if (status.currentView == Status::View::ROMS) {
-                        status.currentView = Status::View::PLATFORMS;
-                        resetNav();
-                        gViewTraceFrames = 8;
-                        romm::logLine("Back to PLATFORMS.");
-                        viewChangedThisFrame = true;
-                    } else if (status.currentView == Status::View::DETAIL) {
-                        status.currentView = Status::View::ROMS;
-                        gViewTraceFrames = 8;
-                        romm::logLine("Back to ROMS from DETAIL.");
-                        viewChangedThisFrame = true;
-                    } else if (status.currentView == Status::View::DOWNLOADING) {
-                        status.currentView = Status::View::QUEUE;
-                        gViewTraceFrames = 8;
-                        romm::logLine("Back to QUEUE from DOWNLOADING.");
-                        viewChangedThisFrame = true;
-                    } else if (status.currentView == Status::View::QUEUE) {
-                        Status::View dest = status.prevQueueView;
-                        if (dest == Status::View::QUEUE) dest = Status::View::PLATFORMS;
-                        if (dest == Status::View::DOWNLOADING) dest = Status::View::PLATFORMS; // avoid loop
-                        status.currentView = dest;
-                        gViewTraceFrames = 8;
-                        romm::logLine(std::string("Back from QUEUE to ") + viewName(dest) + ".");
-                        viewChangedThisFrame = true;
-                    } else if (status.currentView == Status::View::PLATFORMS) {
-                        // No-op to avoid accidental exits; Plus still exits.
-                        romm::logLine("Back on PLATFORMS ignored.");
-                    } else if (status.currentView == Status::View::ERROR) {
-                        running = false;
+                    Status::View cur;
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        cur = status.currentView;
+                    }
+                    romm::logLine(std::string("Back pressed in view=") + viewName(cur));
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        if (cur == Status::View::ROMS) {
+                            status.currentView = Status::View::PLATFORMS;
+                            resetNav();
+                            gViewTraceFrames = 8;
+                            romm::logLine("Back to PLATFORMS.");
+                            viewChangedThisFrame = true;
+                        } else if (cur == Status::View::DETAIL) {
+                            status.currentView = Status::View::ROMS;
+                            gViewTraceFrames = 8;
+                            romm::logLine("Back to ROMS from DETAIL.");
+                            viewChangedThisFrame = true;
+                        } else if (cur == Status::View::DOWNLOADING) {
+                            status.currentView = Status::View::QUEUE;
+                            gViewTraceFrames = 8;
+                            romm::logLine("Back to QUEUE from DOWNLOADING.");
+                            viewChangedThisFrame = true;
+                        } else if (cur == Status::View::QUEUE) {
+                            Status::View dest = status.prevQueueView;
+                            if (dest == Status::View::QUEUE || dest == Status::View::DOWNLOADING) dest = Status::View::PLATFORMS;
+                            status.currentView = dest;
+                            gViewTraceFrames = 8;
+                            romm::logLine(std::string("Back from QUEUE to ") + viewName(dest) + ".");
+                            viewChangedThisFrame = true;
+                        } else if (cur == Status::View::PLATFORMS) {
+                            romm::logLine("Back on PLATFORMS ignored.");
+                        } else if (cur == Status::View::ERROR) {
+                            running = false;
+                        }
                     }
                     break;
                 }
@@ -1001,35 +1041,43 @@ int main(int argc, char** argv) {
                 case romm::Action::StartDownload:
                     // X in QUEUE: start downloads and show downloading view
                     // TODO(queue UX): dedupe entries and surface per-item failures/history in UI.
-                    if (status.currentView == Status::View::QUEUE && !status.downloadQueue.empty()) {
-                        if (status.downloadWorkerRunning.load()) {
-                            // Already running: just open the view without resetting counters.
-                            romm::logLine("Download already running; opening DOWNLOADING view.");
-                            status.currentView = Status::View::DOWNLOADING;
-                            gViewTraceFrames = 8;
-                            viewChangedThisFrame = true;
-                        } else {
-                            {
+                    {
+                        bool allowStart = false;
+                        {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            allowStart = (status.currentView == Status::View::QUEUE && !status.downloadQueue.empty());
+                        }
+                        if (allowStart) {
+                            if (status.downloadWorkerRunning.load()) {
+                                romm::logLine("Download already running; opening DOWNLOADING view.");
                                 std::lock_guard<std::mutex> lock(status.mutex);
                                 status.currentView = Status::View::DOWNLOADING;
-                                status.currentDownloadIndex = 0;
-                                status.currentDownloadedBytes.store(0);
-                                status.totalDownloadedBytes.store(0);
-                                status.totalDownloadBytes.store(0);
-                                for (auto& g : status.downloadQueue) status.totalDownloadBytes.fetch_add(g.sizeBytes);
-                                if (!status.downloadQueue.empty()) {
-                                    status.currentDownloadSize.store(status.downloadQueue[0].sizeBytes);
-                                    status.currentDownloadTitle = status.downloadQueue[0].title;
+                                gViewTraceFrames = 8;
+                                viewChangedThisFrame = true;
+                            } else {
+                                {
+                                    std::lock_guard<std::mutex> lock(status.mutex);
+                                    status.currentView = Status::View::DOWNLOADING;
+                                    status.currentDownloadIndex = 0;
+                                    status.currentDownloadedBytes.store(0);
+                                    status.totalDownloadedBytes.store(0);
+                                    status.totalDownloadBytes.store(0);
+                                    status.downloadCompleted = false; // clear any prior completion banner
+                                    for (auto& g : status.downloadQueue) status.totalDownloadBytes.fetch_add(g.sizeBytes);
+                                    if (!status.downloadQueue.empty()) {
+                                        status.currentDownloadSize.store(status.downloadQueue[0].sizeBytes);
+                                        status.currentDownloadTitle = status.downloadQueue[0].title;
+                                    }
                                 }
+                                romm::logLine("Starting downloads for queue size=" + std::to_string(status.downloadQueue.size()) +
+                                              " totalBytes=" + std::to_string(status.totalDownloadBytes.load()));
+                                startDownloadWorker(status, config);
+                                gViewTraceFrames = 8;
+                                viewChangedThisFrame = true;
                             }
-                            romm::logLine("Starting downloads for queue size=" + std::to_string(status.downloadQueue.size()) +
-                                          " totalBytes=" + std::to_string(status.totalDownloadBytes.load()));
-                            startDownloadWorker(status, config);
-                            gViewTraceFrames = 8;
-                            viewChangedThisFrame = true;
+                        } else {
+                            romm::logLine("StartDownload outside QUEUE; ignoring.");
                         }
-                    } else {
-                        romm::logLine("StartDownload outside QUEUE; ignoring.");
                     }
                     break;
                 default:

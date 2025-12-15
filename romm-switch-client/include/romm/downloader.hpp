@@ -13,4 +13,12 @@ void startDownloadWorker(Status& status, const Config& cfg);
 // Signals the worker to stop and waits for it to finish.
 void stopDownloadWorker();
 
+// If a previous worker has finished, join and release its resources.
+void reapDownloadWorkerIfDone();
+
+#ifdef UNIT_TEST
+// Test helper: parse HTTP headers for content length and range support.
+bool parseLengthAndRangesForTest(const std::string& headers, bool& supportsRanges, uint64_t& contentLength);
+#endif
+
 } // namespace romm

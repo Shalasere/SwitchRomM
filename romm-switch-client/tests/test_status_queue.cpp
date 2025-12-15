@@ -86,3 +86,28 @@ TEST_CASE("progress counters accumulate safely") {
     REQUIRE(st.totalDownloadedBytes.load() == 100);
     // Totals can exceed current size if multiple items are considered; here they match.
 }
+
+TEST_CASE("withStatusLock guards mutations and returns values") {
+    romm::Status st;
+    int snapshotSize = romm::withStatusLock(st, [&]() {
+        st.downloadQueue.push_back(romm::Game{});
+        st.downloadQueue.push_back(romm::Game{});
+        st.selectedQueueIndex = 1;
+        return static_cast<int>(st.downloadQueue.size());
+    });
+    REQUIRE(snapshotSize == 2);
+    // Verify under lock that state persisted.
+    romm::withStatusLock(st, [&]() {
+        REQUIRE(st.downloadQueue.size() == 2);
+        REQUIRE(st.selectedQueueIndex == 1);
+        st.downloadQueue.clear();
+        st.selectedQueueIndex = 0;
+        return 0;
+    });
+    // After clearing, size should be 0.
+    romm::withStatusLock(st, [&]() {
+        REQUIRE(st.downloadQueue.empty());
+        REQUIRE(st.selectedQueueIndex == 0);
+        return 0;
+    });
+}

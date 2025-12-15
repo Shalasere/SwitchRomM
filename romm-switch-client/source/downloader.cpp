@@ -4,6 +4,7 @@
 #include "romm/api.hpp"
 #include "romm/util.hpp"
 #include "romm/raii.hpp"
+#include "romm/manifest.hpp"
 #include <switch.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -82,6 +83,53 @@ struct PreflightInfo {
     bool supportsRanges{false};
     uint64_t contentLength{0};
 };
+
+static Manifest buildManifestFor(const Game& g, uint64_t totalSize) {
+    Manifest m;
+    m.rommId = g.id;
+    m.fileId = g.fileId;
+    m.fsName = g.fsName.empty() ? safeName(g.title) : g.fsName;
+    m.url = g.downloadUrl;
+    m.totalSize = totalSize;
+    m.partSize = kPartSize;
+    if (m.partSize == 0) m.partSize = totalSize; // safety
+    uint64_t partSize = m.partSize;
+    uint64_t remaining = totalSize;
+    int idx = 0;
+    while (remaining > 0) {
+        uint64_t sz = (remaining > partSize) ? partSize : remaining;
+        m.parts.push_back(ManifestPart{idx, sz, ""});
+        remaining -= sz;
+        idx++;
+    }
+    return m;
+}
+
+static bool writeManifestFile(const std::string& path, const Manifest& m) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out << manifestToJson(m);
+    return true;
+}
+
+static bool readManifestFile(const std::string& path, Manifest& m) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::string err;
+    return manifestFromJson(content, m, err);
+}
+
+static bool parsePartIndex(const std::string& name, int& outIdx) {
+    if (name.size() <= 5 || name.substr(name.size() - 5) != ".part") return false;
+    std::string stem = name.substr(0, name.size() - 5);
+    if (stem.empty()) return false;
+    for (char c : stem) {
+        if (c < '0' || c > '9') return false;
+    }
+    outIdx = std::atoi(stem.c_str());
+    return true;
+}
 
 // Preflight: try HEAD first; if it fails or is rejected, fall back to Range: 0-0 GET.
 static bool preflight(const std::string& url, const std::string& authBasic, int timeoutSec, PreflightInfo& info) {
@@ -183,6 +231,18 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
     }
     return info.contentLength > 0;
 }
+
+#ifdef UNIT_TEST
+bool parseLengthAndRangesForTest(const std::string& headers, bool& supportsRanges, uint64_t& contentLength) {
+    PreflightInfo info;
+    info.supportsRanges = false;
+    info.contentLength = 0;
+    parseLengthAndRanges(headers, info);
+    supportsRanges = info.supportsRanges;
+    contentLength = info.contentLength;
+    return contentLength > 0;
+}
+#endif
 
 // Stream a continuous HTTP GET (optionally with Range) and split into FAT32-friendly parts.
 // TODO(manifest/hashes): track expected parts/sizes/hashes to validate resume beyond size-only.
@@ -366,6 +426,9 @@ static bool streamDownload(const std::string& url,
 
 // Rename *.part -> 00/01... then move tmpDir to finalDir (archive bit set for multi-part).
 static bool finalizeParts(const std::string& tmpDir, const std::string& finalDir) {
+    // Drop manifest (avoid carrying metadata into the final folder).
+    std::error_code rmManifestEc;
+    std::filesystem::remove(tmpDir + "/manifest.json", rmManifestEc);
     // rename *.part -> 00/01... and move dir + set archive bit
     DIR* d = opendir(tmpDir.c_str());
     if (!d) return false;
@@ -493,43 +556,6 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     ensureDirectory(tmpDir);
     logLine("Using temp dir: " + tmpDir);
     logLine("Download URL: " + g.downloadUrl);
-    status.currentDownloadSize.store(g.sizeBytes);
-    status.currentDownloadedBytes.store(0);
-    status.currentDownloadTitle = g.title;
-    logLine("Begin download: " + g.title + " size=" + std::to_string(g.sizeBytes));
-
-    // Calculate how many bytes we already have (for resume)
-    uint64_t haveBytes = 0;
-    {
-        DIR* d = opendir(tmpDir.c_str());
-        if (d) {
-            struct dirent* ent;
-            while ((ent = readdir(d)) != nullptr) {
-                std::string n = ent->d_name;
-                if (n.size() > 5 && n.substr(n.size() - 5) == ".part") {
-                    std::string p = tmpDir + "/" + n;
-                    struct stat st{};
-                    if (stat(p.c_str(), &st) == 0) haveBytes += (uint64_t)st.st_size;
-                }
-            }
-            closedir(d);
-        }
-    }
-    if (haveBytes > g.sizeBytes) haveBytes = g.sizeBytes;
-
-    {
-        std::lock_guard<std::mutex> lock(status.mutex);
-        status.currentDownloadSize.store(g.sizeBytes);
-        status.currentDownloadedBytes.store(haveBytes);
-        status.currentDownloadTitle = g.title;
-    }
-    // Count any already-present bytes toward total downloaded so the bar doesn't regress
-    uint64_t creditedExisting = 0;
-    if (haveBytes > 0) {
-        status.totalDownloadedBytes.fetch_add(haveBytes);
-        creditedExisting = haveBytes;
-    }
-
     PreflightInfo pf;
     if (!preflight(g.downloadUrl, auth, cfg.httpTimeoutSeconds, pf)) {
         logLine("Preflight failed for " + g.title + " (HEAD/Range probe). Proceeding with metadata size=" + std::to_string(g.sizeBytes));
@@ -548,6 +574,81 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     }
 
     uint64_t totalSize = status.currentDownloadSize.load();
+
+    // Prepare manifest (load existing or create new) to drive resume decisions.
+    const std::string manifestPath = tmpDir + "/manifest.json";
+    Manifest manifest;
+    bool haveManifest = readManifestFile(manifestPath, manifest);
+    bool needRewrite = true;
+    if (haveManifest) {
+        // Reuse only if consistent with current download parameters.
+        if (manifest.totalSize == totalSize &&
+            manifest.partSize == kPartSize &&
+            manifest.url == g.downloadUrl) {
+            needRewrite = false;
+        }
+    }
+    if (needRewrite) {
+        manifest = buildManifestFor(g, totalSize);
+        writeManifestFile(manifestPath, manifest);
+    }
+
+    // Inspect existing parts for resume; only count parts matching manifest sizes.
+    std::vector<std::pair<int, uint64_t>> observedParts;
+    DIR* d = opendir(tmpDir.c_str());
+    if (d) {
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr) {
+            int idx = -1;
+            if (!parsePartIndex(ent->d_name, idx)) continue;
+            std::string p = tmpDir + "/" + ent->d_name;
+            struct stat st{};
+            if (stat(p.c_str(), &st) == 0) {
+                observedParts.push_back({idx, static_cast<uint64_t>(st.st_size)});
+            }
+        }
+        closedir(d);
+    }
+    auto resumePlan = planResume(manifest, observedParts);
+    // Drop any invalid parts so we never append onto bad data.
+    for (int idx : resumePlan.invalidParts) {
+        std::string p = tmpDir + "/";
+        if (idx < 10) p += "0";
+        p += std::to_string(idx) + ".part";
+        std::error_code ec;
+        std::filesystem::remove(p, ec);
+        if (ec) {
+            logLine("Warning: failed to remove invalid part " + p + " err=" + ec.message());
+        }
+    }
+    if (resumePlan.partialIndex >= 0 && resumePlan.partialBytes > 0) {
+        logLine("Resuming partial part idx=" + std::to_string(resumePlan.partialIndex) +
+                " bytes=" + std::to_string(resumePlan.partialBytes));
+    }
+    // Mark validated parts as completed in manifest and persist.
+    if (!resumePlan.validParts.empty()) {
+        for (auto& part : manifest.parts) {
+            if (std::find(resumePlan.validParts.begin(), resumePlan.validParts.end(), part.index) != resumePlan.validParts.end()) {
+                part.completed = true;
+            }
+        }
+        writeManifestFile(manifestPath, manifest);
+    }
+
+    uint64_t haveBytes = std::min<uint64_t>(resumePlan.bytesHave, totalSize);
+    {
+        std::lock_guard<std::mutex> lock(status.mutex);
+        status.currentDownloadSize.store(totalSize);
+        status.currentDownloadedBytes.store(haveBytes);
+        status.currentDownloadTitle = g.title;
+    }
+    // Count any already-present bytes toward total downloaded so the bar doesn't regress
+    uint64_t creditedExisting = 0;
+    if (haveBytes > 0) {
+        status.totalDownloadedBytes.fetch_add(haveBytes);
+        creditedExisting = haveBytes;
+    }
+
     if (haveBytes >= totalSize) {
         logLine("Already have full size for " + g.title);
     }
@@ -719,7 +820,14 @@ static void workerLoop() {
 } // namespace
 
 void startDownloadWorker(Status& status, const Config& cfg) {
-    if (gCtx.worker.joinable()) return;
+    // If a previous worker finished but wasn't joined, clean it up now.
+    if (gCtx.worker.joinable()) {
+        if (status.downloadWorkerRunning.load()) {
+            // Still running; do not start another.
+            return;
+        }
+        gCtx.worker.join();
+    }
     gCtx.stopRequested.store(false);
     gCtx.status = &status;
     gCtx.cfg = cfg;
@@ -732,6 +840,18 @@ void stopDownloadWorker() {
         gCtx.worker.join();
     }
     gCtx.status = nullptr;
+    gCtx.worker = std::thread(); // reset
+}
+
+void reapDownloadWorkerIfDone() {
+    if (gCtx.worker.joinable()) {
+        // Safe to join if the worker has finished (not running or stop requested).
+        if (!gCtx.status || !gCtx.status->downloadWorkerRunning.load()) {
+            gCtx.worker.join();
+            gCtx.status = nullptr;
+            gCtx.worker = std::thread();
+        }
+    }
 }
 
 } // namespace romm

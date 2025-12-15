@@ -26,4 +26,9 @@ struct Config {
 
 bool loadConfig(Config& outCfg, std::string& outError);
 
+#ifdef UNIT_TEST
+// Test helper: parse .env-style content from an in-memory string.
+bool parseEnvString(const std::string& contents, Config& outCfg, std::string& outError);
+#endif
+
 } // namespace romm

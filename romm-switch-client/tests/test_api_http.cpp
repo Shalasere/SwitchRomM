@@ -65,3 +65,22 @@ TEST_CASE("httpRequestStreamMock detects short read against Content-Length") {
     REQUIRE_FALSE(ok);
     REQUIRE(err == "Short read");
 }
+
+TEST_CASE("httpRequestStreamMock propagates sink abort") {
+    const std::string raw =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "hello";
+
+    romm::HttpResponse resp;
+    std::string err;
+    bool ok = romm::httpRequestStreamMock(raw, resp,
+        [&](const char* /*data*/, size_t /*len*/) {
+            return false; // simulate sink abort (e.g., disk error)
+        },
+        err);
+
+    REQUIRE_FALSE(ok);
+    REQUIRE(err == "Sink aborted");
+}

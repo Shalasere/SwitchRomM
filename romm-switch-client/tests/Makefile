@@ -13,6 +13,8 @@ CXXFLAGS ?= -std=c++17 -Wall -Wextra -I../include -I../tests/include -DUNIT_TEST
 
 TARGET := romm_tests
 SOURCES := ../source/api.cpp \
+           ../source/config.cpp \
+           ../source/manifest.cpp \
            test_api.cpp \
            test_api_http.cpp \
            test_api_catch.cpp \
@@ -20,7 +22,11 @@ SOURCES := ../source/api.cpp \
            test_status_queue.cpp \
            test_config.cpp \
            test_thread_safety.cpp \
-           logger_stub.cpp
+           test_config_env.cpp \
+           test_manifest.cpp \
+           test_worker_reap.cpp \
+           logger_stub.cpp \
+           downloader_stub.cpp
 
 all: $(TARGET)
 
