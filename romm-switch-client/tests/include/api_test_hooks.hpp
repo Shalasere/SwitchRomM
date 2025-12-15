@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 
 namespace romm {
@@ -11,4 +12,10 @@ bool parseHttpUrl(const std::string& url,
                   std::string& err);
 
 bool decodeChunkedBody(const std::string& body, std::string& decoded);
+
+struct HttpResponse;
+bool httpRequestStreamMock(const std::string& rawResponse,
+                           HttpResponse& resp,
+                           const std::function<bool(const char*, size_t)>& onData,
+                           std::string& err);
 } // namespace romm

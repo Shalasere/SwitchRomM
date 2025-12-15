@@ -855,6 +855,7 @@ int main(int argc, char** argv) {
         // TODO(nav): extract view transitions into a ViewController and align hints with mapping.
         // Adjust selection index based on current view (platforms/roms/queue)
         auto adjustSelection = [&](int dir) {
+            std::lock_guard<std::mutex> lock(status.mutex);
             if (status.currentView == Status::View::PLATFORMS) {
                 status.selectedPlatformIndex = std::max(0, std::min((int)status.platforms.size() - 1, status.selectedPlatformIndex + dir));
             } else if (status.currentView == Status::View::ROMS || status.currentView == Status::View::DETAIL) {
@@ -918,25 +919,28 @@ int main(int argc, char** argv) {
                         romm::logLine("Open DETAIL for idx=" + std::to_string(status.selectedRomIndex));
                       } else if (status.currentView == Status::View::DETAIL && !status.roms.empty()) {
                           if (status.selectedRomIndex >= 0 && status.selectedRomIndex < (int)status.roms.size()) {
-                              // Fetch DetailedRom files[] to pick the best downloadable asset (xci/nsp).
-                              romm::Game enriched = status.roms[status.selectedRomIndex];
-                              std::string err;
-                              if (!romm::enrichGameWithFiles(config, enriched, err)) {
-                                  status.currentView = Status::View::ERROR;
-                                  status.lastError = err;
-                                  romm::logLine("Failed to enrich ROM with files: " + err);
-                                  break;
-                              }
-                              // Persist enriched fields back into the ROM list and queue.
+                          // Fetch DetailedRom files[] to pick the best downloadable asset (xci/nsp).
+                          romm::Game enriched = status.roms[status.selectedRomIndex];
+                          std::string err;
+                          if (!romm::enrichGameWithFiles(config, enriched, err)) {
+                              status.currentView = Status::View::ERROR;
+                              status.lastError = err;
+                              romm::logLine("Failed to enrich ROM with files: " + err);
+                              break;
+                          }
+                          // Persist enriched fields back into the ROM list and queue under lock.
+                          {
+                              std::lock_guard<std::mutex> lock(status.mutex);
                               status.roms[status.selectedRomIndex] = enriched;
                               status.downloadQueue.push_back(enriched);
                               status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
-                              romm::logLine("Queued ROM: " + enriched.title +
-                                            " | Queue size=" + std::to_string(status.downloadQueue.size()));
                               status.prevQueueView = Status::View::DETAIL;
-                              status.currentView = Status::View::QUEUE; // show queued list immediately
-                              gViewTraceFrames = 8;
-                              viewChangedThisFrame = true;
+                          }
+                          romm::logLine("Queued ROM: " + enriched.title +
+                                        " | Queue size=" + std::to_string(status.downloadQueue.size()));
+                          status.currentView = Status::View::QUEUE; // show queued list immediately
+                          gViewTraceFrames = 8;
+                          viewChangedThisFrame = true;
                           }
                     }
                     break;
@@ -979,15 +983,18 @@ int main(int argc, char** argv) {
                 case romm::Action::OpenQueue:
                     // Y/X: open queue from any view; remember where we came from (except downloading)
                     // Only update prevQueueView if we're not already in QUEUE
-                    if (status.currentView != Status::View::QUEUE &&
-                        status.currentView != Status::View::DOWNLOADING) { // keep last real view (plat/roms/detail)
-                        status.prevQueueView = status.currentView;
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        if (status.currentView != Status::View::QUEUE &&
+                            status.currentView != Status::View::DOWNLOADING) { // keep last real view (plat/roms/detail)
+                            status.prevQueueView = status.currentView;
+                        }
+                        status.currentView = Status::View::QUEUE;
+                        if (status.selectedQueueIndex >= (int)status.downloadQueue.size())
+                            status.selectedQueueIndex = status.downloadQueue.empty() ? 0 : (int)status.downloadQueue.size() - 1;
+                        romm::logLine(std::string("Opened queue view from ") + viewName(status.prevQueueView) +
+                                      " items=" + std::to_string(status.downloadQueue.size()));
                     }
-                    status.currentView = Status::View::QUEUE;
-                    if (status.selectedQueueIndex >= (int)status.downloadQueue.size())
-                        status.selectedQueueIndex = status.downloadQueue.empty() ? 0 : (int)status.downloadQueue.size() - 1;
-                    romm::logLine(std::string("Opened queue view from ") + viewName(status.prevQueueView) +
-                                  " items=" + std::to_string(status.downloadQueue.size()));
                     gViewTraceFrames = 8;
                     viewChangedThisFrame = true;
                     break;
@@ -1002,14 +1009,19 @@ int main(int argc, char** argv) {
                             gViewTraceFrames = 8;
                             viewChangedThisFrame = true;
                         } else {
-                            status.currentView = Status::View::DOWNLOADING;
-                            status.currentDownloadIndex = 0;
-                            status.currentDownloadedBytes.store(0);
-                            status.totalDownloadedBytes.store(0);
-                            // Prime totals immediately so HUD isn't zero before worker starts.
-                            status.totalDownloadBytes.store(0);
-                            for (auto& g : status.downloadQueue) status.totalDownloadBytes.fetch_add(g.sizeBytes);
-                            status.currentDownloadSize.store(status.downloadQueue[0].sizeBytes);
+                            {
+                                std::lock_guard<std::mutex> lock(status.mutex);
+                                status.currentView = Status::View::DOWNLOADING;
+                                status.currentDownloadIndex = 0;
+                                status.currentDownloadedBytes.store(0);
+                                status.totalDownloadedBytes.store(0);
+                                status.totalDownloadBytes.store(0);
+                                for (auto& g : status.downloadQueue) status.totalDownloadBytes.fetch_add(g.sizeBytes);
+                                if (!status.downloadQueue.empty()) {
+                                    status.currentDownloadSize.store(status.downloadQueue[0].sizeBytes);
+                                    status.currentDownloadTitle = status.downloadQueue[0].title;
+                                }
+                            }
                             romm::logLine("Starting downloads for queue size=" + std::to_string(status.downloadQueue.size()) +
                                           " totalBytes=" + std::to_string(status.totalDownloadBytes.load()));
                             startDownloadWorker(status, config);

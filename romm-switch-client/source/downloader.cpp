@@ -35,7 +35,6 @@ constexpr uint64_t kFreeSpaceMarginBytes = 200ULL * 1024ULL * 1024ULL; // ~200MB
 struct DownloadContext {
     std::thread worker;
     std::atomic<bool> stopRequested{false};
-    std::mutex mutex;
     Status* status{nullptr};
     Config cfg;
 };

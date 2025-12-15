@@ -1,6 +1,7 @@
 #define CATCH_CONFIG_MAIN
 #include "catch.hpp"
 #include "api_test_hooks.hpp"
+#include "romm/api.hpp"
 #include "romm/util.hpp"
 
 TEST_CASE("parseHttpUrl basic http") {
@@ -92,4 +93,29 @@ TEST_CASE("urlEncode handles safe and unsafe chars") {
     REQUIRE(romm::util::urlEncode("simple") == "simple");
     REQUIRE(romm::util::urlEncode("Hello World") == "Hello%20World");
     REQUIRE(romm::util::urlEncode("a+b/c") == "a%2Bb%2Fc");
+}
+
+TEST_CASE("httpRequestStreamMock streams without buffering") {
+    // Simulate a response where headers and part of the body arrive together,
+    // then additional body chunks follow.
+    std::string raw =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 15\r\n"
+        "\r\n"
+        "hello world 123";
+
+    romm::HttpResponse resp;
+    size_t total = 0;
+    std::string err;
+    bool ok = romm::httpRequestStreamMock(raw, resp,
+        [&](const char* /*data*/, size_t len) {
+            total += len;
+            return true;
+        },
+        err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(resp.statusCode == 200);
+    REQUIRE(total == 15);
+    REQUIRE(resp.body.empty()); // streamed, not buffered into resp.body
 }

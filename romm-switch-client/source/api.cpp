@@ -17,6 +17,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#include <functional>
 #ifndef UNIT_TEST
 #include <sys/socket.h>
 #include <netdb.h>
@@ -25,13 +26,6 @@
 #endif
 
 namespace romm {
-
-struct HttpResponse {
-    int         statusCode   = 0;
-    std::string statusText;
-    std::string headersRaw;
-    std::string body;
-};
 
 bool parseHttpUrl(const std::string& url,
                   std::string& host,
@@ -126,12 +120,12 @@ bool decodeChunkedBody(const std::string& body, std::string& decoded) {
 // Low-level HTTP request: no JSON assumptions.
 // Returns true if we got *any* HTTP response (even 4xx/5xx).
 // resp.statusCode will be 0 on protocol/parse failure.
-static bool httpRequest(const std::string& method,
-                        const std::string& url,
-                        const std::vector<std::pair<std::string, std::string>>& extraHeaders,
-                        int timeoutSec,
-                        HttpResponse& resp,
-                        std::string& err)
+bool httpRequest(const std::string& method,
+                 const std::string& url,
+                 const std::vector<std::pair<std::string, std::string>>& extraHeaders,
+                 int timeoutSec,
+                 HttpResponse& resp,
+                 std::string& err)
 {
     resp = HttpResponse{};
     std::string host, portStr, path;
@@ -264,16 +258,251 @@ static bool httpRequest(const std::string& method,
 
     return true;
 }
+
+// Streaming variant: delivers body via onData, does not keep the payload in memory.
+bool httpRequestStream(const std::string& method,
+                       const std::string& url,
+                       const std::vector<std::pair<std::string, std::string>>& extraHeaders,
+                       int timeoutSec,
+                       HttpResponse& resp,
+                       const std::function<bool(const char*, size_t)>& onData,
+                       std::string& err)
+{
+    resp = HttpResponse{};
+    std::string host, portStr, path;
+    if (!parseHttpUrl(url, host, portStr, path, err)) {
+        return false;
+    }
+
+    struct addrinfo hints{};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+
+    int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
+    if (ret != 0 || !res) {
+        err = "DNS lookup failed for host: " + host;
+        if (res) freeaddrinfo(res);
+        return false;
+    }
+
+    romm::UniqueFd sockFd(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
+    if (!sockFd) {
+        err = "Socket creation failed";
+        freeaddrinfo(res);
+        return false;
+    }
+
+    if (timeoutSec > 0) {
+        timeval tv{}; tv.tv_sec = timeoutSec; tv.tv_usec = 0;
+        setsockopt(sockFd.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sockFd.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
+    if (connect(sockFd.fd, res->ai_addr, res->ai_addrlen) != 0) {
+        err = "Connect failed";
+        freeaddrinfo(res);
+        return false;
+    }
+    freeaddrinfo(res);
+
+    std::ostringstream req;
+    req << method << " " << path << " HTTP/1.1\r\n";
+    req << "Host: " << host << "\r\n";
+    req << "Connection: close\r\n";
+    for (const auto& kv : extraHeaders) {
+        req << kv.first << ": " << kv.second << "\r\n";
+    }
+    req << "\r\n";
+    std::string reqStr = req.str();
+
+    size_t totalSent = 0;
+    while (totalSent < reqStr.size()) {
+        ssize_t n = send(sockFd.fd, reqStr.data() + totalSent,
+                         reqStr.size() - totalSent, 0);
+        if (n <= 0) {
+            err = "Send failed";
+            return false;
+        }
+        totalSent += static_cast<size_t>(n);
+    }
+
+    std::string headerBuf; // only used until headers parsed
+    char buf[8192];
+    bool headersDone = false;
+    size_t bytesSentToSink = 0;
+    bool chunked = false;
+    uint64_t contentLength = 0;
+
+    while (true) {
+        ssize_t n = recv(sockFd.fd, buf, sizeof(buf), 0);
+        if (n < 0) {
+            err = "Recv failed or timed out";
+            return false;
+        } else if (n == 0) {
+            break; // EOF
+        }
+
+        if (!headersDone) {
+            headerBuf.append(buf, buf + n);
+            auto hdrEnd = headerBuf.find("\r\n\r\n");
+            if (hdrEnd == std::string::npos) {
+                continue; // need more header data
+            }
+            headersDone = true;
+            size_t bodyStart = hdrEnd + 4;
+
+            std::string headerBlock = headerBuf.substr(0, hdrEnd);
+            auto firstCrLf = headerBlock.find("\r\n");
+            if (firstCrLf == std::string::npos) {
+                err = "Malformed HTTP response (no status line CRLF)";
+                return false;
+            }
+            resp.headersRaw = headerBlock.substr(firstCrLf + 2);
+
+            std::string statusLine = headerBlock.substr(0, firstCrLf);
+            if (!statusLine.empty() && statusLine.back() == '\r') statusLine.pop_back();
+            std::istringstream sl(statusLine);
+            std::string httpVer;
+            sl >> httpVer >> resp.statusCode;
+            std::getline(sl, resp.statusText);
+            if (!resp.statusText.empty() && resp.statusText.front() == ' ') resp.statusText.erase(resp.statusText.begin());
+
+            std::istringstream hs(headerBlock);
+            std::string line;
+            std::getline(hs, line); // discard status line
+            while (std::getline(hs, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                auto colon = line.find(':');
+                if (colon == std::string::npos) continue;
+                std::string key = line.substr(0, colon);
+                std::string val = line.substr(colon + 1);
+                while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+                std::string keyLower = key;
+                for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (keyLower == "content-length") {
+                    contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
+                } else if (keyLower == "transfer-encoding" && val.find("chunked") != std::string::npos) {
+                    chunked = true;
+                }
+            }
+
+            if (chunked) {
+                err = "Chunked encoding not supported for streaming downloads";
+                return false;
+            }
+
+            // Send any body bytes already received with the headers.
+            if (bodyStart < headerBuf.size()) {
+                size_t bodyBytes = headerBuf.size() - bodyStart;
+                if (!onData(headerBuf.data() + bodyStart, bodyBytes)) {
+                    err = "Sink aborted";
+                    return false;
+                }
+                bytesSentToSink += bodyBytes;
+            }
+            headerBuf.clear(); // free header accumulation to avoid buffering whole body
+            continue;
+        }
+
+        // After headers: stream straight to sink without buffering.
+        if (!onData(buf, static_cast<size_t>(n))) {
+            err = "Sink aborted";
+            return false;
+        }
+        bytesSentToSink += static_cast<size_t>(n);
+    }
+
+    if (contentLength > 0 && bytesSentToSink < contentLength) {
+        err = "Short read";
+        return false;
+    }
+
+    return true;
+}
 #else
 // Stubbed httpRequest for UNIT_TEST builds (network not exercised).
-static bool httpRequest(const std::string&,
-                        const std::string&,
-                        const std::vector<std::pair<std::string, std::string>>&,
-                        int,
-                        HttpResponse&,
-                        std::string& err) {
+bool httpRequest(const std::string&,
+                 const std::string&,
+                 const std::vector<std::pair<std::string, std::string>>&,
+                 int,
+                 HttpResponse&,
+                 std::string& err) {
     err = "httpRequest not available in UNIT_TEST build";
     return false;
+}
+
+bool httpRequestStream(const std::string&,
+                       const std::string&,
+                       const std::vector<std::pair<std::string, std::string>>&,
+                       int,
+                       HttpResponse&,
+                       const std::function<bool(const char*, size_t)>&,
+                       std::string& err) {
+    err = "httpRequestStream not available in UNIT_TEST build";
+    return false;
+}
+
+// Test helper: simulate streaming from a raw HTTP response string.
+bool httpRequestStreamMock(const std::string& rawResponse,
+                           HttpResponse& resp,
+                           const std::function<bool(const char*, size_t)>& sink,
+                           std::string& err) {
+    resp = HttpResponse{};
+    auto hdrEnd = rawResponse.find("\r\n\r\n");
+    if (hdrEnd == std::string::npos) {
+        err = "Malformed response";
+        return false;
+    }
+    std::string headerBlock = rawResponse.substr(0, hdrEnd);
+    std::string body = rawResponse.substr(hdrEnd + 4);
+
+    auto firstCrLf = headerBlock.find("\r\n");
+    if (firstCrLf == std::string::npos) {
+        err = "Malformed status line";
+        return false;
+    }
+    resp.headersRaw = headerBlock.substr(firstCrLf + 2);
+    std::string statusLine = headerBlock.substr(0, firstCrLf);
+    if (!statusLine.empty() && statusLine.back() == '\r') statusLine.pop_back();
+    std::istringstream sl(statusLine);
+    std::string httpVer;
+    sl >> httpVer >> resp.statusCode;
+    std::getline(sl, resp.statusText);
+    if (!resp.statusText.empty() && resp.statusText.front() == ' ') resp.statusText.erase(resp.statusText.begin());
+
+    // Parse headers: reject chunked, track content-length for short-read detection.
+    uint64_t contentLength = 0;
+    std::istringstream hs(headerBlock.substr(firstCrLf + 2));
+    std::string line;
+    while (std::getline(hs, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        std::string val = line.substr(colon + 1);
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+        std::string keyLower = key;
+        for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (keyLower == "transfer-encoding" && val.find("chunked") != std::string::npos) {
+            err = "Chunked not supported in mock";
+            return false;
+        } else if (keyLower == "content-length") {
+            contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
+        }
+    }
+
+    if (!body.empty()) {
+        if (!sink(body.data(), body.size())) {
+            err = "Sink aborted";
+            return false;
+        }
+    }
+    if (contentLength > 0 && body.size() < contentLength) {
+        err = "Short read";
+        return false;
+    }
+    return true;
 }
 #endif
 

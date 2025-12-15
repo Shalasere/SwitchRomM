@@ -1,7 +1,7 @@
 # RomM Switch Client - Technical Review
 
 Quick review of the C++17/libnx/SDL2 codebase: architecture, flows, risks, and pointers for contributors.  
-Last updated: 2025-12-12 (file_id downloads, macron UTF-8 fix, resume counter fixes, archive-bit finalize, logging dirs ensured, docs synced, host tests for HTTP parsing/chunked decoding).
+Last updated: 2025-12-14 (HTTP streaming unified, memory blow-up fixed, partial status locking, controls finalized, Catch2 streaming test added).
 
 ## Architecture snapshot
 - **Entry/UI**: `source/main.cpp` - SDL init, config load, API fetch, input handling, view transitions, rendering.
@@ -21,10 +21,10 @@ Last updated: 2025-12-12 (file_id downloads, macron UTF-8 fix, resume counter fi
 
 ## Issues (bugs/risks)
 Severity: [H]=High, [M]=Medium, [L]=Low. File refs approximate.
-- [H] Thread safety (`source/downloader.cpp`, `source/main.cpp`): `Status` mutated by worker and UI with no locks. **Fix**: add mutex/message-passing; keep progress in atomics.
-- [H] HTTP robustness (`source/api.cpp`, `source/downloader.cpp`): Minimal HTTP client (no TLS). Range preflight present; JSON parsing basic. **Fix**: optional TLS, richer status/body handling, tighter resume validation.
-- [M] Archive bit: now set best-effort for multi-part folders; single-part emits flat file. Residual risk: SD errors on finalize.
-- [M] Resume granularity (`source/downloader.cpp`): Only full parts resume; no manifest/checksum; partials deleted. **Fix**: manifest with expected sizes/count, validate sizes, optional checksum; allow mid-part resume. Current counters stay aligned after retries.
+- [H] Thread safety (`source/downloader.cpp`, `source/main.cpp`): `Status` still shared; some locks added for selection and queue mutations, but worker/UI access is not consistently synchronized. **Fix**: guard all non-atomic fields with `Status::mutex` or move to an event queue; keep counters atomic.
+- [H] HTTP robustness (`source/api.cpp`, `source/downloader.cpp`): HTTP-only, no TLS. Streaming now uses unified `httpRequestStream` without buffering full bodies (fixed memory blow-up). **Fix**: optional TLS, richer status/body handling, tighter resume validation.
+- [M] Archive bit: best-effort for multi-part folders; single-part emits flat file. Residual risk: SD errors on finalize.
+- [M] Resume granularity (`source/downloader.cpp`): Only full parts resume; no manifest/checksum; partials deleted. **Fix**: manifest with expected sizes/count, validate sizes, optional checksum; allow mid-part resume.
 - [M] Error handling/retries (`source/downloader.cpp`): Limited retry/backoff; failures drop items and continue. **Fix**: bounded retries/backoff per ROM with user-visible status; keep failed item info in UI.
 - [M] UI feedback (`source/main.cpp` DOWNLOADING): Limited status when stalled; last status/error not shown until failure. **Fix**: show last range/error, per-ROM progress; differentiate "no data yet" vs "stalled."
 - [M] Free-space handling (`source/downloader.cpp`): Single pre-check; no re-check per part; write errors not surfaced. **Fix**: re-check before each part; handle write errors and report to UI.
@@ -46,14 +46,14 @@ Severity: [H]=High, [M]=Medium, [L]=Low. File refs approximate.
 - **Naming/clarity**: Generally clear; global debug counters could be scoped.
 - **Rendering**: `renderStatus` is large; split per view.
 
-## Suggested next steps
-- Add mutex/message queue for worker -> UI state; keep progress atomic.
-- Implement retry/backoff and better HTTP status/body handling; add "last status" text to DOWNLOADING.
-- Add manifest-based resume and part size validation; optional checksum.
-- Maintain archive-bit best-effort on multi-part folders; surface failures in UI/logs.
-- Re-check free space per part; handle write errors.
-- Refactor renderStatus into per-view functions; wrap sockets/files in RAII helpers.
-- Expand inline code comments (partially done) to orient new contributors.
+## Suggested next steps (roadmap)
+- **Thread safety**: Finish guarding all shared `Status` fields; consider an event queue for worker->UI updates; keep only counters atomic.
+- **HTTP/TLS**: Keep the unified streaming path; add TLS or document LAN-only; improve error reporting and retry/backoff.
+- **Resume robustness**: Add per-ROM manifest (sizes/hashes), mid-part resume, and explicit failed-item retention in the queue UI.
+- **Download UX**: Show per-ROM state (pending/downloading/failed/done), surface last error in DOWNLOADING, and add free-space re-checks before each part.
+- **Covers/UI**: Keep async cover loading; placeholder when absent; avoid blocking render thread.
+- **Logging**: Add optional size cap/rotation; keep debug heartbeats behind log_level.
+- **Refactors**: Split `renderStatus` into per-view helpers; wrap sockets/files in RAII (helpers exist); keep controls fixed per `docs/controls.md`.
 
 ## Credits / Inspiration
 - Concepts and flow informed by the RomM muOS client: https://github.com/rommapp/muos-app

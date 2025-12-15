@@ -1,59 +1,27 @@
-#include <iostream>
-#include <string>
+#include "catch.hpp"
 #include "api_test_hooks.hpp"
 
-struct TestRunner {
-    int passed{0};
-    int failed{0};
+TEST_CASE("parseHttpUrl variants (legacy runner parity)") {
+    std::string host, port, path, err;
+    bool ok = romm::parseHttpUrl("http://example.com:8080/path?x=1", host, port, path, err);
+    REQUIRE(ok);
+    REQUIRE(host == "example.com");
+    REQUIRE(port == "8080");
+    REQUIRE(path == "/path?x=1");
 
-    void expect(bool cond, const std::string& name) {
-        if (cond) {
-            passed++;
-        } else {
-            failed++;
-            std::cerr << "FAIL: " << name << "\n";
-        }
-    }
-};
+    host.clear(); port.clear(); path.clear(); err.clear();
+    ok = romm::parseHttpUrl("https://bad.com", host, port, path, err);
+    REQUIRE_FALSE(ok);
+    REQUIRE_FALSE(err.empty());
+}
 
-int main() {
-    TestRunner t;
+TEST_CASE("decodeChunkedBody mirrors legacy assertions") {
+    std::string decoded;
+    std::string body = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    REQUIRE(romm::decodeChunkedBody(body, decoded));
+    REQUIRE(decoded == "Wikipedia");
 
-    {
-        std::string host, port, path, err;
-        bool ok = romm::parseHttpUrl("http://example.com:8080/path?x=1", host, port, path, err);
-        t.expect(ok, "parseHttpUrl http ok");
-        t.expect(host == "example.com", "parseHttpUrl host");
-        t.expect(port == "8080", "parseHttpUrl port");
-        t.expect(path == "/path?x=1", "parseHttpUrl path");
-    }
-
-    {
-        std::string host, port, path, err;
-        bool ok = romm::parseHttpUrl("https://bad.com", host, port, path, err);
-        t.expect(!ok, "parseHttpUrl rejects https");
-        t.expect(!err.empty(), "parseHttpUrl https err set");
-    }
-
-    {
-        std::string decoded;
-        std::string body = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-        bool ok = romm::decodeChunkedBody(body, decoded);
-        t.expect(ok, "decodeChunkedBody valid");
-        t.expect(decoded == "Wikipedia", "decodeChunkedBody content");
-    }
-
-    {
-        std::string decoded;
-        std::string body = "4\r\nWiki\r\nZ\r\nbad\r\n0\r\n\r\n"; // malformed chunk size
-        bool ok = romm::decodeChunkedBody(body, decoded);
-        t.expect(!ok, "decodeChunkedBody malformed");
-    }
-
-    if (t.failed == 0) {
-        std::cout << "All tests passed (" << t.passed << ")\n";
-        return 0;
-    }
-    std::cout << "Tests passed: " << t.passed << " failed: " << t.failed << "\n";
-    return 1;
+    decoded.clear();
+    std::string bad = "4\r\nWiki\r\nZ\r\nbad\r\n0\r\n\r\n"; // malformed chunk size
+    REQUIRE_FALSE(romm::decodeChunkedBody(bad, decoded));
 }
