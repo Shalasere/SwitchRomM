@@ -44,7 +44,7 @@ DownloadContext gCtx; // global download context shared with worker
 
 static void recomputeTotals(Status& st) {
     uint64_t remaining = 0;
-    for (auto& g : st.downloadQueue) remaining += g.sizeBytes;
+    for (auto& q : st.downloadQueue) remaining += q.game.sizeBytes;
     st.totalDownloadBytes.store(st.totalDownloadedBytes.load() + remaining);
 }
 
@@ -203,10 +203,17 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
         }
         return info.contentLength > 0;
     }
+    if (code != 0 && (code < 200 || code >= 300)) {
+        logLine("Preflight HEAD returned HTTP " + std::to_string(code));
+    }
 
     // Fallback: GET with Range 0-0
     if (!doRequest("GET", "Range: bytes=0-0", code, headers)) return false;
     if (code == 206) info.supportsRanges = true;
+    if (!(code == 200 || code == 206)) {
+        logLine("Preflight Range GET returned HTTP " + std::to_string(code));
+        return false;
+    }
     std::istringstream hs(headers);
     std::string line;
     while (std::getline(hs, line)) {
@@ -215,21 +222,21 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
         if (colonPos == std::string::npos) continue;
         std::string key = line.substr(0, colonPos);
         std::string val = line.substr(colonPos + 1);
-        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
-        std::string keyLower = key;
-        for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (keyLower == "content-range") {
-            // Expect bytes 0-0/total
-            auto slash = val.find('/');
-            if (slash != std::string::npos) {
-                std::string totalStr = val.substr(slash + 1);
-                info.contentLength = static_cast<uint64_t>(std::strtoull(totalStr.c_str(), nullptr, 10));
-            }
-        } else if (keyLower == "content-length" && info.contentLength == 0) {
-            info.contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
+    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+    std::string keyLower = key;
+    for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (keyLower == "content-range") {
+        // Expect bytes 0-0/total
+        auto slash = val.find('/');
+        if (slash != std::string::npos) {
+            std::string totalStr = val.substr(slash + 1);
+            info.contentLength = static_cast<uint64_t>(std::strtoull(totalStr.c_str(), nullptr, 10));
         }
+    } else if (keyLower == "content-length" && info.contentLength == 0) {
+        info.contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
     }
-    return info.contentLength > 0;
+}
+return info.contentLength > 0;
 }
 
 #ifdef UNIT_TEST
@@ -519,7 +526,7 @@ static bool finalizeParts(const std::string& tmpDir, const std::string& finalDir
 }
 
 // Download a single Game into FAT32-safe parts. Resumes completed parts; deletes partial fragments.
-static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
+static bool downloadOne(Game g, Status& status, const Config& cfg) {
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
         auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
@@ -574,6 +581,8 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     }
 
     uint64_t totalSize = status.currentDownloadSize.load();
+    bool refreshedMetadata = false;
+    const uint64_t kTinyContentThreshold = 1024ULL * 1024ULL; // 1 MB
 
     // Prepare manifest (load existing or create new) to drive resume decisions.
     const std::string manifestPath = tmpDir + "/manifest.json";
@@ -657,6 +666,47 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
     int attempt = 0;
     std::string err;
     bool okStream = false;
+    auto refreshMetadata = [&]() mutable -> bool {
+        if (refreshedMetadata) return false;
+        refreshedMetadata = true;
+        logLine("Refreshing metadata for " + g.title + " after bad response");
+        std::string enrichErr;
+        if (!enrichGameWithFiles(cfg, g, enrichErr)) {
+            logLine("Metadata refresh failed: " + enrichErr);
+            err = enrichErr;
+            return false;
+        }
+        removeDirRecursive(tmpDir);
+        ensureDirectory(tmpDir);
+        manifest = buildManifestFor(g, g.sizeBytes);
+        writeManifestFile(manifestPath, manifest);
+        haveBytes = 0;
+        creditedExisting = 0;
+        status.currentDownloadedBytes.store(0);
+        status.totalDownloadedBytes.store(0);
+        status.currentDownloadSize.store(g.sizeBytes);
+        status.currentDownloadTitle = g.title;
+        if (!preflight(g.downloadUrl, auth, cfg.httpTimeoutSeconds, pf)) {
+            logLine("Preflight after refresh failed");
+            err = "Preflight after refresh failed";
+            return false;
+        }
+        logLine("Refresh succeeded; new URL=" + g.downloadUrl + " len=" + std::to_string(pf.contentLength));
+        totalSize = pf.contentLength ? pf.contentLength : g.sizeBytes;
+        status.currentDownloadSize.store(totalSize);
+        return true;
+    };
+    // If preflight returned an implausibly tiny length (e.g., HTML error page), try one refresh up front.
+    if (pf.contentLength > 0 && pf.contentLength < kTinyContentThreshold) {
+        logLine("Tiny Content-Length (" + std::to_string(pf.contentLength) + " bytes) for " + g.title + "; attempting metadata refresh");
+        if (refreshMetadata()) {
+            totalSize = status.currentDownloadSize.load();
+        } else {
+            err = "Server returned tiny Content-Length (" + std::to_string(pf.contentLength) + " bytes)";
+            return false;
+        }
+    }
+
     while (attempt < maxAttempts && !okStream && !gCtx.stopRequested.load()) {
         bool useRange = pf.supportsRanges && haveBytes > 0;
         if (!pf.supportsRanges && haveBytes > 0) {
@@ -691,6 +741,13 @@ static bool downloadOne(const Game& g, Status& status, const Config& cfg) {
             status.currentDownloadedBytes.store(haveBytes);
             attempt++;
             if (gCtx.stopRequested.load()) break;
+            if (!err.empty() && err.find("HTTP status 404") != std::string::npos) {
+                // Stale URL (manifest pointing to old file_id). Try to refresh once.
+                if (refreshMetadata()) {
+                    attempt = 0; // fresh attempts after refresh
+                    continue;
+                }
+            }
             // If ranges unsupported, reset counters so UI reflects restart
             if (!pf.supportsRanges) {
                 status.currentDownloadedBytes.store(0);
@@ -773,11 +830,12 @@ static void workerLoop() {
         st->downloadCompleted = false;
         st->totalDownloadBytes.store(0);
         st->totalDownloadedBytes.store(0);
-        for (auto& g : st->downloadQueue) st->totalDownloadBytes.fetch_add(g.sizeBytes);
+        for (auto& q : st->downloadQueue) st->totalDownloadBytes.fetch_add(q.game.sizeBytes);
+        for (auto& q : st->downloadQueue) q.state = QueueState::Pending;
     }
     logLine("Worker start, total bytes=" + std::to_string(st->totalDownloadBytes.load()));
     while (true) {
-        Game next;
+        QueueItem next;
         {
             std::lock_guard<std::mutex> lock(st->mutex);
             if (st->downloadQueue.empty() || gCtx.stopRequested.load()) break;
@@ -786,23 +844,33 @@ static void workerLoop() {
             st->currentDownloadIndex = 0;
             next = st->downloadQueue.front(); // copy
             // Prime UI fields for the next item.
-            st->currentDownloadTitle = next.title;
-            st->currentDownloadSize.store(next.sizeBytes);
+            st->currentDownloadTitle = next.game.title;
+            st->currentDownloadSize.store(next.game.sizeBytes);
             st->currentDownloadedBytes.store(0);
+            st->downloadQueue.front().state = QueueState::Downloading;
         }
-        if (!downloadOne(next, *st, cfg)) {
-            logLine("Download failed or stopped for " + next.title);
+        if (!downloadOne(next.game, *st, cfg)) {
+            logLine("Download failed or stopped for " + next.game.title);
             st->lastDownloadFailed.store(true);
             {
                 std::lock_guard<std::mutex> lock(st->mutex);
-                if (!st->downloadQueue.empty()) st->downloadQueue.erase(st->downloadQueue.begin());
+                if (!st->downloadQueue.empty()) {
+                    st->downloadQueue.front().state = QueueState::Failed;
+                    st->downloadQueue.front().error = st->lastDownloadError;
+                    st->downloadHistory.push_back(st->downloadQueue.front());
+                    st->downloadQueue.erase(st->downloadQueue.begin());
+                }
                 recomputeTotals(*st);
             }
             continue;
         }
         {
             std::lock_guard<std::mutex> lock(st->mutex);
-            if (!st->downloadQueue.empty()) st->downloadQueue.erase(st->downloadQueue.begin());
+            if (!st->downloadQueue.empty()) {
+                st->downloadQueue.front().state = QueueState::Completed;
+                st->downloadHistory.push_back(st->downloadQueue.front());
+                st->downloadQueue.erase(st->downloadQueue.begin());
+            }
             recomputeTotals(*st);
         }
     }
@@ -818,6 +886,39 @@ static void workerLoop() {
 }
 
 } // namespace
+
+bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError) {
+    namespace fs = std::filesystem;
+    outError.clear();
+    const fs::path tempRoot = fs::path(cfg.downloadDir) / "temp";
+    if (!fs::exists(tempRoot)) return true; // nothing to load
+    std::lock_guard<std::mutex> lock(status.mutex);
+    for (const auto& entry : fs::directory_iterator(tempRoot)) {
+        if (!entry.is_directory()) continue;
+        fs::path manifestPath = entry.path() / "manifest.json";
+        Manifest m;
+        if (!fs::exists(manifestPath) || !readManifestFile(manifestPath.string(), m)) continue;
+        auto already = std::find_if(status.downloadHistory.begin(), status.downloadHistory.end(),
+            [&](const QueueItem& qi) {
+                if (!m.rommId.empty()) return qi.game.id == m.rommId;
+                return qi.game.fsName == m.fsName;
+            });
+        if (already != status.downloadHistory.end()) continue;
+        QueueItem qi;
+        qi.game.id = m.rommId;
+        qi.game.fileId = m.fileId;
+        qi.game.fsName = m.fsName;
+        qi.game.downloadUrl = m.url;
+        qi.game.sizeBytes = m.totalSize;
+        qi.state = QueueState::Failed;
+        bool allDone = !m.parts.empty() &&
+                       std::all_of(m.parts.begin(), m.parts.end(),
+                                   [](const ManifestPart& p){ return p.completed; });
+        if (allDone) qi.state = QueueState::Completed;
+        status.downloadHistory.push_back(qi);
+    }
+    return true;
+}
 
 void startDownloadWorker(Status& status, const Config& cfg) {
     // If a previous worker finished but wasn't joined, clean it up now.

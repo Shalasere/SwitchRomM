@@ -15,6 +15,8 @@ TARGET := romm_tests
 SOURCES := ../source/api.cpp \
            ../source/config.cpp \
            ../source/manifest.cpp \
+           ../source/cover_loader.cpp \
+           ../source/stb_image_impl.cpp \
            test_api.cpp \
            test_api_http.cpp \
            test_api_catch.cpp \
@@ -24,6 +26,9 @@ SOURCES := ../source/api.cpp \
            test_thread_safety.cpp \
            test_config_env.cpp \
            test_manifest.cpp \
+           test_cover_loader.cpp \
+           test_queue_policy.cpp \
+           test_manifest_scan.cpp \
            test_worker_reap.cpp \
            logger_stub.cpp \
            downloader_stub.cpp

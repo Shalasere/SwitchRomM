@@ -5,6 +5,7 @@ Logs go to `sdmc:/switch/romm_switch_client/log.txt`, mirrored to stdout/nxlink,
 - Default: `info`. Set `log_level=debug|info|warn|error` in `.env`/`config.json`.
 - Tags: `[APP]` lifecycle (default), `[API]` API info/debug, `[DL]` download heartbeat/finalize, `[UI]` render traces, `[SDL]` SDL init issues.
 - Debug-only noise (render traces, download heartbeats, per-file listings) only when `log_level=debug`.
+- Preflight logs HTTP status codes for HEAD/Range so 404/tiny responses are visible in info logs.
 - Info keeps startup, config echo, API counts, queue actions, download start/finalize/results. Input/controller codes stay at debug to keep logs readable.
 
 Environment example (`sdmc:/switch/romm_switch_client/.env`):

@@ -14,6 +14,13 @@
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
+#include <unordered_map>
+#include <unordered_set>
+#include <filesystem>
+#include <optional>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include "stb_image.h"
 // Fallback declarations in case the minimal stb header wasn't visible for some reason
 extern "C" unsigned char *stbi_load_from_memory(const unsigned char *buffer, int len, int *x, int *y, int *channels_in_file, int desired_channels);
@@ -29,6 +36,8 @@ extern "C" void stbi_image_free(void *retval_from_stbi_load);
 #include "romm/input.hpp"
 #include "romm/logger.hpp"
 #include "romm/downloader.hpp"
+#include "romm/cover_loader.hpp"
+#include "romm/queue_policy.hpp"
 
 using romm::Status;
 using romm::Config;
@@ -38,46 +47,38 @@ static int gRomsDebugFrames = 0;
 static int gFrameCounter = 0;
 static int gViewTraceFrames = 0; // log render view for a few frames after navigation
 static SDL_Texture* gCoverTexture = nullptr;
+static std::string gCoverTextureUrl;
+static romm::CoverLoader gCoverLoader;
+static std::string gLastCoverRequested;
 
-// Load cover art for the given game (blocking). Replaces the global cover texture.
-static void loadCoverTextureForGame(const romm::Game& g, SDL_Renderer* renderer, const Config& config) {
-    if (gCoverTexture) {
-        SDL_DestroyTexture(gCoverTexture);
-        gCoverTexture = nullptr;
-    }
+static bool fetchCoverData(const std::string& url, const Config& cfg, std::vector<unsigned char>& outData, std::string& err) {
+    std::string body;
+    if (!romm::fetchBinary(cfg, url, body, err)) return false;
+    outData.assign(body.begin(), body.end());
+    return true;
+}
+
+static void processCoverResult(SDL_Renderer* renderer) {
+    auto res = gCoverLoader.poll();
+    if (!res) return;
     if (!renderer) return;
-    if (g.coverUrl.empty()) return;
-
-    std::string data;
-    std::string err;
-    if (!romm::fetchBinary(config, g.coverUrl, data, err)) {
-        romm::logLine("Cover fetch failed for " + g.title + ": " + err);
-        return;
+    if (res->ok && !res->pixels.empty()) {
+        SDL_Texture* tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
+                                             SDL_TEXTUREACCESS_STATIC, res->w, res->h);
+        if (tex && SDL_UpdateTexture(tex, nullptr, res->pixels.data(), res->w * 4) == 0) {
+            SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+            if (gCoverTexture) SDL_DestroyTexture(gCoverTexture);
+            gCoverTexture = tex;
+            gCoverTextureUrl = res->url;
+            romm::logLine("Loaded cover for " + res->title +
+                          " (" + std::to_string(res->w) + "x" + std::to_string(res->h) + ")");
+            return;
+        }
+        if (tex) SDL_DestroyTexture(tex);
+        romm::logLine("Cover texture upload failed for " + res->title);
+    } else {
+        romm::logLine("Cover fetch failed for " + res->title + ": " + res->error);
     }
-    int w = 0, h = 0, channels = 0;
-    unsigned char* pixels = stbi_load_from_memory(reinterpret_cast<const unsigned char*>(data.data()),
-                                                  static_cast<int>(data.size()),
-                                                  &w, &h, &channels, STBI_rgb_alpha);
-    if (!pixels) {
-        romm::logLine("Cover decode failed for " + g.title);
-        return;
-    }
-    SDL_Texture* tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);
-    if (!tex) {
-        romm::logLine(std::string("Cover texture create failed: ") + SDL_GetError());
-        stbi_image_free(pixels);
-        return;
-    }
-    if (SDL_UpdateTexture(tex, nullptr, pixels, w * 4) != 0) {
-        romm::logLine(std::string("Cover texture upload failed: ") + SDL_GetError());
-        SDL_DestroyTexture(tex);
-        stbi_image_free(pixels);
-        return;
-    }
-    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
-    gCoverTexture = tex;
-    stbi_image_free(pixels);
-    romm::logLine("Loaded cover for " + g.title + " (" + std::to_string(w) + "x" + std::to_string(h) + ")");
 }
 
 static const char* viewName(Status::View v) {
@@ -350,14 +351,15 @@ static void drawText(SDL_Renderer* r, int x, int y, const std::string& txt, SDL_
 
 // Render the current view (header/footer + body) based on shared Status state.
 // Views: PLATFORMS, ROMS, DETAIL, QUEUE, DOWNLOADING, ERROR.
-static void renderStatus(SDL_Renderer* renderer, const Status& status) {
+static void renderStatus(SDL_Renderer* renderer, const Status& status, const Config& config) {
     if (!renderer) return;
 
     struct Snapshot {
         Status::View view{Status::View::PLATFORMS};
         std::vector<romm::Platform> platforms;
         std::vector<romm::Game> roms;
-        std::vector<romm::Game> downloadQueue;
+        std::vector<romm::QueueItem> downloadQueue;
+        std::vector<romm::QueueItem> downloadHistory;
         int selectedPlatformIndex{0};
         int selectedRomIndex{0};
         int selectedQueueIndex{0};
@@ -368,6 +370,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         std::string lastDownloadError;
         std::string currentDownloadTitle;
         std::string lastError;
+        std::unordered_set<std::string> completedOnDisk;
     } snap;
 
     {
@@ -376,6 +379,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         snap.platforms = status.platforms;
         snap.roms = status.roms;
         snap.downloadQueue = status.downloadQueue;
+        snap.downloadHistory = status.downloadHistory;
         snap.selectedPlatformIndex = status.selectedPlatformIndex;
         snap.selectedRomIndex = status.selectedRomIndex;
         snap.selectedQueueIndex = status.selectedQueueIndex;
@@ -386,6 +390,34 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         snap.lastDownloadError = status.lastDownloadError;
         snap.currentDownloadTitle = status.currentDownloadTitle;
         snap.lastError = status.lastError;
+    }
+    // Populate on-disk completion set outside the status lock (uses config).
+    for (const auto& g : snap.roms) {
+        std::vector<std::filesystem::path> candidates;
+        if (!g.fsName.empty()) {
+            std::filesystem::path base = std::filesystem::path(config.downloadDir) / g.fsName;
+            candidates.push_back(base);
+            // If fsName lacks an extension, also check common ones.
+            if (!base.has_extension()) {
+                candidates.push_back(std::filesystem::path(config.downloadDir) / (g.fsName + ".xci"));
+                candidates.push_back(std::filesystem::path(config.downloadDir) / (g.fsName + ".nsp"));
+            }
+        }
+        std::error_code ec;
+        for (const auto& p : candidates) {
+            if (!std::filesystem::exists(p, ec)) continue;
+            if (std::filesystem::is_regular_file(p, ec)) {
+                snap.completedOnDisk.insert(g.id);
+                break;
+            }
+            if (std::filesystem::is_directory(p, ec)) {
+                auto it = std::filesystem::directory_iterator(p, ec);
+                if (!ec && it != std::filesystem::end(it)) {
+                    snap.completedOnDisk.insert(g.id);
+                    break;
+                }
+            }
+        }
     }
 
     if (gViewTraceFrames > 0) {
@@ -457,12 +489,12 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         }
     };
 
-    auto drawFooterBar = [&](const std::string& text) {
+    auto drawFooterBar = [&](const std::string& left, const std::string& right) {
         SDL_Rect bar{0, 720 - 48, 1280, 48};
         SDL_SetRenderDrawColor(renderer, footerBar.r, footerBar.g, footerBar.b, 255);
         SDL_RenderFillRect(renderer, &bar);
         SDL_Color hint{200, 220, 255, 255};
-        drawText(renderer, 32, 720 - 36, text, hint, 2);
+        drawText(renderer, 32, 720 - 36, left, hint, 2);
     };
 
     // Cache system time/battery once per second to avoid overcalling services.
@@ -533,9 +565,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
             if (totalDone == 0) {
                 static const char* dots[] = {"", ".", "..", "..."};
                 const int phase = (gFrameCounter / 20) % 4;
-                drawText(renderer, outline.x, outline.y + 110,
-                         std::string("Connecting") + dots[phase] + " waiting for data",
-                         {200,220,255,255}, 2);
+                    drawText(renderer, outline.x, outline.y + 110,
+                             std::string("Connecting") + dots[phase] + " waiting for data",
+                             {200,220,255,255}, 2);
             }
             if (snap.lastDownloadFailed) {
                 drawText(renderer, outline.x, outline.y + 110, "Failed: " + snap.lastDownloadError, {255,80,80,255}, 2);
@@ -543,8 +575,12 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         }
     } else if (snap.view == Status::View::DOWNLOADING) {
         SDL_Color fg{255,255,255,255};
-        drawText(renderer, (1280/2) - 120, 720/2 - 40, "Connecting...", fg, 2);
-        drawText(renderer, (1280/2) - 120, 720/2 + 0, "Waiting for data...", fg, 2);
+        bool resuming = (status.currentDownloadedBytes.load() > 0);
+        drawText(renderer, (1280/2) - 120, 720/2 - 40, resuming ? "Resuming download..." : "Connecting...", fg, 2);
+        std::string line2 = resuming
+            ? ("Already have " + humanSize(status.currentDownloadedBytes.load()) + " on disk")
+            : "Waiting for data...";
+        drawText(renderer, (1280/2) - 120, 720/2 + 0, line2, fg, 2);
         if (snap.lastDownloadFailed) {
             drawText(renderer, (1280/2) - 120, 720/2 + 30, "Failed: " + snap.lastDownloadError, {255,80,80,255}, 2);
         }
@@ -586,7 +622,23 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         if (clean.size() <= maxlen) return clean;
         return clean.substr(0, maxlen) + "...";
     };
+    auto ellipsizeTight = [&](const std::string& s, double maxUnits) {
+        std::string clean = sanitize(s);
+        std::string out;
+        double units = 0.0;
+        for (char c : clean) {
+            double w = (c == ' ') ? 0.5 : 1.0; // tighter spacing for spaces
+            if (units + w > maxUnits) {
+                out += "...";
+                return out;
+            }
+            out.push_back(c);
+            units += w;
+        }
+        return out;
+    };
 
+    std::optional<romm::QueueState> selectedStateForFooter;
     std::string header;
     std::string controls;
     if (snap.view == Status::View::PLATFORMS) {
@@ -616,6 +668,75 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
                  "count=" + std::to_string(snap.roms.size()) +
                  " sel=" + std::to_string(selRom);
         SDL_Color fg{255,255,255,255};
+        std::unordered_map<std::string, romm::QueueState> queueStateById;
+        queueStateById.reserve(snap.downloadQueue.size() + snap.downloadHistory.size());
+        for (const auto& qi : snap.downloadHistory) {
+            if (qi.state == romm::QueueState::Failed || qi.state == romm::QueueState::Completed) {
+                queueStateById[qi.game.id] = qi.state;
+            }
+        }
+        for (const auto& qi : snap.downloadQueue) {
+            queueStateById[qi.game.id] = qi.state; // live queue overrides history
+        }
+        // Apply on-disk completion: if final file/folder exists, show as completed regardless of history.
+        for (const auto& g : snap.roms) {
+            if (snap.completedOnDisk.count(g.id)) {
+                queueStateById[g.id] = romm::QueueState::Completed;
+            }
+        }
+        auto drawFilledCircle = [&](int cx, int cy, int r, SDL_Color c) {
+            SDL_SetRenderDrawColor(renderer, c.r, c.g, c.b, c.a);
+            for (int dy = -r; dy <= r; ++dy) {
+                int dx = static_cast<int>(std::sqrt(static_cast<double>(r * r - dy * dy)));
+                SDL_RenderDrawLine(renderer, cx - dx, cy + dy, cx + dx, cy + dy);
+            }
+        };
+        auto drawCircleOutline = [&](int cx, int cy, int r, SDL_Color c) {
+            SDL_SetRenderDrawColor(renderer, c.r, c.g, c.b, c.a);
+            int x = r;
+            int y = 0;
+            int err = 0;
+            while (x >= y) {
+                SDL_RenderDrawPoint(renderer, cx + x, cy + y);
+                SDL_RenderDrawPoint(renderer, cx + y, cy + x);
+                SDL_RenderDrawPoint(renderer, cx - y, cy + x);
+                SDL_RenderDrawPoint(renderer, cx - x, cy + y);
+                SDL_RenderDrawPoint(renderer, cx - x, cy - y);
+                SDL_RenderDrawPoint(renderer, cx - y, cy - x);
+                SDL_RenderDrawPoint(renderer, cx + y, cy - x);
+                SDL_RenderDrawPoint(renderer, cx + x, cy - y);
+                if (err <= 0) {
+                    ++y;
+                    err += 2 * y + 1;
+                }
+                if (err > 0) {
+                    --x;
+                    err -= 2 * x + 1;
+                }
+            }
+        };
+        auto drawBadge = [&](std::optional<romm::QueueState> st, int x, int y) {
+            const int r = 7;
+            drawCircleOutline(x + r, y + r, r, SDL_Color{0,0,0,220});
+            if (!st.has_value()) {
+                drawCircleOutline(x + r, y + r, r - 2, SDL_Color{100,100,100,180});
+                return;
+            }
+            switch (*st) {
+                case romm::QueueState::Pending:
+                    drawFilledCircle(x + r, y + r, r - 2, SDL_Color{140,140,140,255});
+                    break;
+                case romm::QueueState::Downloading:
+                    drawFilledCircle(x + r, y + r, r - 2, SDL_Color{230,230,230,255});
+                    break;
+                case romm::QueueState::Completed:
+                    drawFilledCircle(x + r, y + r, r - 2, SDL_Color{50,200,110,255});
+                    break;
+                case romm::QueueState::Failed:
+                    drawFilledCircle(x + r, y + r, r - 2, SDL_Color{220,70,70,255});
+                    break;
+            }
+        };
         size_t visible = snap.roms.size() < 18 ? snap.roms.size() : 18;
         size_t start = 0;
         if (!snap.roms.empty()) {
@@ -644,6 +765,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         if (snap.roms.empty()) {
             drawText(renderer, 64, 96, "No ROMs found for this platform.", fg, 2);
         }
+        if (selRom >= 0 && selRom < (int)snap.roms.size()) {
+            if (auto it = queueStateById.find(snap.roms[selRom].id); it != queueStateById.end()) {
+                selectedStateForFooter = it->second;
+            }
+        }
         for (size_t i = 0; i < visible; ++i) {
             size_t idx = start + i;
             SDL_Rect r{ 64, 88 + static_cast<int>(i)*26, 1008, 22 };
@@ -653,9 +779,15 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
                 SDL_SetRenderDrawColor(renderer, 34, 90, 140, 200);
             SDL_RenderFillRect(renderer, &r);
             if (idx < snap.roms.size()) {
-                drawText(renderer, r.x + 12, r.y + 4, ellipsize(snap.roms[idx].title, 64), fg, 2);
+                // TODO(UI): switch long titles to a scrolling marquee instead of hard ellipsis.
+                drawText(renderer, r.x + 12, r.y + 4, ellipsizeTight(snap.roms[idx].title, 43.0), fg, 2);
                 std::string sz = humanSize(snap.roms[idx].sizeBytes);
                 drawText(renderer, r.x + 760, r.y + 4, sz, fg, 2);
+                std::optional<romm::QueueState> st;
+                if (auto it = queueStateById.find(snap.roms[idx].id); it != queueStateById.end()) {
+                    st = it->second;
+                }
+                drawBadge(st, r.x + 930, r.y + 4);
             }
         }
     } else if (snap.view == Status::View::DETAIL) {
@@ -665,11 +797,24 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
             const auto& g = snap.roms[selRom];
             header = "DETAIL [" + ellipsize(g.title, 22) + "]";
             SDL_Rect cover{70, 110, 240, 240};
-            if (gCoverTexture) {
+            if (g.coverUrl.empty()) {
+                SDL_SetRenderDrawColor(renderer, 90, 125, 180, 255);
+                SDL_RenderFillRect(renderer, &cover);
+                drawText(renderer, cover.x + 12, cover.y + cover.h / 2 - 8, "No cover URL", fg, 2);
+            } else if (gCoverTexture && g.coverUrl == gCoverTextureUrl) {
                 SDL_RenderCopy(renderer, gCoverTexture, nullptr, &cover);
             } else {
                 SDL_SetRenderDrawColor(renderer, 90, 125, 180, 255);
                 SDL_RenderFillRect(renderer, &cover);
+                drawText(renderer, cover.x + 12, cover.y + cover.h / 2 - 8, "Loading cover...", fg, 2);
+                romm::CoverJob job{g.coverUrl, g.title, config};
+                if (g.coverUrl != gLastCoverRequested) {
+                    romm::logLine("Requesting cover: " + g.coverUrl);
+                    gLastCoverRequested = g.coverUrl;
+                } else {
+                    romm::logDebug("Cover already requested: " + g.coverUrl, "COVER");
+                }
+                gCoverLoader.request(job, gCoverTextureUrl);
             }
             SDL_Rect outline{cover.x-2, cover.y-2, cover.w+4, cover.h+4};
             SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
@@ -690,7 +835,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         }
     } else if (snap.view == Status::View::QUEUE) {
         uint64_t total = 0;
-        for (auto& q : snap.downloadQueue) total += q.sizeBytes;
+        for (auto& q : snap.downloadQueue) total += q.game.sizeBytes;
         header = "QUEUE items=" + std::to_string(snap.downloadQueue.size()) +
                  " total=" + humanSize(total);
         SDL_Color fg{255,255,255,255};
@@ -722,10 +867,20 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
                 SDL_SetRenderDrawColor(renderer, 110, 70, 180, 200);
             SDL_RenderFillRect(renderer, &r);
             if (idx < snap.downloadQueue.size()) {
-                const auto& g = snap.downloadQueue[idx];
-                drawText(renderer, r.x + 10, r.y + 4, ellipsize(g.title, 58), fg, 2);
-                std::string sz = humanSize(g.sizeBytes);
-                drawText(renderer, r.x + 740, r.y + 4, sz, fg, 2);
+                const auto& q = snap.downloadQueue[idx];
+                drawText(renderer, r.x + 10, r.y + 4, ellipsize(q.game.title, 58), fg, 2);
+                std::string sz = humanSize(q.game.sizeBytes);
+                std::string stateStr;
+                switch (q.state) {
+                    case romm::QueueState::Pending: stateStr = "pending"; break;
+                    case romm::QueueState::Downloading: stateStr = "downloading"; break;
+                    case romm::QueueState::Completed: stateStr = "done"; break;
+                    case romm::QueueState::Failed: stateStr = "failed"; break;
+                }
+                drawText(renderer, r.x + 680, r.y + 4, sz + " " + stateStr, fg, 2);
+                if (q.state == romm::QueueState::Failed && !q.error.empty()) {
+                    drawText(renderer, r.x + 10, r.y + 22, ellipsize(q.error, 58), SDL_Color{255,160,160,255}, 2);
+                }
             }
         }
     } else if (snap.view == Status::View::DOWNLOADING) {
@@ -763,11 +918,43 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status) {
         gLastControls = controls;
     }
 
+    std::string footerRight;
+    std::string footerStatusValue;
+    if (snap.view == Status::View::ROMS) {
+        auto stateToText = [](const std::optional<romm::QueueState>& st) -> std::string {
+            if (!st.has_value()) return "not queued";
+            switch (*st) {
+                case romm::QueueState::Pending:     return "queued";
+                case romm::QueueState::Downloading: return "downloading";
+                case romm::QueueState::Completed:   return "completed";
+                case romm::QueueState::Failed:      return "failed";
+            }
+            return "unknown";
+        };
+        footerStatusValue = stateToText(selectedStateForFooter);
+    }
+
     if (!header.empty()) {
         drawHeaderBar(header, sysInfo);
     }
     if (!controls.empty()) {
-        drawFooterBar(controls);
+        // Draw only the left footer text here; status is drawn with fixed positioning below.
+        drawFooterBar(controls, "");
+        if (snap.view == Status::View::ROMS) {
+            SDL_Color hint{200, 220, 255, 255};
+            const int labelX = 960;
+            const int valueX = labelX + 110; // extra spacing to avoid clipping long values
+            drawText(renderer, labelX, 720 - 36, "Status:", hint, 2);
+            drawText(renderer, valueX, 720 - 36, footerStatusValue, hint, 2);
+        } else if (!footerRight.empty()) {
+            // Fallback for other views if right text is provided.
+            SDL_Color hint{200, 220, 255, 255};
+            int charW = 6 * 2;
+            int textW = static_cast<int>(footerRight.size()) * charW;
+            int x = 1280 - 160 - textW;
+            if (x < 32) x = 32;
+            drawText(renderer, x, 720 - 36, footerRight, hint, 2);
+        }
     }
 
     SDL_RenderPresent(renderer);
@@ -819,7 +1006,6 @@ int main(int argc, char** argv) {
     bool running = true;
     ScrollHold scrollHold;
     auto resetNav = [&]() { status.navStack.clear(); };
-    int lastCoverSel = -1;
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
         romm::logLine(std::string("SDL_Init failed: ") + SDL_GetError());
@@ -872,18 +1058,25 @@ int main(int argc, char** argv) {
         romm::logLine(" download_dir=" + config.downloadDir);
         romm::logLine(std::string(" fat32_safe=") + (config.fat32Safe ? "true" : "false"));
         romm::ensureDirectory(config.downloadDir);
+        std::string histErr;
+        if (!romm::loadLocalManifests(status, config, histErr) && !histErr.empty()) {
+            romm::logLine("Manifest load warning: " + histErr);
+        }
         std::string err;
         if (!romm::fetchPlatforms(config, status, err)) {
             status.currentView = Status::View::ERROR;
             status.lastError = err;
             romm::logLine("Failed to fetch platforms: " + err);
         }
+        // Start cover loader once config is available.
+        gCoverLoader.start(fetchCoverData);
     }
 
     // Main loop: poll input -> update state -> render current view
     while (running && appletMainLoop()) {
         // If a previous worker has finished, join and release it so we can start a fresh session.
         romm::reapDownloadWorkerIfDone();
+        processCoverResult(renderer);
         bool viewChangedThisFrame = false;
         // TODO(nav): extract view transitions into a ViewController and align hints with mapping.
         // Adjust selection index based on current view (platforms/roms/queue)
@@ -993,15 +1186,20 @@ int main(int argc, char** argv) {
                                   romm::logLine("Failed to enrich ROM with files: " + err);
                                   break;
                               }
-                                  {
-                                      std::lock_guard<std::mutex> lock(status.mutex);
-                                      status.roms[sel] = enriched;
-                                      status.downloadQueue.push_back(enriched);
-                                      status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
-                                      status.downloadCompleted = false; // new work pending, clear stale banner
-                                      status.prevQueueView = Status::View::DETAIL;
-                                      status.currentView = Status::View::QUEUE;
-                                  }
+                              if (!romm::canEnqueueGame(status, enriched)) {
+                                  romm::logLine("ROM already queued this session: " + enriched.title);
+                                  gViewTraceFrames = 4;
+                                  break;
+                              }
+                              {
+                                  std::lock_guard<std::mutex> lock(status.mutex);
+                                  status.roms[sel] = enriched;
+                                  status.downloadQueue.push_back(romm::QueueItem{enriched, romm::QueueState::Pending, ""});
+                                  status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
+                                  status.downloadCompleted = false; // new work pending, clear stale banner
+                                  status.prevQueueView = Status::View::DETAIL;
+                                  status.currentView = Status::View::QUEUE;
+                              }
                                   romm::logLine("Queued ROM: " + enriched.title +
                                                 " | Queue size=" + std::to_string(status.downloadQueue.size()));
                               gViewTraceFrames = 8;
@@ -1094,10 +1292,11 @@ int main(int argc, char** argv) {
                                     status.totalDownloadedBytes.store(0);
                                     status.totalDownloadBytes.store(0);
                                     status.downloadCompleted = false; // clear any prior completion banner
-                                    for (auto& g : status.downloadQueue) status.totalDownloadBytes.fetch_add(g.sizeBytes);
+                                    for (auto& q : status.downloadQueue) status.totalDownloadBytes.fetch_add(q.game.sizeBytes);
                                     if (!status.downloadQueue.empty()) {
-                                        status.currentDownloadSize.store(status.downloadQueue[0].sizeBytes);
-                                        status.currentDownloadTitle = status.downloadQueue[0].title;
+                                        status.currentDownloadSize.store(status.downloadQueue[0].game.sizeBytes);
+                                        status.currentDownloadTitle = status.downloadQueue[0].game.title;
+                                        status.downloadQueue[0].state = romm::QueueState::Downloading;
                                     }
                                 }
                                 romm::logLine("Starting downloads for queue size=" + std::to_string(status.downloadQueue.size()) +
@@ -1144,24 +1343,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // TODO(async covers): move cover fetch/decode off the render loop; keep placeholder texture.
-        // JIT cover loading: when entering or changing selection in DETAIL, load cover; free when leaving.
-        if (status.currentView == Status::View::DETAIL) {
-            if (status.selectedRomIndex != lastCoverSel) {
-                lastCoverSel = status.selectedRomIndex;
-                if (status.selectedRomIndex >= 0 && status.selectedRomIndex < (int)status.roms.size()) {
-                    loadCoverTextureForGame(status.roms[status.selectedRomIndex], renderer, config);
-                }
-            }
-        } else {
-            if (gCoverTexture) {
-                SDL_DestroyTexture(gCoverTexture);
-                gCoverTexture = nullptr;
-            }
-            lastCoverSel = -1;
-        }
-
-        renderStatus(renderer, status);
+        renderStatus(renderer, status, config);
 
     // Lightweight frame log for early frames to catch exit path
     if (gFrameCounter < 5) {
@@ -1190,6 +1372,7 @@ exit_app:
     if (pad) SDL_GameControllerClose(pad);
     SDL_Quit();
     if (romfsReady) romfsExit();
+    gCoverLoader.stop();
     psmExit();
     timeExit();
     fsdevUnmountAll();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "romm/models.hpp"
+#include "romm/models.hpp"
 #include <atomic>
 #include <string>
 #include <vector>
@@ -8,6 +9,14 @@
 #include <utility>
 
 namespace romm {
+
+enum class QueueState { Pending, Downloading, Completed, Failed };
+
+struct QueueItem {
+    Game game;
+    QueueState state{QueueState::Pending};
+    std::string error;
+};
 
 struct Status {
     // TODO(thread-safety): use this mutex (or an event queue) to guard shared state between UI and worker.
@@ -31,7 +40,8 @@ struct Status {
     View prevQueueView{View::ROMS}; // where to return when leaving queue
 
     // Download queue and progress
-    std::vector<Game> downloadQueue;
+    std::vector<QueueItem> downloadQueue;
+    std::vector<QueueItem> downloadHistory; // completed/failed items for UI display
     bool isDownloading{false};
     size_t currentDownloadIndex{0};
     std::atomic<uint64_t> currentDownloadSize{0};

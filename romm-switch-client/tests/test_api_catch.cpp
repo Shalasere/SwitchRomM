@@ -1,5 +1,6 @@
 #define CATCH_CONFIG_MAIN
 #include "catch.hpp"
+#include <vector>
 #include "api_test_hooks.hpp"
 #include "romm/api.hpp"
 #include "romm/util.hpp"
@@ -118,4 +119,38 @@ TEST_CASE("httpRequestStreamMock streams without buffering") {
     REQUIRE(resp.statusCode == 200);
     REQUIRE(total == 15);
     REQUIRE(resp.body.empty()); // streamed, not buffered into resp.body
+}
+
+TEST_CASE("parseGames builds cover URL from path_cover_small") {
+    const std::string body = R"([{
+        "id": "1",
+        "name": "Test Game",
+        "fs_size_bytes": 1234,
+        "fs_name": "test.xci",
+        "path_cover_small": "/assets/romm/resources/roms/19/4076/cover/small.png?ts=2025-12-15 09:33:40"
+    }])";
+    std::vector<romm::Game> games;
+    std::string err;
+    bool ok = romm::parseGamesTest(body, "19", "http://example.com", games, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(games.size() == 1);
+    REQUIRE(games[0].coverUrl == "http://example.com/assets/romm/resources/roms/19/4076/cover/small.png?ts=2025-12-15%2009:33:40");
+}
+
+TEST_CASE("parseGames preserves absolute cover_url and encodes spaces") {
+    const std::string body = R"([{
+        "id": "2",
+        "name": "Absolute",
+        "fs_size_bytes": 1,
+        "fs_name": "a.xci",
+        "cover_url": "http://remote/img path.png?x=1 2"
+    }])";
+    std::vector<romm::Game> games;
+    std::string err;
+    bool ok = romm::parseGamesTest(body, "19", "http://example.com", games, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(games.size() == 1);
+    REQUIRE(games[0].coverUrl == "http://remote/img%20path.png?x=1%202");
 }

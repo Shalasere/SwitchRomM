@@ -622,7 +622,17 @@ static bool parseGames(const std::string& body,
                        const std::string& serverUrl,
                        std::string& err)
 {
-    (void)serverUrl; // download URLs now built on-demand via enrichGameWithFiles
+    auto encodeSpaces = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            if (c == ' ')
+                out += "%20";
+            else
+                out.push_back(c);
+        }
+        return out;
+    };
     mini::Array arr;
     mini::Object obj;
     if (!mini::parse(body, arr)) {
@@ -650,6 +660,16 @@ static bool parseGames(const std::string& body,
             while (!s.empty() && s.front() == '/') s.erase(s.begin());
             return s;
         };
+        auto absolutizeUrl = [&](const std::string& url) -> std::string {
+            if (url.empty()) return url;
+            if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) return encodeSpaces(url);
+            if (!serverUrl.empty() && url.front() == '/') {
+                if (serverUrl.back() == '/')
+                    return encodeSpaces(serverUrl.substr(0, serverUrl.size() - 1) + url);
+                return encodeSpaces(serverUrl + url);
+            }
+            return encodeSpaces(url);
+        };
 
         if (auto it = o.find("id"); it != o.end())
             g.id = valToString(it->second);
@@ -676,12 +696,14 @@ static bool parseGames(const std::string& body,
         if (auto it = o.find("platform_slug"); it != o.end() && it->second.type == mini::Value::Type::String)
             g.platformSlug = it->second.str;
 
-        if (auto it = o.find("cover_url"); it != o.end() && it->second.type == mini::Value::Type::String)
-            g.coverUrl = it->second.str;
+        if (auto it = o.find("path_cover_small"); it != o.end() && it->second.type == mini::Value::Type::String)
+            g.coverUrl = absolutizeUrl(it->second.str);
+        else if (auto it1 = o.find("cover_url"); it1 != o.end() && it1->second.type == mini::Value::Type::String)
+            g.coverUrl = absolutizeUrl(it1->second.str);
         else if (auto it2 = o.find("assets"); it2 != o.end() && it2->second.type == mini::Value::Type::Object) {
             auto cov = it2->second.object.find("cover");
             if (cov != it2->second.object.end() && cov->second.type == mini::Value::Type::String)
-                g.coverUrl = cov->second.str;
+                g.coverUrl = absolutizeUrl(cov->second.str);
         }
 
         g.platformId = platformId;
@@ -706,6 +728,20 @@ static bool parseGames(const std::string& body,
 
     return true;
 }
+
+#ifdef UNIT_TEST
+bool parseGamesTest(const std::string& body,
+                    const std::string& platformId,
+                    const std::string& serverUrl,
+                    std::vector<Game>& outGames,
+                    std::string& err)
+{
+    Status st;
+    bool ok = parseGames(body, platformId, st, serverUrl, err);
+    outGames = st.roms;
+    return ok;
+}
+#endif
 
 bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError) {
     std::string auth;
@@ -790,6 +826,39 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
         return false;
     }
 
+    auto encodeSpaces = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            if (c == ' ')
+                out += "%20";
+            else
+                out.push_back(c);
+        }
+        return out;
+    };
+
+    auto absolutizeUrl = [&](const std::string& url) -> std::string {
+        if (url.empty()) return url;
+        if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) return encodeSpaces(url);
+        if (!cfg.serverUrl.empty() && url.front() == '/') {
+            if (cfg.serverUrl.back() == '/')
+                return encodeSpaces(cfg.serverUrl.substr(0, cfg.serverUrl.size() - 1) + url);
+            return encodeSpaces(cfg.serverUrl + url);
+        }
+        return encodeSpaces(url);
+    };
+
+    if (auto covp = obj.find("path_cover_small"); covp != obj.end() && covp->second.type == mini::Value::Type::String) {
+        g.coverUrl = absolutizeUrl(covp->second.str);
+    } else if (auto cov = obj.find("cover_url"); cov != obj.end() && cov->second.type == mini::Value::Type::String) {
+        g.coverUrl = absolutizeUrl(cov->second.str);
+    } else if (auto it2 = obj.find("assets"); it2 != obj.end() && it2->second.type == mini::Value::Type::Object) {
+        auto cov = it2->second.object.find("cover");
+        if (cov != it2->second.object.end() && cov->second.type == mini::Value::Type::String)
+            g.coverUrl = absolutizeUrl(cov->second.str);
+    }
+
     auto itf = obj.find("files");
     if (itf == obj.end() || itf->second.type != mini::Value::Type::Array) {
         outError = "DetailedRom has no files array";
@@ -799,6 +868,7 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
     uint64_t bestSize = 0;
     std::string bestName;
     std::string bestId;
+    std::string bestDownloadUrl;
 
     auto stripLeadingSlash = [](std::string s) {
         while (!s.empty() && s.front() == '/') s.erase(s.begin());
@@ -830,6 +900,10 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
                 fid = std::to_string(static_cast<uint64_t>(idit->second.number));
             else if (idit->second.type == mini::Value::Type::String)
                 fid = idit->second.str;
+        }
+        std::string downloadUrlField;
+        if (auto dl = fo.find("download_url"); dl != fo.end() && dl->second.type == mini::Value::Type::String) {
+            downloadUrlField = dl->second.str;
         }
 
         // Size: prefer file_size_bytes
@@ -864,6 +938,7 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
             bestName = fname;
             bestId   = fid;
             bestSize = fsize;
+            bestDownloadUrl = downloadUrlField;
         }
 
         logDebug("files[] entry: name=" + fname + " id=" + fid +
@@ -878,9 +953,15 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
     g.fsName = bestName;
     g.fileId = bestId;
     if (bestSize > 0) g.sizeBytes = bestSize;
-    g.downloadUrl = cfg.serverUrl + "/api/roms/" + g.id +
-                    "/content/" + romm::util::urlEncode(bestName) +
-                    "?file_ids=" + bestId;
+    if (!bestDownloadUrl.empty()) {
+        g.downloadUrl = bestDownloadUrl;
+        logInfo("Using download_url field for " + g.title, "API");
+    } else {
+        g.downloadUrl = cfg.serverUrl + "/api/roms/" + g.id +
+                        "/content/" + romm::util::urlEncode(bestName) +
+                        "?file_ids=" + bestId;
+        logInfo("Constructed download URL for " + g.title, "API");
+    }
 
     logInfo("Selected file via files[] id=" + bestId + " name=" + bestName +
             " size=" + std::to_string(bestSize) + " for " + g.title, "API");

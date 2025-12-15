@@ -13,8 +13,8 @@ TEST_CASE("queue indices stay in range under mutex") {
     // Add items under lock and ensure index clamps.
     {
         std::lock_guard<std::mutex> lock(st.mutex);
-        st.downloadQueue.push_back(romm::Game{});
-        st.downloadQueue.push_back(romm::Game{});
+        st.downloadQueue.push_back({romm::Game{}, romm::QueueState::Pending, ""});
+        st.downloadQueue.push_back({romm::Game{}, romm::QueueState::Pending, ""});
         st.selectedQueueIndex = 5;
         if (st.selectedQueueIndex >= (int)st.downloadQueue.size()) {
             st.selectedQueueIndex = (int)st.downloadQueue.size() - 1;
@@ -41,6 +41,18 @@ TEST_CASE("queue indices stay in range under mutex") {
     }
 }
 
+TEST_CASE("queue item state and error fields survive copies") {
+    romm::QueueItem item;
+    item.game.title = "Test";
+    item.state = romm::QueueState::Failed;
+    item.error = "disk full";
+
+    romm::QueueItem copy = item;
+    REQUIRE(copy.state == romm::QueueState::Failed);
+    REQUIRE(copy.error == "disk full");
+    REQUIRE(copy.game.title == "Test");
+}
+
 TEST_CASE("enqueue dedup by fileId/fsName") {
     romm::Status st;
     romm::Game a; a.fileId = "123"; a.fsName = "foo.nsp";
@@ -49,12 +61,12 @@ TEST_CASE("enqueue dedup by fileId/fsName") {
 
     auto enqueue = [&](const romm::Game& g) {
         std::lock_guard<std::mutex> lock(st.mutex);
-        auto it = std::find_if(st.downloadQueue.begin(), st.downloadQueue.end(), [&](const romm::Game& existing) {
-            return (!g.fileId.empty() && g.fileId == existing.fileId) ||
-                   (!g.fsName.empty() && g.fsName == existing.fsName);
+        auto it = std::find_if(st.downloadQueue.begin(), st.downloadQueue.end(), [&](const romm::QueueItem& existing) {
+            return (!g.fileId.empty() && g.fileId == existing.game.fileId) ||
+                   (!g.fsName.empty() && g.fsName == existing.game.fsName);
         });
         if (it == st.downloadQueue.end()) {
-            st.downloadQueue.push_back(g);
+            st.downloadQueue.push_back({g, romm::QueueState::Pending, ""});
             return true;
         }
         return false;
@@ -90,8 +102,8 @@ TEST_CASE("progress counters accumulate safely") {
 TEST_CASE("withStatusLock guards mutations and returns values") {
     romm::Status st;
     int snapshotSize = romm::withStatusLock(st, [&]() {
-        st.downloadQueue.push_back(romm::Game{});
-        st.downloadQueue.push_back(romm::Game{});
+        st.downloadQueue.push_back({romm::Game{}, romm::QueueState::Pending, ""});
+        st.downloadQueue.push_back({romm::Game{}, romm::QueueState::Pending, ""});
         st.selectedQueueIndex = 1;
         return static_cast<int>(st.downloadQueue.size());
     });

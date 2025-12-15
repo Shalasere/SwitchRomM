@@ -53,8 +53,8 @@ LOG_LEVEL=info          # debug|info|warn|error
 ### Docs
 - `docs/config.md` — config keys, defaults, SD paths.
 - `docs/controls.md` — current controller mapping.
-- `docs/downloads.md` — download pipeline and layout.
-- `docs/logging.md` — logging behavior and levels.
+- `docs/downloads.md` - download pipeline, resume/retry rules, badges.
+- `docs/logging.md` - logging behavior and levels.
 
 ### Controls (current mapping)
 - D-Pad: navigate lists
@@ -64,6 +64,13 @@ LOG_LEVEL=info          # debug|info|warn|error
 - Y (left): Start downloads (from queue)
 - Plus/Start: Quit
 Mappings are fixed in `source/input.cpp` (Nintendo layout); UI hints match.
+
+### Queue / status behavior
+- Badges per ROM: hollow (not queued), grey (queued), white (downloading), green (completed on disk), red (failed).
+- Footer shows status text for the selected ROM; stable position (no shifting).
+- Completed detection checks final output on disk (`fsName`, or `fsName`.xci/.nsp, or multipart dir).
+- No duplicate enqueue per session; failed/incomplete items can be retried, completed are blocked.
+- Temp manifests load as failed so they can be retried; 404/tiny preflight triggers one metadata refresh, then fails fast.
 
 ### Current client features
 - SDL2 UI (1280x720): platforms -> ROMs -> detail, queue, downloading, error.

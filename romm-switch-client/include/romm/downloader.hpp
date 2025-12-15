@@ -16,6 +16,9 @@ void stopDownloadWorker();
 // If a previous worker has finished, join and release its resources.
 void reapDownloadWorkerIfDone();
 
+// Scan temp manifests under download_dir to seed history of resumable items.
+bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError);
+
 #ifdef UNIT_TEST
 // Test helper: parse HTTP headers for content length and range support.
 bool parseLengthAndRangesForTest(const std::string& headers, bool& supportsRanges, uint64_t& contentLength);

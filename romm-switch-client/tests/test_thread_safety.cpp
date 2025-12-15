@@ -18,7 +18,7 @@ TEST_CASE("concurrent access to Status guarded by mutex") {
             g.id = std::to_string(i);
             g.title = "Game " + std::to_string(i);
             g.sizeBytes = static_cast<uint64_t>(i * 1024);
-            st.downloadQueue.push_back(g);
+            st.downloadQueue.push_back(romm::QueueItem{g, romm::QueueState::Pending, ""});
             // Clamp selection to end.
             st.selectedQueueIndex = static_cast<int>(st.downloadQueue.size()) - 1;
         }
@@ -27,7 +27,7 @@ TEST_CASE("concurrent access to Status guarded by mutex") {
     // Reader thread: snapshot sizes under the mutex and verify indices stay in range.
     std::thread reader([&](){
         for (int j = 0; j < 500; ++j) {
-            std::vector<romm::Game> snap;
+            std::vector<romm::QueueItem> snap;
             int sel = 0;
             {
                 std::lock_guard<std::mutex> lock(st.mutex);

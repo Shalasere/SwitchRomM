@@ -1,5 +1,8 @@
 #include "romm/downloader.hpp"
 #include "romm/events.hpp"
+#include "romm/manifest.hpp"
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
@@ -24,6 +27,44 @@ void stopDownloadWorker() {
 
 void reapDownloadWorkerIfDone() {
     // nothing
+}
+
+bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError) {
+    namespace fs = std::filesystem;
+    outError.clear();
+    const fs::path tempRoot = fs::path(cfg.downloadDir) / "temp";
+    if (!fs::exists(tempRoot)) return true;
+    std::lock_guard<std::mutex> lock(status.mutex);
+    for (const auto& entry : fs::directory_iterator(tempRoot)) {
+        if (!entry.is_directory()) continue;
+        fs::path manifestPath = entry.path() / "manifest.json";
+        if (!fs::exists(manifestPath)) continue;
+        std::ifstream in(manifestPath.string(), std::ios::binary);
+        if (!in) continue;
+        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        romm::Manifest m;
+        std::string err;
+        if (!romm::manifestFromJson(content, m, err)) continue;
+        auto already = std::find_if(status.downloadHistory.begin(), status.downloadHistory.end(),
+            [&](const QueueItem& qi) {
+                if (!m.rommId.empty()) return qi.game.id == m.rommId;
+                return qi.game.fsName == m.fsName;
+            });
+        if (already != status.downloadHistory.end()) continue;
+        QueueItem qi;
+        qi.game.id = m.rommId;
+        qi.game.fileId = m.fileId;
+        qi.game.fsName = m.fsName;
+        qi.game.downloadUrl = m.url;
+        qi.game.sizeBytes = m.totalSize;
+        qi.state = QueueState::Pending;
+        bool allDone = !m.parts.empty() &&
+                       std::all_of(m.parts.begin(), m.parts.end(),
+                                   [](const romm::ManifestPart& p){ return p.completed; });
+        if (allDone) qi.state = QueueState::Completed;
+        status.downloadHistory.push_back(qi);
+    }
+    return true;
 }
 
 bool parseLengthAndRangesForTest(const std::string& headers, bool& supportsRanges, uint64_t& contentLength) {
