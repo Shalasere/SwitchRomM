@@ -60,3 +60,55 @@ TEST_CASE("planResume counts valid and invalid parts") {
     REQUIRE(plan.bytesHave == 4096 + 1000);
     REQUIRE(plan.bytesNeed == m.totalSize - plan.bytesHave);
 }
+
+TEST_CASE("planResume requires contiguity from part 0") {
+    romm::Manifest m;
+    m.totalSize = 3 * 4096;
+    m.partSize = 4096;
+    m.parts = { {0, 4096, ""}, {1, 4096, ""}, {2, 4096, ""} };
+
+    SECTION("missing part 0 invalidates later complete parts") {
+        std::vector<std::pair<int, uint64_t>> observed = {
+            {1, 4096}, // looks complete but part 0 missing
+            {2, 4096}
+        };
+        romm::ResumePlan plan = romm::planResume(m, observed);
+        REQUIRE(plan.validParts.empty());
+        REQUIRE(plan.partialIndex == -1);
+        REQUIRE(plan.bytesHave == 0);
+        REQUIRE(plan.bytesNeed == m.totalSize);
+        REQUIRE(plan.invalidParts.size() == 2);
+    }
+
+    SECTION("gap after part 0 stops resume boundary") {
+        std::vector<std::pair<int, uint64_t>> observed = {
+            {0, 4096},
+            {2, 4096}
+        };
+        romm::ResumePlan plan = romm::planResume(m, observed);
+        REQUIRE(plan.validParts.size() == 1);
+        REQUIRE(plan.validParts[0] == 0);
+        REQUIRE(plan.partialIndex == -1);
+        REQUIRE(plan.bytesHave == 4096);
+        REQUIRE(plan.bytesNeed == m.totalSize - plan.bytesHave);
+        REQUIRE(plan.invalidParts.size() == 1);
+        REQUIRE(plan.invalidParts[0] == 2);
+    }
+
+    SECTION("partial allowed only at first missing index; later parts invalid") {
+        std::vector<std::pair<int, uint64_t>> observed = {
+            {0, 4096},
+            {1, 2048}, // partial at next index
+            {2, 4096}  // should be invalid because gap/partial before it
+        };
+        romm::ResumePlan plan = romm::planResume(m, observed);
+        REQUIRE(plan.validParts.size() == 1);
+        REQUIRE(plan.validParts[0] == 0);
+        REQUIRE(plan.partialIndex == 1);
+        REQUIRE(plan.partialBytes == 2048);
+        REQUIRE(plan.bytesHave == 4096 + 2048);
+        REQUIRE(plan.bytesNeed == m.totalSize - plan.bytesHave);
+        REQUIRE(plan.invalidParts.size() == 1);
+        REQUIRE(plan.invalidParts[0] == 2);
+    }
+}

@@ -1,6 +1,6 @@
 # Config
 
-Put `.env` at `sdmc:/switch/romm_switch_client/.env`. `config.json` in the same directory is also read, but `.env` wins if both set the same key.
+ Put `.env` at `sdmc:/switch/romm_switch_client/.env`. `config.json` in the same directory is also read; current load order is `.env` then `config.json`, so JSON overrides `.env` on the same key. TODO: decide whether `.env` should have precedence instead (was previously documented that way).
 
 ## Keys (with defaults)
 - `SERVER_URL` (required): Base RomM URL. **HTTP only; TLS is not supported in the client.** Example: `http://192.168.1.10:8080`.

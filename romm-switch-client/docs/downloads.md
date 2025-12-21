@@ -29,3 +29,11 @@
 - On restart, the app reuses complete parts and a single partial part using `manifest.json` (size-only validation today). If Range is unavailable, the ROM restarts from zero.
 - Preflight logs HTTP status; on tiny Content-Length or 404 we refresh metadata once, then fail fast.
 - Finalize logs the SD error string; single-part finalize falls back to copy-on-write if a rename fails.
+
+### TODO (known gaps)
+- Temp dir naming is title-only and can collide; include rom/file IDs to isolate downloads.
+- Resume validation is size-only; add hashes/checks or stronger validation even though contiguity is enforced now (hashing optional/expensive; server does not provide hashes).
+- Final output naming can overwrite when sanitized titles collide; add collision-safe naming (IDs or disambiguation).
+- Downloader streaming assumes Content-Length; detect Transfer-Encoding: chunked and fail loudly (or implement support).
+- Use effective total size consistently (prefer server Content-Length when present); ensure progress/completion counters reflect that value.
+- download_url from API may be relative/unencoded; absolutize against SERVER_URL and use full URL encoding for path components (spaces-only encoding is insufficient).

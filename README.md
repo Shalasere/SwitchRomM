@@ -48,20 +48,20 @@ HTTP_TIMEOUT_SECONDS=30
 FAT32_SAFE=true
 LOG_LEVEL=info          # debug|info|warn|error
 ```
-`config.json` also works, but `.env` is preferred.
+`config.json` is also read and currently overrides `.env` on the same keys (load order is .env then config.json).
 
 ### Docs
-- `docs/config.md` — config keys, defaults, SD paths.
-- `docs/controls.md` — current controller mapping.
+- `docs/config.md` - config keys, defaults, SD paths.
+- `docs/controls.md` - current controller mapping.
 - `docs/downloads.md` - download pipeline, resume/retry rules, badges.
 - `docs/logging.md` - logging behavior and levels.
 
 ### Controls (current mapping)
 - D-Pad: navigate lists
-- A (right): Back
-- B (bottom): Select/confirm
-- X (top): Open queue
-- Y (left): Start downloads (from queue)
+- A (right): Select / confirm
+- B (bottom): Back
+- Y (left): Queue view / add to queue
+- X (top): Start downloads (from queue)
 - Plus/Start: Quit
 Mappings are fixed in `source/input.cpp` (Nintendo layout); UI hints match.
 

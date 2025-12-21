@@ -14,3 +14,6 @@ log_level=info
 ```
 
 Tip: use `debug` only when diagnosing; keep `info` to reduce SD writes and keep logs readable.
+
+TODO:
+- Make logger thread-safe (single sink + mutex) and avoid open-per-line writes (add buffering/rotation to reduce SD wear).

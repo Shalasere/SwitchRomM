@@ -2,6 +2,7 @@
 #include "mini/json.hpp"
 #include <algorithm>
 #include <sstream>
+#include <unordered_map>
 
 namespace romm {
 
@@ -102,35 +103,58 @@ bool manifestFromJson(const std::string& json, Manifest& out, std::string& err) 
 ResumePlan planResume(const Manifest& m,
                       const std::vector<std::pair<int, uint64_t>>& observedParts) {
     ResumePlan plan;
-    // Map observed sizes by index; allow one partial (incomplete) part to be resumed.
-    int partialIdx = -1;
-    uint64_t partialBytes = 0;
+
+    // Build quick lookups for expected and observed sizes.
+    std::unordered_map<int, uint64_t> expected;
+    expected.reserve(m.parts.size());
+    for (const auto& p : m.parts) {
+        expected[p.index] = p.size;
+    }
+    std::unordered_map<int, uint64_t> observed;
+    observed.reserve(observedParts.size());
     for (const auto& pr : observedParts) {
-        int idx = pr.first;
-        uint64_t sz = pr.second;
-        auto it = std::find_if(m.parts.begin(), m.parts.end(), [&](const ManifestPart& p){ return p.index == idx; });
-        if (it != m.parts.end()) {
-            if (it->size == sz) {
-                plan.validParts.push_back(idx);
-                plan.bytesHave += sz;
-            } else if (sz > 0 && sz < it->size) {
-                // treat a single partial part as resumable
-                if (partialIdx < 0 || idx > partialIdx) {
-                    partialIdx = idx;
-                    partialBytes = sz;
-                }
-            } else {
-                plan.invalidParts.push_back(idx);
-            }
-        } else {
-            plan.invalidParts.push_back(idx);
+        observed[pr.first] = pr.second;
+    }
+
+    // Walk contiguous parts from index 0. Stop at the first missing/invalid/partial.
+    int idx = 0;
+    while (true) {
+        auto expIt = expected.find(idx);
+        if (expIt == expected.end()) break; // manifest doesn't expect this index
+
+        auto obsIt = observed.find(idx);
+        if (obsIt == observed.end()) break; // missing part stops contiguity
+
+        uint64_t expectedSize = expIt->second;
+        uint64_t haveSize = obsIt->second;
+
+        if (haveSize == expectedSize) {
+            plan.validParts.push_back(idx);
+            plan.bytesHave += expectedSize;
+            observed.erase(obsIt);
+            ++idx;
+            continue;
         }
+
+        if (haveSize > 0 && haveSize < expectedSize) {
+            // Allow exactly one partial part at the first missing index.
+            plan.partialIndex = idx;
+            plan.partialBytes = haveSize;
+            plan.bytesHave += haveSize;
+            observed.erase(obsIt);
+        } else {
+            // Wrong size or oversized: mark invalid and stop.
+            plan.invalidParts.push_back(idx);
+            observed.erase(obsIt);
+        }
+        break; // any deviation stops contiguity
     }
-    if (partialIdx >= 0 && partialBytes > 0) {
-        plan.partialIndex = partialIdx;
-        plan.partialBytes = partialBytes;
-        plan.bytesHave += partialBytes;
+
+    // Anything observed beyond the contiguous boundary is invalid.
+    for (const auto& kv : observed) {
+        plan.invalidParts.push_back(kv.first);
     }
+
     plan.bytesNeed = (m.totalSize > plan.bytesHave) ? (m.totalSize - plan.bytesHave) : 0;
     return plan;
 }
