@@ -11,6 +11,7 @@
 - `HTTP_TIMEOUT_SECONDS` (`30`): HTTP send/recv timeout.
 - `FAT32_SAFE` (`true`): Present but ignored; splitting is always on.
 - `LOG_LEVEL` (`info`): `debug|info|warn|error`.
+- `SPEED_TEST_URL` (blank): Optional URL to fetch ~10MB for a quick throughput estimate. If blank, no separate speed test is run.
 
 ## Files created by the client
 - Downloads: `<DOWNLOAD_DIR>/<Title or fsName>` (single file) or `<DOWNLOAD_DIR>/<Title or fsName>/00 01 ...` (multi-part DBI layout).

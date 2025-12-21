@@ -5,6 +5,7 @@
 #include "romm/util.hpp"
 #include "romm/raii.hpp"
 #include "romm/manifest.hpp"
+#include "romm/speed_test.hpp"
 #include <switch.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -29,6 +30,21 @@
 namespace romm {
 
 namespace {
+
+// Send entire buffer, handling short writes and EINTR.
+static bool sendAll(int fd, const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, data + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
 
 constexpr uint64_t kPartSize = 0xFFFF0000ULL; // DBI/Tinfoil split size
 constexpr uint64_t kFreeSpaceMarginBytes = 200ULL * 1024ULL * 1024ULL; // ~200MB margin
@@ -158,7 +174,9 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
         if (!authBasic.empty()) req += "Authorization: Basic " + authBasic + "\r\n";
         if (!extraHeader.empty()) req += extraHeader + "\r\n";
         req += "\r\n";
-        send(sock.fd, req.c_str(), req.size(), 0);
+        if (!sendAll(sock.fd, req.c_str(), req.size())) {
+            return false;
+        }
         std::string headerAccum;
         char buf[1024];
         while (true) {
@@ -290,7 +308,10 @@ static bool streamDownload(const std::string& url,
         req += "Range: bytes=" + std::to_string(startOffset) + "-\r\n";
     }
     req += "\r\n";
-    send(sock.fd, req.c_str(), req.size(), 0);
+    if (!sendAll(sock.fd, req.c_str(), req.size())) {
+        err = "Send failed";
+        return false;
+    }
 
     // Read headers
     std::string headerAccum;
@@ -300,7 +321,11 @@ static bool streamDownload(const std::string& url,
     size_t bodyStartOffset = 0;
     int statusCode = 0;
     uint64_t contentLength = 0;
+    bool transferChunked = false;
     uint64_t expectedBody = totalSize - startOffset;
+    const uint64_t kProbeBytes = 10ULL * 1024ULL * 1024ULL; // 10 MB probe for throughput log
+    bool probeLogged = false;
+    auto transferStart = std::chrono::steady_clock::now();
     while (!headersDone) {
         ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
         if (n <= 0) { err = "No HTTP headers received"; return false; }
@@ -332,7 +357,16 @@ static bool streamDownload(const std::string& url,
                 contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
             } else if (keyLower == "content-range") {
                 // Optional: validate total size from content-range
+            } else if (keyLower == "transfer-encoding" && val.find("chunked") != std::string::npos) {
+                transferChunked = true;
             }
+        }
+        if (transferChunked) {
+            err = "Chunked transfer not supported for streaming downloads";
+            return false;
+        }
+        if (contentLength > 0) {
+            expectedBody = contentLength;
         }
         if (contentLength && expectedBody && contentLength < expectedBody) {
             err = "Short body (Content-Length " + std::to_string(contentLength) + " < expected " + std::to_string(expectedBody) + ")";
@@ -393,6 +427,18 @@ static bool streamDownload(const std::string& url,
             if (!writeSpan(globalOffset, headerAccum.data() + bodyStartOffset, toUse)) { return false; }
             status.currentDownloadedBytes.fetch_add(toUse);
             status.totalDownloadedBytes.fetch_add(toUse);
+            uint64_t received = globalOffset - startOffset;
+            if (!probeLogged && received >= kProbeBytes) {
+                double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - transferStart).count();
+                if (secs <= 0.0) secs = 1e-6;
+                double mbps = (received / (1024.0 * 1024.0)) / secs; // MB/s
+                logLine("Throughput estimate ~" + std::to_string(mbps) + " Mbps (first 10MB)");
+                {
+                    std::lock_guard<std::mutex> lock(status.mutex);
+                    status.lastSpeedMbps = mbps;
+                }
+                probeLogged = true;
+            }
         }
     }
 
@@ -408,8 +454,28 @@ static bool streamDownload(const std::string& url,
             status.currentDownloadedBytes.fetch_add(toUse);
             status.totalDownloadedBytes.fetch_add(toUse);
             bytesSinceBeat += toUse;
+            uint64_t received = globalOffset - startOffset;
+            if (!probeLogged && received >= kProbeBytes) {
+                double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - transferStart).count();
+                if (secs <= 0.0) secs = 1e-6;
+                double mbps = (received / (1024.0 * 1024.0)) / secs; // MB/s
+                logLine("Throughput estimate ~" + std::to_string(mbps) + " Mbps (first 10MB)");
+                {
+                    std::lock_guard<std::mutex> lock(status.mutex);
+                    status.lastSpeedMbps = mbps;
+                }
+                probeLogged = true;
+            }
             auto now = std::chrono::steady_clock::now();
             if (bytesSinceBeat >= kLogEvery || now - lastBeat > std::chrono::seconds(10)) {
+                double beatSecs = std::chrono::duration<double>(now - lastBeat).count();
+                if (beatSecs > 0.0) {
+                double mbps = (bytesSinceBeat / (1024.0 * 1024.0)) / beatSecs; // MB/s
+                {
+                    std::lock_guard<std::mutex> lock(status.mutex);
+                    status.lastSpeedMbps = mbps;
+                }
+            }
                 logDebug("Heartbeat: " + status.currentDownloadTitle +
                          " cur=" + std::to_string(status.currentDownloadedBytes.load()) + "/" +
                          std::to_string(status.currentDownloadSize.load()) +
@@ -558,8 +624,12 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     std::string tmpName = safeName(g.title);
     if (tmpName.empty() && !g.fsName.empty()) tmpName = safeName(g.fsName);
     if (tmpName.size() > 12) tmpName = tmpName.substr(0, 12);
-    if (tmpName.empty()) tmpName = g.id;
-    std::string tmpDir = tempRoot + "/" + tmpName + ".tmp";
+    std::string idSuffix = safeName(!g.id.empty() ? g.id : g.fileId);
+    if (idSuffix.size() > 8) idSuffix = idSuffix.substr(0, 8);
+    if (tmpName.empty()) tmpName = idSuffix.empty() ? "rom" : idSuffix;
+    std::string tmpDir = tempRoot + "/" + tmpName;
+    if (!idSuffix.empty()) tmpDir += "_" + idSuffix;
+    tmpDir += ".tmp";
     ensureDirectory(tmpDir);
     logLine("Using temp dir: " + tmpDir);
     logLine("Download URL: " + g.downloadUrl);
@@ -572,13 +642,14 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
         logLine("Preflight for " + g.title + " len=" + std::to_string(pf.contentLength) +
                 " ranges=" + (pf.supportsRanges ? "true" : "false"));
     }
+    uint64_t effectiveSize = pf.contentLength ? pf.contentLength : g.sizeBytes;
     if (pf.contentLength != 0 && pf.contentLength != g.sizeBytes) {
         logLine("Warning: server size " + std::to_string(pf.contentLength) + " differs from metadata " + std::to_string(g.sizeBytes));
-        // trust server size for transfer
-        status.currentDownloadSize.store(pf.contentLength);
-    } else if (pf.contentLength != 0) {
-        status.currentDownloadSize.store(pf.contentLength);
     }
+    if (effectiveSize == 0) {
+        effectiveSize = g.sizeBytes;
+    }
+    status.currentDownloadSize.store(effectiveSize);
 
     uint64_t totalSize = status.currentDownloadSize.load();
     bool refreshedMetadata = false;
@@ -798,6 +869,12 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     } else {
         finalName += ".nsp";
     }
+    // Avoid overwriting an existing file/dir by disambiguating with rom/file id.
+    std::error_code finalEc;
+    if (std::filesystem::exists(finalName, finalEc)) {
+        std::string suffix = idSuffix.empty() ? "dup" : idSuffix;
+        finalName += "." + suffix;
+    }
     logLine("Finalize: moving temp to " + finalName);
     bool okFinal = finalizeParts(tmpDir, finalName);
     if (!okFinal) {
@@ -808,7 +885,7 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     {
         std::lock_guard<std::mutex> lock(status.mutex);
         // Keep UI counters aligned with the completed file.
-        status.currentDownloadedBytes.store(g.sizeBytes);
+        status.currentDownloadedBytes.store(totalSize);
         status.totalDownloadedBytes.store(status.totalDownloadedBytes.load()); // unchanged, already includes current
         status.lastDownloadError.clear();
     }

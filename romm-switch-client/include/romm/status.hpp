@@ -49,6 +49,7 @@ struct Status {
     std::atomic<uint64_t> totalDownloadBytes{0};
     std::atomic<uint64_t> totalDownloadedBytes{0};
     std::string currentDownloadTitle;
+    double lastSpeedMbps{0.0}; // last measured throughput (Mbps), updated by worker
     std::atomic<bool> downloadWorkerRunning{false};
     std::atomic<bool> lastDownloadFailed{false};
     std::string lastDownloadError;

@@ -43,6 +43,7 @@ static bool parseEnvStream(std::istream& in, Config& outCfg) {
             std::string v = toLower(val);
             outCfg.fat32Safe = (v == "1" || v == "true" || v == "yes");
         } else if (key == "log_level") outCfg.logLevel = toLower(val);
+        else if (key == "speed_test_url") outCfg.speedTestUrl = val;
     }
     return true;
 }
@@ -93,6 +94,7 @@ static bool parseJson(const std::string& path, Config& outCfg, std::string& outE
         getStr("log_level", lvl);
         if (!lvl.empty()) outCfg.logLevel = toLower(lvl);
     }
+    getStr("speed_test_url", outCfg.speedTestUrl);
     return true;
 }
 

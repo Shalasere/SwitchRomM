@@ -22,6 +22,8 @@ struct Config {
     bool fat32Safe{false};
     // Logging verbosity (debug, info, warn, error)
     std::string logLevel{"info"};
+    // Optional URL to fetch ~10MB for a quick throughput estimate; blank to skip.
+    std::string speedTestUrl;
 };
 
 bool loadConfig(Config& outCfg, std::string& outError);

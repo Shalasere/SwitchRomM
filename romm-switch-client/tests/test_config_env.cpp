@@ -6,7 +6,8 @@ TEST_CASE("parseEnvString parses required fields") {
         "server_url=http://example.com\n"
         "download_dir=sdmc:/romm_cache/switch\n"
         "log_level=debug\n"
-        "http_timeout_seconds=15\n";
+        "http_timeout_seconds=15\n"
+        "speed_test_url=http://speed.test/file\n";
 
     romm::Config cfg;
     std::string err;
@@ -17,6 +18,20 @@ TEST_CASE("parseEnvString parses required fields") {
     REQUIRE(cfg.downloadDir == "sdmc:/romm_cache/switch");
     REQUIRE(cfg.logLevel == "debug");
     REQUIRE(cfg.httpTimeoutSeconds == 15);
+    REQUIRE(cfg.speedTestUrl == "http://speed.test/file");
+}
+
+TEST_CASE("parseEnvString accepts speed_test_url optional") {
+    const std::string env =
+        "server_url=http://example.com\n"
+        "download_dir=sdmc:/romm_cache/switch\n"
+        "speed_test_url=\n";
+    romm::Config cfg;
+    std::string err;
+    bool ok = romm::parseEnvString(env, cfg, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(cfg.speedTestUrl.empty());
 }
 
 TEST_CASE("parseEnvString rejects missing required fields") {

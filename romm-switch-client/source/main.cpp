@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <iomanip>
 #include "stb_image.h"
 // Fallback declarations in case the minimal stb header wasn't visible for some reason
 extern "C" unsigned char *stbi_load_from_memory(const unsigned char *buffer, int len, int *x, int *y, int *channels_in_file, int desired_channels);
@@ -38,6 +39,7 @@ extern "C" void stbi_image_free(void *retval_from_stbi_load);
 #include "romm/downloader.hpp"
 #include "romm/cover_loader.hpp"
 #include "romm/queue_policy.hpp"
+#include "romm/speed_test.hpp"
 
 using romm::Status;
 using romm::Config;
@@ -369,8 +371,10 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         bool lastDownloadFailed{false};
         std::string lastDownloadError;
         std::string currentDownloadTitle;
+        int currentDownloadIndex{0};
         std::string lastError;
         std::unordered_set<std::string> completedOnDisk;
+        double lastSpeedMbps{0.0};
     } snap;
 
     {
@@ -389,33 +393,60 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.lastDownloadFailed = status.lastDownloadFailed.load();
         snap.lastDownloadError = status.lastDownloadError;
         snap.currentDownloadTitle = status.currentDownloadTitle;
+        snap.currentDownloadIndex = status.currentDownloadIndex;
         snap.lastError = status.lastError;
+        snap.lastSpeedMbps = status.lastSpeedMbps;
     }
     // Populate on-disk completion set outside the status lock (uses config).
+    // Cache results and rescan only when ROM list changes or on a timed interval to avoid per-frame disk IO.
+    static std::unordered_map<std::string, bool> completedCache;
+    static std::string cacheKey;
+    static std::chrono::steady_clock::time_point lastScanSteady{};
+    std::string currentKey;
+    currentKey.reserve(snap.roms.size() * 8);
     for (const auto& g : snap.roms) {
-        std::vector<std::filesystem::path> candidates;
-        if (!g.fsName.empty()) {
-            std::filesystem::path base = std::filesystem::path(config.downloadDir) / g.fsName;
-            candidates.push_back(base);
-            // If fsName lacks an extension, also check common ones.
-            if (!base.has_extension()) {
-                candidates.push_back(std::filesystem::path(config.downloadDir) / (g.fsName + ".xci"));
-                candidates.push_back(std::filesystem::path(config.downloadDir) / (g.fsName + ".nsp"));
-            }
-        }
-        std::error_code ec;
-        for (const auto& p : candidates) {
-            if (!std::filesystem::exists(p, ec)) continue;
-            if (std::filesystem::is_regular_file(p, ec)) {
-                snap.completedOnDisk.insert(g.id);
-                break;
-            }
-            if (std::filesystem::is_directory(p, ec)) {
-                auto it = std::filesystem::directory_iterator(p, ec);
-                if (!ec && it != std::filesystem::end(it)) {
-                    snap.completedOnDisk.insert(g.id);
-                    break;
+        currentKey.append(g.id);
+        currentKey.push_back('|');
+        currentKey.append(g.fsName);
+        currentKey.push_back(';');
+    }
+    auto nowSteady = std::chrono::steady_clock::now();
+    bool needScan = (currentKey != cacheKey) || (nowSteady - lastScanSteady > std::chrono::seconds(2));
+    if (needScan) {
+        completedCache.clear();
+        cacheKey = currentKey;
+        lastScanSteady = nowSteady;
+        for (const auto& g : snap.roms) {
+            std::string key = !g.id.empty() ? g.id : g.fsName;
+            bool found = false;
+            std::vector<std::filesystem::path> candidates;
+            if (!g.fsName.empty()) {
+                std::filesystem::path base = std::filesystem::path(config.downloadDir) / g.fsName;
+                candidates.push_back(base);
+                // If fsName lacks an extension, also check common ones.
+                if (!base.has_extension()) {
+                    candidates.push_back(std::filesystem::path(config.downloadDir) / (g.fsName + ".xci"));
+                    candidates.push_back(std::filesystem::path(config.downloadDir) / (g.fsName + ".nsp"));
                 }
+            }
+            std::error_code ec;
+            for (const auto& p : candidates) {
+                if (!std::filesystem::exists(p, ec)) continue;
+                if (std::filesystem::is_regular_file(p, ec)) { found = true; break; }
+                if (std::filesystem::is_directory(p, ec)) {
+                    auto it = std::filesystem::directory_iterator(p, ec);
+                    if (!ec && it != std::filesystem::end(it)) { found = true; break; }
+                }
+            }
+            if (!key.empty()) completedCache[key] = found;
+        }
+    }
+    for (const auto& g : snap.roms) {
+        std::string key = !g.id.empty() ? g.id : g.fsName;
+        if (!key.empty()) {
+            auto it = completedCache.find(key);
+            if (it != completedCache.end() && it->second) {
+                snap.completedOnDisk.insert(g.id);
             }
         }
     }
@@ -483,7 +514,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         if (!right.empty()) {
             int charW = 6 * 2; // glyph width (5) + spacing, scaled by 2
             int textW = static_cast<int>(right.size()) * charW;
-            int x = 1280 - 32 - textW;
+            int x = 1280 - 72 - textW; // leave extra padding on the right to avoid clipping battery/time
             if (x < 32) x = 32;
             drawText(renderer, x, 14, right, fg, 2);
         }
@@ -500,12 +531,12 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     // Cache system time/battery once per second to avoid overcalling services.
     static time_t lastTimeSec = 0;
     static std::string sysInfo;
-    time_t now = time(nullptr);
-    if (now != lastTimeSec) {
-        lastTimeSec = now;
+    time_t nowSec = time(nullptr);
+    if (nowSec != lastTimeSec) {
+        lastTimeSec = nowSec;
         char buf[16]{};
         struct tm tm{};
-        localtime_r(&now, &tm);
+        localtime_r(&nowSec, &tm);
         std::snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
         u32 batt = 0;
         if (R_SUCCEEDED(psmGetBatteryChargePercentage(&batt))) {
@@ -526,6 +557,22 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.downloadCompleted ||
         (totalBytes > 0 && totalDone >= totalBytes &&
          snap.downloadQueue.empty() && !snap.downloadWorkerRunning);
+
+    // If we have a speed reading, prepend it to the right-hand status.
+    std::vector<std::string> rightParts;
+    if (snap.lastSpeedMbps > 0.05) {
+        std::ostringstream oss;
+        oss << "SPD:" << std::fixed << std::setprecision(1) << snap.lastSpeedMbps << " MB/s";
+        rightParts.push_back(oss.str());
+    } else if (snap.lastSpeedMbps < 0.0) {
+        rightParts.push_back(snap.lastSpeedMbps == -2.0 ? "SPD:err" : "SPD:...");
+    }
+    rightParts.push_back(sysInfo);
+    std::string rightInfo;
+    for (size_t i = 0; i < rightParts.size(); ++i) {
+        if (i) rightInfo += "  ";
+        rightInfo += rightParts[i];
+    }
 
     if (snap.view == Status::View::DOWNLOADING && totalBytes > 0) {
         float pctTotal = static_cast<float>(totalDone) /
@@ -561,7 +608,13 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             drawText(renderer, outline.x, outline.y + 80,
                      "Overall  " + std::to_string(pctInt) + "% (" +
                      humanSize(totalDone) + " / " +
-                     humanSize(totalBytes) + ")", fg, 2);
+                     humanSize(totalBytes) + ")" +
+                     (snap.lastSpeedMbps > 0.1 ? ("  @" + [] (double mbps) {
+                         std::ostringstream oss;
+                         oss << std::fixed << std::setprecision(1) << " " << mbps << " MB/s";
+                         return oss.str();
+                     }(snap.lastSpeedMbps)) : std::string()),
+                     fg, 2);
             if (totalDone == 0) {
                 static const char* dots[] = {"", ".", "..", "..."};
                 const int phase = (gFrameCounter / 20) % 4;
@@ -884,7 +937,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             }
         }
     } else if (snap.view == Status::View::DOWNLOADING) {
-        header = "DOWNLOADING sel=" + std::to_string(status.currentDownloadIndex);
+        header = "DOWNLOADING sel=" + std::to_string(snap.currentDownloadIndex);
     } else if (snap.view == Status::View::ERROR) {
         header = "ERROR";
     }
@@ -935,7 +988,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     }
 
     if (!header.empty()) {
-        drawHeaderBar(header, sysInfo);
+        drawHeaderBar(header, rightInfo);
     }
     if (!controls.empty()) {
         // Draw only the left footer text here; status is drawn with fixed positioning below.
@@ -964,6 +1017,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
     socketInitializeDefault();
+    std::thread speedTestThread;
 #if HAS_NXLINK
     int nxfd = nxlinkStdio();
     if (nxfd >= 0) {
@@ -1058,6 +1112,26 @@ int main(int argc, char** argv) {
         romm::logLine(" download_dir=" + config.downloadDir);
         romm::logLine(std::string(" fat32_safe=") + (config.fat32Safe ? "true" : "false"));
         romm::ensureDirectory(config.downloadDir);
+        if (!config.speedTestUrl.empty()) {
+            // Kick off a background speed test (20MB range) without blocking UI; join on exit.
+            const Config cfgCopy = config;
+            {
+                std::lock_guard<std::mutex> lock(status.mutex);
+                status.lastSpeedMbps = -1.0; // pending
+            }
+            speedTestThread = std::thread([cfgCopy, &status]() {
+                std::string err;
+                constexpr uint64_t kProbeBytes = 40ULL * 1024ULL * 1024ULL;
+                if (romm::runSpeedTest(cfgCopy, status, kProbeBytes, err)) {
+                    std::lock_guard<std::mutex> lock(status.mutex);
+                    romm::logLine("Startup speed test: " + std::to_string(status.lastSpeedMbps) + " MB/s");
+                } else {
+                    std::lock_guard<std::mutex> lock(status.mutex);
+                    status.lastSpeedMbps = -2.0; // failed
+                    romm::logLine("Startup speed test failed: " + err);
+                }
+            });
+        }
         std::string histErr;
         if (!romm::loadLocalManifests(status, config, histErr) && !histErr.empty()) {
             romm::logLine("Manifest load warning: " + histErr);
@@ -1363,6 +1437,9 @@ int main(int argc, char** argv) {
 exit_app:
     romm::logLine("Exiting main loop. running=" + std::to_string(running));
     romm::stopDownloadWorker();
+    if (speedTestThread.joinable()) {
+        speedTestThread.join();
+    }
     // Restore default sleep/dim behavior on exit.
     appletSetMediaPlaybackState(false);
     appletSetAutoSleepDisabled(false);

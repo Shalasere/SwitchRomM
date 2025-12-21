@@ -47,6 +47,7 @@ DOWNLOAD_DIR=sdmc:/romm_cache/switch
 HTTP_TIMEOUT_SECONDS=30
 FAT32_SAFE=true
 LOG_LEVEL=info          # debug|info|warn|error
+SPEED_TEST_URL=         # optional; URL to fetch ~10MB to estimate throughput; leave blank to skip
 ```
 `config.json` is also read and currently overrides `.env` on the same keys (load order is .env then config.json).
 
