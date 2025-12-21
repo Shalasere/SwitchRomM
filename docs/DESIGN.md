@@ -35,23 +35,24 @@ Audience: senior C++ devs working on `romm-switch-client/`. Snapshot of constrai
 - Config: `apiToken`/`fat32Safe` unused; fast-fail on `https://` now enforced.
 
 ## Plan (near-term)
-P0 - correctness/safety
-- Enforce Status policy: all non-trivial fields under mutex; snapshot helpers; stop racy reads (e.g., currentDownloadIndex/title) and per-frame FS scans.
-- Resume integrity: contiguous-only resume implemented; remaining: temp dirs keyed by rom/file id, avoid final-name collisions, use effective total size (Content-Length if present), optional hashes remain TODO (server doesn’t provide).
-- Networking: loop send() in downloader preflight/stream, detect chunked for streaming and fail loudly, align server/metadata size use.
-- Controls: canonical mapping A=Select, B=Back, Y=Queue, X=Download reflected in code, UI hints, docs; remove contradictory footers.
+P0 - correctness/safety (DONE)
+- Status policy: non-trivial fields guarded via mutex/snapshots; racy reads curtailed; per-frame FS scans removed in favor of cached completion.
+- Resume integrity: contiguous-only resume enforced; temp dirs keyed by rom/file IDs; collision-safe final naming; effective size prefers Content-Length when present (optional hashes still TODO).
+- Networking: downloader send() loops; streaming detects chunked and fails loudly; server/metadata size alignment improved.
+- Controls: canonical mapping A=Select, B=Back, Y=Queue, X=Download reflected in code, UI hints, docs; contradictory footers removed.
 
-P1 - robustness/UX
-- Unify HTTP client (shared parse/connect/stream); structured errors; enforce http-only at config load; track active socket and `shutdown()` on stop.
-- Async cover loading with placeholder; keep SDL texture work on main thread.
-- Queue UX: QueueItem state (Pending/Downloading/Completed/Failed), keep failed visible, dedupe enqueues, consistent back-nav.
-- Cache on-disk completion state; update on download completion/manifest load/background scan instead of per-frame exists checks.
+P1 - robustness/UX (active)
+- Unify HTTP client (shared parse/connect/stream) to eliminate divergence; keep explicit chunked fail-fast for streaming unless adding support; structured errors; enforce http-only at config load; track active socket and `shutdown()` on stop.
+- Logger hygiene: thread-safe sink, keep file handle open, add basic rotation/size cap to reduce SD wear.
+- On-disk completion detection: account for ID-suffixed final filenames so badges stay accurate.
+- Status locking audit: ensure all string/vector/error accesses are under mutex/snapshotted; consider event-queue model.
+- Resume validation: strengthen beyond size-only when feasible (hash optional; server doesn’t provide).
+- Queue/UI polish: async cover placeholder; consistent back-nav; keep failed/resumable visible; dedupe enqueues (already), ensure hints stay aligned.
 
 P2 - quality
-- Manifest + optional hashes for downloads; validate resume beyond size-only; fsync temp/manifest.
-- Log rotation/cap; thread-safe logger.
+- Manifest + optional hashes; fsync temp/manifest; richer error codes.
 - UI polish (paging/search optional), tidy navStack, config flag cleanup.
-- Expand tests: URL builder, file selection, downloader segmentation/resume (contiguity), input mapping, chunked detection/error.
+- Expand tests: URL builder, file selection, downloader segmentation/resume edge cases, input mapping, chunked detection/error, logger.
 
 ## Constraints / Deployment
 - Network: http only; use on trusted LAN or behind TLS-terminating proxy.
