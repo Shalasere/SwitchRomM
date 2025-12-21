@@ -5,6 +5,7 @@
 #include <sstream>
 #include <mutex>
 #include <filesystem>
+#include <algorithm>
 
 namespace romm {
 
@@ -41,7 +42,15 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         qi.game.fsName = m.fsName;
         qi.game.downloadUrl = m.url;
         qi.game.sizeBytes = m.totalSize;
-        qi.state = romm::QueueState::Pending;
+        qi.state = romm::QueueState::Resumable;
+        qi.error = "Resume available";
+        bool allDone = !m.parts.empty() &&
+                       std::all_of(m.parts.begin(), m.parts.end(),
+                                   [](const romm::ManifestPart& p){ return p.completed; });
+        if (allDone) {
+            qi.state = romm::QueueState::Completed;
+            qi.error.clear();
+        }
         status.downloadHistory.push_back(qi);
     }
     return true;

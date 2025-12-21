@@ -470,13 +470,18 @@ static bool streamDownload(const std::string& url,
             if (bytesSinceBeat >= kLogEvery || now - lastBeat > std::chrono::seconds(10)) {
                 double beatSecs = std::chrono::duration<double>(now - lastBeat).count();
                 if (beatSecs > 0.0) {
-                double mbps = (bytesSinceBeat / (1024.0 * 1024.0)) / beatSecs; // MB/s
+                    double mbps = (bytesSinceBeat / (1024.0 * 1024.0)) / beatSecs; // MB/s
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        status.lastSpeedMbps = mbps;
+                    }
+                }
+                std::string titleCopy;
                 {
                     std::lock_guard<std::mutex> lock(status.mutex);
-                    status.lastSpeedMbps = mbps;
+                    titleCopy = status.currentDownloadTitle;
                 }
-            }
-                logDebug("Heartbeat: " + status.currentDownloadTitle +
+                logDebug("Heartbeat: " + titleCopy +
                          " cur=" + std::to_string(status.currentDownloadedBytes.load()) + "/" +
                          std::to_string(status.currentDownloadSize.load()) +
                          " total=" + std::to_string(status.totalDownloadedBytes.load()) + "/" +
@@ -634,6 +639,7 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     logLine("Using temp dir: " + tmpDir);
     logLine("Download URL: " + g.downloadUrl);
     PreflightInfo pf;
+    uint64_t originalSize = g.sizeBytes;
     if (!preflight(g.downloadUrl, auth, cfg.httpTimeoutSeconds, pf)) {
         logLine("Preflight failed for " + g.title + " (HEAD/Range probe). Proceeding with metadata size=" + std::to_string(g.sizeBytes));
         pf.contentLength = g.sizeBytes;
@@ -649,7 +655,21 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     if (effectiveSize == 0) {
         effectiveSize = g.sizeBytes;
     }
-    status.currentDownloadSize.store(effectiveSize);
+    {
+        std::lock_guard<std::mutex> lock(status.mutex);
+        status.currentDownloadSize.store(effectiveSize);
+        g.sizeBytes = effectiveSize;
+        if (!status.downloadQueue.empty()) {
+            // Replace the queued size so recomputeTotals uses the effective size.
+            status.downloadQueue.front().game.sizeBytes = effectiveSize;
+        }
+        uint64_t curTotal = status.totalDownloadBytes.load();
+        if (curTotal >= originalSize) {
+            status.totalDownloadBytes.store(curTotal - originalSize + effectiveSize);
+        } else {
+            status.totalDownloadBytes.store(effectiveSize);
+        }
+    }
 
     uint64_t totalSize = status.currentDownloadSize.load();
     bool refreshedMetadata = false;
@@ -850,17 +870,21 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
         }
     }
     if (!okStream) {
+        std::string errCopy = err.empty() ? "Download failed" : err;
         {
             std::lock_guard<std::mutex> lock(status.mutex);
-            status.lastDownloadError = err.empty() ? "Download failed" : err;
+            status.lastDownloadError = errCopy;
         }
-        logLine("Download failed: " + status.lastDownloadError);
+        logLine("Download failed: " + errCopy);
         return false;
     }
 
     std::string finalBase = safeName(g.title);
     if (finalBase.empty() && !g.fsName.empty()) finalBase = safeName(g.fsName);
     if (finalBase.empty()) finalBase = g.id.empty() ? "rom" : g.id;
+    if (!idSuffix.empty()) {
+        finalBase += "_" + idSuffix;
+    }
     std::string finalName = baseDir + "/" + finalBase;
     // ensure extension from fsName if present
     if (!g.fsName.empty()) {
@@ -869,7 +893,7 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     } else {
         finalName += ".nsp";
     }
-    // Avoid overwriting an existing file/dir by disambiguating with rom/file id.
+    // Avoid overwriting an existing file/dir by disambiguating if path already exists.
     std::error_code finalEc;
     if (std::filesystem::exists(finalName, finalEc)) {
         std::string suffix = idSuffix.empty() ? "dup" : idSuffix;
@@ -927,15 +951,23 @@ static void workerLoop() {
             st->downloadQueue.front().state = QueueState::Downloading;
         }
         if (!downloadOne(next.game, *st, cfg)) {
-            logLine("Download failed or stopped for " + next.game.title);
-            st->lastDownloadFailed.store(true);
+            bool wasStopped = gCtx.stopRequested.load();
+            logLine(std::string("Download failed or stopped for ") + next.game.title +
+                    (wasStopped ? " (stop requested)" : ""));
+            st->lastDownloadFailed.store(!wasStopped);
             {
                 std::lock_guard<std::mutex> lock(st->mutex);
                 if (!st->downloadQueue.empty()) {
-                    st->downloadQueue.front().state = QueueState::Failed;
-                    st->downloadQueue.front().error = st->lastDownloadError;
-                    st->downloadHistory.push_back(st->downloadQueue.front());
-                    st->downloadQueue.erase(st->downloadQueue.begin());
+                    if (wasStopped) {
+                        // Leave in queue as Pending so user can resume later.
+                        st->downloadQueue.front().state = QueueState::Pending;
+                        st->downloadQueue.front().error.clear();
+                    } else {
+                        st->downloadQueue.front().state = QueueState::Failed;
+                        st->downloadQueue.front().error = st->lastDownloadError;
+                        st->downloadHistory.push_back(st->downloadQueue.front());
+                        st->downloadQueue.erase(st->downloadQueue.begin());
+                    }
                 }
                 recomputeTotals(*st);
             }
@@ -975,6 +1007,12 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         fs::path manifestPath = entry.path() / "manifest.json";
         Manifest m;
         if (!fs::exists(manifestPath) || !readManifestFile(manifestPath.string(), m)) continue;
+        auto alreadyQ = std::find_if(status.downloadQueue.begin(), status.downloadQueue.end(),
+            [&](const QueueItem& qi) {
+                if (!m.rommId.empty()) return qi.game.id == m.rommId;
+                return qi.game.fsName == m.fsName;
+            });
+        if (alreadyQ != status.downloadQueue.end()) continue;
         auto already = std::find_if(status.downloadHistory.begin(), status.downloadHistory.end(),
             [&](const QueueItem& qi) {
                 if (!m.rommId.empty()) return qi.game.id == m.rommId;
@@ -987,11 +1025,15 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         qi.game.fsName = m.fsName;
         qi.game.downloadUrl = m.url;
         qi.game.sizeBytes = m.totalSize;
-        qi.state = QueueState::Failed;
+        qi.state = QueueState::Resumable;
+        qi.error = "Resume available";
         bool allDone = !m.parts.empty() &&
                        std::all_of(m.parts.begin(), m.parts.end(),
                                    [](const ManifestPart& p){ return p.completed; });
-        if (allDone) qi.state = QueueState::Completed;
+        if (allDone) {
+            qi.state = QueueState::Completed;
+            qi.error.clear();
+        }
         status.downloadHistory.push_back(qi);
     }
     return true;

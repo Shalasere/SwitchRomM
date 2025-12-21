@@ -10,8 +10,8 @@
 
 ### HUD / badges
 - Shows Current and Overall progress. When all files are finalized, HUD switches to "Downloads complete".
-- Badges per ROM: hollow (not queued), grey (queued), white (downloading), green (completed on disk), red (failed).
-- On startup, manifests in `temp/` load as Failed (so you can retry), and final files on disk mark as Completed.
+- Badges per ROM: hollow (not queued), grey (queued), white (downloading), green (completed on disk), orange (resumable), red (failed).
+- On startup, manifests in `temp/` load as Resumable (so you can retry), and final files on disk mark as Completed.
 - Failures show a red "Failed: ." line. Short reads trigger a retry; if Range isn't supported that retry restarts the current ROM.
 - Adding items while downloading recalculates overall bytes immediately; the overall % can dip when you enqueue mid-run (queue is not locked).
 
@@ -32,6 +32,6 @@
 
 ### TODO (known gaps)
 - Resume validation is size-only; add hashes/checks or stronger validation even though contiguity is enforced now (hashing optional/expensive; server does not provide hashes).
-- Final output naming can overwrite when sanitized titles collide; add collision-safe naming (IDs or disambiguation).
+- Final output naming now includes ID suffix; still consider additional collision handling if needed.
 - Use effective total size consistently (prefer server Content-Length when present); ensure progress/completion counters reflect that value.
 - download_url from API may be relative/unencoded; absolutize against SERVER_URL and use full URL encoding for path components (spaces-only encoding is insufficient).

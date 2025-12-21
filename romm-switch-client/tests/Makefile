@@ -26,6 +26,7 @@ SOURCES := ../source/api.cpp \
            test_config.cpp \
            test_thread_safety.cpp \
            test_config_env.cpp \
+           test_config_sample.cpp \
            test_manifest.cpp \
            test_cover_loader.cpp \
            test_queue_policy.cpp \

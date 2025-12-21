@@ -10,7 +10,7 @@
 
 namespace romm {
 
-enum class QueueState { Pending, Downloading, Completed, Failed };
+enum class QueueState { Pending, Downloading, Completed, Resumable, Failed };
 
 struct QueueItem {
     Game game;

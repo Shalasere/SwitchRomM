@@ -39,8 +39,8 @@ TEST_CASE("loadLocalManifests seeds history from temp manifests") {
     REQUIRE(st.downloadHistory.size() == 1);
     REQUIRE(st.downloadHistory[0].game.id == "123");
     REQUIRE(st.downloadHistory[0].game.fsName == "test.xci");
-    // Not all parts completed -> Pending badge
-    REQUIRE(st.downloadHistory[0].state == romm::QueueState::Pending);
+    // Not all parts completed -> treated as Resumable
+    REQUIRE(st.downloadHistory[0].state == romm::QueueState::Resumable);
 
     std::filesystem::remove_all(tmp);
 }

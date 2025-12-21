@@ -724,7 +724,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         std::unordered_map<std::string, romm::QueueState> queueStateById;
         queueStateById.reserve(snap.downloadQueue.size() + snap.downloadHistory.size());
         for (const auto& qi : snap.downloadHistory) {
-            if (qi.state == romm::QueueState::Failed || qi.state == romm::QueueState::Completed) {
+            if (qi.state == romm::QueueState::Failed ||
+                qi.state == romm::QueueState::Completed ||
+                qi.state == romm::QueueState::Resumable) {
                 queueStateById[qi.game.id] = qi.state;
             }
         }
@@ -784,6 +786,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
                     break;
                 case romm::QueueState::Completed:
                     drawFilledCircle(x + r, y + r, r - 2, SDL_Color{50,200,110,255});
+                    break;
+                case romm::QueueState::Resumable:
+                    drawFilledCircle(x + r, y + r, r - 2, SDL_Color{230,150,60,255});
                     break;
                 case romm::QueueState::Failed:
                     drawFilledCircle(x + r, y + r, r - 2, SDL_Color{220,70,70,255});
@@ -928,10 +933,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
                     case romm::QueueState::Pending: stateStr = "pending"; break;
                     case romm::QueueState::Downloading: stateStr = "downloading"; break;
                     case romm::QueueState::Completed: stateStr = "done"; break;
+                    case romm::QueueState::Resumable: stateStr = "resumable"; break;
                     case romm::QueueState::Failed: stateStr = "failed"; break;
                 }
                 drawText(renderer, r.x + 680, r.y + 4, sz + " " + stateStr, fg, 2);
-                if (q.state == romm::QueueState::Failed && !q.error.empty()) {
+                if ((q.state == romm::QueueState::Failed || q.state == romm::QueueState::Resumable) && !q.error.empty()) {
                     drawText(renderer, r.x + 10, r.y + 22, ellipsize(q.error, 58), SDL_Color{255,160,160,255}, 2);
                 }
             }
@@ -980,6 +986,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
                 case romm::QueueState::Pending:     return "queued";
                 case romm::QueueState::Downloading: return "downloading";
                 case romm::QueueState::Completed:   return "completed";
+                case romm::QueueState::Resumable:   return "resumable";
                 case romm::QueueState::Failed:      return "failed";
             }
             return "unknown";
@@ -1102,8 +1109,11 @@ int main(int argc, char** argv) {
     romm::logLine("Auto-sleep disabled; media playback state set to keep screen on.");
 
     if (!romm::loadConfig(config, cfgError)) {
-        status.currentView = Status::View::ERROR;
-        status.lastError = cfgError;
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.currentView = Status::View::ERROR;
+            status.lastError = cfgError;
+        }
         romm::logLine(cfgError);
     } else {
         romm::setLogLevelFromString(config.logLevel);
@@ -1138,8 +1148,11 @@ int main(int argc, char** argv) {
         }
         std::string err;
         if (!romm::fetchPlatforms(config, status, err)) {
-            status.currentView = Status::View::ERROR;
-            status.lastError = err;
+            {
+                std::lock_guard<std::mutex> lock(status.mutex);
+                status.currentView = Status::View::ERROR;
+                status.lastError = err;
+            }
             romm::logLine("Failed to fetch platforms: " + err);
         }
         // Start cover loader once config is available.
@@ -1163,6 +1176,23 @@ int main(int argc, char** argv) {
             } else if (status.currentView == Status::View::QUEUE) {
                 status.selectedQueueIndex = std::max(0, std::min((int)status.downloadQueue.size() - 1, status.selectedQueueIndex + dir));
             }
+        };
+        auto recomputeTotals = [&]() {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            uint64_t remaining = 0;
+            // Include current download remainder if active.
+            if (status.downloadWorkerRunning.load()) {
+                uint64_t curSize = status.currentDownloadSize.load();
+                uint64_t curDone = status.currentDownloadedBytes.load();
+                if (curSize > curDone) {
+                    remaining += (curSize - curDone);
+                }
+            }
+            for (const auto& q : status.downloadQueue) {
+                remaining += q.game.sizeBytes;
+            }
+            uint64_t already = status.totalDownloadedBytes.load();
+            status.totalDownloadBytes.store(already + remaining);
         };
         SDL_Event e;
         // Handle input events until a view change occurs (then render the new view before more input)
@@ -1274,6 +1304,7 @@ int main(int argc, char** argv) {
                                   status.prevQueueView = Status::View::DETAIL;
                                   status.currentView = Status::View::QUEUE;
                               }
+                              recomputeTotals();
                                   romm::logLine("Queued ROM: " + enriched.title +
                                                 " | Queue size=" + std::to_string(status.downloadQueue.size()));
                               gViewTraceFrames = 8;
