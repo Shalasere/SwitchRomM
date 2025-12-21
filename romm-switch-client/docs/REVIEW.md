@@ -1,7 +1,7 @@
 # RomM Switch Client - Technical Review
 
 Quick review of the C++17/libnx/SDL2 codebase: architecture, flows, risks, and pointers for contributors.  
-Last updated: 2025-12-15 (controls standardized A=Select/B=Back/Y=Queue/X=Download; resume/HTTP gaps documented).
+Last updated: 2025-12-21 (controls standardized A=Select/B=Back/Y=Queue/X=Download; resume contiguity enforced; ID-suffixed temps/finals; chunked fail-fast; speed test optional).
 
 ## Architecture snapshot
 - **Entry/UI**: `source/main.cpp` - SDL init, config load, API fetch, input handling, view transitions, rendering.
@@ -9,30 +9,30 @@ Last updated: 2025-12-15 (controls standardized A=Select/B=Back/Y=Queue/X=Downlo
 - **Input**: `source/input.cpp` - SDL controller mapping (A=Select, B=Back, Y=Queue, X=Start Downloads, Plus=Quit; Nintendo layout) with debounce; raw JOY ignored; log_level from `.env`. Controls in `docs/controls.md`.
 - **Data/API**: `source/api.cpp` - minimal HTTP (HTTP-only, Basic auth), JSON via `mini/json.hpp`; fetches `/api/roms/{id}`, picks `.xci/.nsp` via `file_id`, builds `/content/<fs_name>?file_ids=<id>`; Range preflight.
 - **Covers**: cover_url parsed, relative URLs prefixed; reliability in DETAIL view still TODO.
-- **Downloader**: `source/downloader.cpp` - background worker, FAT32 parts (0xFFFF0000), temp dirs from title/fsName; skips complete parts, deletes partials; single-part rename/copy fallback; multi-part archive bit; queue not locked; resume keeps counters aligned; one GET per ROM with large recv buffer.
+- **Downloader**: `source/downloader.cpp` - background worker, FAT32 parts (0xFFFF0000), temp dirs `<safe-12>_<id>.tmp`; skips complete parts, deletes partials; single-part rename/copy fallback; multi-part archive bit; queue not locked; resume keeps counters aligned; one GET per ROM with large recv buffer; finalized outputs are ID-suffixed/collision-safe.
 
 ## Logic flows (per view)
 - **PLATFORMS**: Select (A) fetches ROMs; Back (B) ignored; Y opens QUEUE (prevQueueView=PLATFORMS); Plus quits.
 - **ROMS**: Select (A) -> DETAIL; Back (B) -> PLATFORMS; Y -> QUEUE (prevQueueView=ROMS); D-pad scroll with acceleration.
 - **DETAIL**: Shows ROM metadata; Select (A) enqueues and switches to QUEUE; Back (B) -> ROMS; Y -> QUEUE (prevQueueView=DETAIL).
 - **QUEUE**: Lists queued ROMs; X starts downloads -> DOWNLOADING; Back returns to prevQueueView; Plus quits; empty shows "Queue empty." or "All downloads complete."
-- **DOWNLOADING**: Shows global progress, percent/bytes; "Connecting..." when no data yet; failure text if lastDownloadFailed; B -> QUEUE; Plus quits (stops worker).
+- **DOWNLOADING**: Shows global progress, percent/bytes/MBps; SPD header when speed test url is set; "Connecting..." when no data yet; failure text if lastDownloadFailed; B -> QUEUE; Plus quits (stops worker).
 - **ERROR**: Set on API failure; Quit exits.
 
 ## Issues (bugs/risks)
 Severity: [H]=High, [M]=Medium, [L]=Low. File refs approximate.
-- [H] Thread safety (`source/downloader.cpp`, `source/main.cpp`): `Status` shared; strings/vectors sometimes read/written without lock (e.g., currentDownloadIndex/title). **Fix**: guard all non-atomic fields with `Status::mutex` or move to an event queue; keep counters atomic; snapshot under lock.
-- [H] Resume integrity (`source/manifest.cpp`, `source/downloader.cpp`): contiguity enforced in planResume; validation still size-only (hashes TODO; server doesn’t provide), temp dirs now include rom/file IDs but final names can still overwrite. **Fix**: add stronger validation (hash when feasible), collision-safe final names, size-consistent progress (use Content-Length if present).
-- [H] HTTP robustness (`source/api.cpp`, `source/downloader.cpp`): HTTP-only, no TLS. Downloader send() does not loop (short-write risk); streaming assumes Content-Length and does not detect chunked; duplicate HTTP stacks. **Fix**: loop send in downloader, detect chunked and fail loudly, unify HTTP handling; optional TLS/redirects later.
+- [H] Thread safety (`source/downloader.cpp`, `source/main.cpp`): `Status` shared; most hotspots now under mutex/snapshot, but a full audit is still pending. **Fix**: guard all non-atomic fields with `Status::mutex` or move to an event queue; keep counters atomic; snapshot under lock.
+- [H] Resume integrity (`source/manifest.cpp`, `source/downloader.cpp`): contiguity now enforced; validation still size-only (hashes TODO; server doesn't provide); temp dirs/finals include IDs and collision-safe suffixes. **Fix**: add stronger validation (hash when feasible), and ensure on-disk detection accounts for ID suffix.
+- [H] HTTP robustness (`source/api.cpp`, `source/downloader.cpp`): HTTP-only, no TLS. Downloader send() now loops; streaming explicitly fails on chunked TE; duplicate HTTP stacks remain. **Fix**: unify HTTP handling; optional TLS/redirects later; decide on chunked streaming support.
 - [M] Archive bit: best-effort for multi-part folders; single-part emits flat file. Residual risk: SD errors on finalize.
 - [M] Resume granularity (`source/downloader.cpp`): Size-only validation; only full parts resume; partials deleted. **Fix**: manifest with expected sizes/count (and optional checksum), validate sizes, allow mid-part resume once contiguous enforcement is in place.
 - [M] Error handling/retries (`source/downloader.cpp`): Limited retry/backoff; failures drop items and continue. **Fix**: bounded retries/backoff per ROM with user-visible status; keep failed item info in UI.
-- [M] UI feedback (`source/main.cpp` DOWNLOADING): Limited status when stalled; last status/error not shown until failure. **Fix**: show last range/error, per-ROM progress; differentiate "no data yet" vs "stalled."
+- [M] UI feedback (`source/main.cpp` DOWNLOADING): Now shows MBps; still limited when stalled. **Fix**: show last range/error, per-ROM progress; differentiate "no data yet" vs "stalled."
 - [M] Free-space handling (`source/downloader.cpp`): Single pre-check; no re-check per part; write errors not surfaced. **Fix**: re-check before each part; handle write errors and report to UI.
 - [M] Config/auth (`include/romm/config.hpp`, `source/api.cpp`): Only Basic auth; `apiToken` unused; assumes `http://`. **Fix**: support token header, validate scheme/port; surface auth errors.
-- [L] Logging volume/threading: Debug-only heartbeats/file listings; no rotation; logger opens file per line and is not synchronized. **Fix**: optional size cap/rotation; thread-safe sink.
+- [L] Logging volume/threading: Debug-only heartbeats/file listings; no rotation; logger opens file per line and is not synchronized. **Fix**: optional size cap/rotation; thread-safe sink. (Still open.)
 - [L] Structure/style (`source/main.cpp`): Large renderStatus and input switch mix concerns. **Fix**: split per-view render functions/controllers; wrap sockets/files in RAII.
-- [L] Data/UI fidelity: Model titles are sanitized to ASCII on parse (UTF-8 lost); download/cover URLs only encode spaces and may not be absolutized if provided relative; cover loader is latest-only (drops queued covers). **Fix**: keep UTF-8 in model and sanitize at render; use full urlEncode + absolutize download_url/cover URLs; document latest-wins cover loader or add queue; add redirect/IPv6/trailer handling if needed.
+- [L] Data/UI fidelity: Model titles are sanitized to ASCII on parse (UTF-8 lost); download/cover URLs only encode spaces and may not be absolutized if provided relative; cover loader is latest-only (drops queued covers). **Fix**: keep UTF-8 in model and sanitize at render; use full urlEncode + absolutize download_url/cover URLs; document latest-wins cover loader or add queue; add redirect/IPv6/trailer handling if needed. SPD speed test runs once at startup if URL set; optional.
 
 ## File notes
 - `source/main.cpp`: SDL lifecycle; config/API fetch; input loop maps Action -> state; view transitions; renderStatus draws all views; download view shows global progress/failure; queue view shows completion when empty after success.

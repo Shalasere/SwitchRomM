@@ -47,7 +47,7 @@ DOWNLOAD_DIR=sdmc:/romm_cache/switch
 HTTP_TIMEOUT_SECONDS=30
 FAT32_SAFE=true
 LOG_LEVEL=info          # debug|info|warn|error
-SPEED_TEST_URL=         # optional; URL to fetch ~10MB to estimate throughput; leave blank to skip
+SPEED_TEST_URL=         # optional; URL to fetch ~40MB (Range) to estimate throughput; leave blank to skip
 ```
 `config.json` is also read and currently overrides `.env` on the same keys (load order is .env then config.json).
 
@@ -69,7 +69,7 @@ Mappings are fixed in `source/input.cpp` (Nintendo layout); UI hints match.
 ### Queue / status behavior
 - Badges per ROM: hollow (not queued), grey (queued), white (downloading), green (completed on disk), orange (resumable), red (failed).
 - Footer shows status text for the selected ROM; stable position (no shifting).
-- Completed detection checks final output on disk (`fsName`, or `fsName`.xci/.nsp, or multipart dir).
+- Completed detection checks final output on disk (`fsName`, or `fsName`.xci/.nsp, or multipart dir). Final outputs are suffixed with IDs to avoid collisions; detection still keys off `fsName`.
 - No duplicate enqueue per session; failed/incomplete items can be retried, completed are blocked. Resumable items show as orange and can be retried manually; they are not auto-queued.
 - Temp manifests load into history as Resumable (“Resume available”) and do not auto-queue; 404/tiny preflight triggers one metadata refresh, then fails fast.
 

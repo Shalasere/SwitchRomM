@@ -1,6 +1,6 @@
 # Config
 
- Put `.env` at `sdmc:/switch/romm_switch_client/.env`. `config.json` in the same directory is also read; current load order is `.env` then `config.json`, so JSON overrides `.env` on the same key. TODO: decide whether `.env` should have precedence instead (was previously documented that way).
+ Put `.env` at `sdmc:/switch/romm_switch_client/.env`. `config.json` in the same directory is also read; current load order is `.env` then `config.json`, so JSON overrides `.env` on the same key. TODO: decide whether `.env` should have precedence instead (was previously documented that way). Each download also uses collision-safe output naming with ID suffixes.
 
 ## Keys (with defaults)
 - `SERVER_URL` (required): Base RomM URL. **HTTP only; TLS is not supported in the client.** Example: `http://192.168.1.10:8080`.
@@ -11,9 +11,9 @@
 - `HTTP_TIMEOUT_SECONDS` (`30`): HTTP send/recv timeout.
 - `FAT32_SAFE` (`true`): Present but ignored; splitting is always on.
 - `LOG_LEVEL` (`info`): `debug|info|warn|error`.
-- `SPEED_TEST_URL` (blank): Optional URL to fetch ~10MB for a quick throughput estimate. If blank, no separate speed test is run.
+- `SPEED_TEST_URL` (blank): Optional URL to fetch ~40MB (Range) for a quick throughput estimate. If set, runs once at startup; if blank, only in-download speeds are shown.
 
 ## Files created by the client
-- Downloads: `<DOWNLOAD_DIR>/<Title or fsName>` (single file) or `<DOWNLOAD_DIR>/<Title or fsName>/00 01 ...` (multi-part DBI layout).
+- Downloads: `<DOWNLOAD_DIR>/<Title or fsName>_<id>.<ext>` (single file, ID-suffixed for collisions) or `<DOWNLOAD_DIR>/<Title or fsName>_<id>.<ext>/00 01 ...` (multi-part DBI layout).
 - Temps: `<DOWNLOAD_DIR>/temp/<safe-12>.tmp/*.part` and `manifest.json` (safe to delete after failures/stops).
 - Log: `sdmc:/switch/romm_switch_client/log.txt`.
