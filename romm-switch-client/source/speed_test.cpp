@@ -5,6 +5,7 @@
 #include "romm/api.hpp"
 #include "romm/logger.hpp"
 #include "romm/raii.hpp"
+#include "romm/http_common.hpp"
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -14,21 +15,6 @@
 #include <mutex>
 
 namespace romm {
-
-// Send entire buffer, handling short writes and EINTR.
-static bool sendAll(int fd, const char* data, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, data + sent, len - sent, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        sent += static_cast<size_t>(n);
-    }
-    return true;
-}
 
 // Measure throughput by downloading up to testBytes (discarded) and return MB/s.
 static bool measureSpeed(const std::string& url,
@@ -68,7 +54,8 @@ static bool measureSpeed(const std::string& url,
     if (!sendAll(sock.fd, req.c_str(), req.size())) { err = "Send failed"; return false; }
 
     std::string headerAccum;
-    char buf[64 * 1024];
+    constexpr size_t kSpeedTestBuf = 64 * 1024;
+    char buf[kSpeedTestBuf];
     bool headersDone = false;
     uint64_t contentLength = 0;
     size_t bodyStart = 0;

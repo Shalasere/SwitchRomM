@@ -43,7 +43,7 @@ struct Status {
     std::vector<QueueItem> downloadQueue;
     std::vector<QueueItem> downloadHistory; // completed/failed items for UI display
     bool isDownloading{false};
-    size_t currentDownloadIndex{0};
+    std::atomic<size_t> currentDownloadIndex{0};
     std::atomic<uint64_t> currentDownloadSize{0};
     std::atomic<uint64_t> currentDownloadedBytes{0};
     std::atomic<uint64_t> totalDownloadBytes{0};

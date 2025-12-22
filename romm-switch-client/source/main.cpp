@@ -393,7 +393,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.lastDownloadFailed = status.lastDownloadFailed.load();
         snap.lastDownloadError = status.lastDownloadError;
         snap.currentDownloadTitle = status.currentDownloadTitle;
-        snap.currentDownloadIndex = status.currentDownloadIndex;
+        snap.currentDownloadIndex = status.currentDownloadIndex.load();
         snap.lastError = status.lastError;
         snap.lastSpeedMbps = status.lastSpeedMbps;
     }
@@ -402,6 +402,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     static std::unordered_map<std::string, bool> completedCache;
     static std::string cacheKey;
     static std::chrono::steady_clock::time_point lastScanSteady{};
+
     std::string currentKey;
     currentKey.reserve(snap.roms.size() * 8);
     for (const auto& g : snap.roms) {
@@ -418,26 +419,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         lastScanSteady = nowSteady;
         for (const auto& g : snap.roms) {
             std::string key = !g.id.empty() ? g.id : g.fsName;
-            bool found = false;
-            std::vector<std::filesystem::path> candidates;
-            if (!g.fsName.empty()) {
-                std::filesystem::path base = std::filesystem::path(config.downloadDir) / g.fsName;
-                candidates.push_back(base);
-                // If fsName lacks an extension, also check common ones.
-                if (!base.has_extension()) {
-                    candidates.push_back(std::filesystem::path(config.downloadDir) / (g.fsName + ".xci"));
-                    candidates.push_back(std::filesystem::path(config.downloadDir) / (g.fsName + ".nsp"));
-                }
-            }
-            std::error_code ec;
-            for (const auto& p : candidates) {
-                if (!std::filesystem::exists(p, ec)) continue;
-                if (std::filesystem::is_regular_file(p, ec)) { found = true; break; }
-                if (std::filesystem::is_directory(p, ec)) {
-                    auto it = std::filesystem::directory_iterator(p, ec);
-                    if (!ec && it != std::filesystem::end(it)) { found = true; break; }
-                }
-            }
+            bool found = isGameCompletedOnDisk(g, config);
             if (!key.empty()) completedCache[key] = found;
         }
     }
@@ -655,8 +637,13 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             unsigned char c = static_cast<unsigned char>(s[i]);
             if (c == 0xC5 && i + 1 < s.size()) {
                 unsigned char c2 = static_cast<unsigned char>(s[i + 1]);
-                if (c2 == 0x8C || c2 == 0x8D) {
-                    out.push_back('');
+                if (c2 == 0x8C) { // Ō
+                    out.push_back('O');
+                    ++i;
+                    continue;
+                }
+                if (c2 == 0x8D) { // ō
+                    out.push_back('o');
                     ++i;
                     continue;
                 }
@@ -1112,7 +1099,10 @@ int main(int argc, char** argv) {
         {
             std::lock_guard<std::mutex> lock(status.mutex);
             status.currentView = Status::View::ERROR;
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
             status.lastError = cfgError;
+        }
         }
         romm::logLine(cfgError);
     } else {
@@ -1151,7 +1141,10 @@ int main(int argc, char** argv) {
             {
                 std::lock_guard<std::mutex> lock(status.mutex);
                 status.currentView = Status::View::ERROR;
-                status.lastError = err;
+                {
+                    std::lock_guard<std::mutex> lock(status.mutex);
+                    status.lastError = err;
+                }
             }
             romm::logLine("Failed to fetch platforms: " + err);
         }
@@ -1255,7 +1248,10 @@ int main(int argc, char** argv) {
                         } else {
                             std::lock_guard<std::mutex> lock(status.mutex);
                             status.currentView = Status::View::ERROR;
-                            status.lastError = err;
+                            {
+                                std::lock_guard<std::mutex> lock(status.mutex);
+                                status.lastError = err;
+                            }
                             romm::logLine("Failed to fetch ROMs: " + err);
                         }
                     } else if (currentView == Status::View::ROMS) {
@@ -1286,7 +1282,10 @@ int main(int argc, char** argv) {
                               if (!romm::enrichGameWithFiles(config, enriched, err)) {
                                   std::lock_guard<std::mutex> lock(status.mutex);
                                   status.currentView = Status::View::ERROR;
-                                  status.lastError = err;
+                                  {
+                                      std::lock_guard<std::mutex> lock(status.mutex);
+                                      status.lastError = err;
+                                  }
                                   romm::logLine("Failed to enrich ROM with files: " + err);
                                   break;
                               }
@@ -1392,7 +1391,7 @@ int main(int argc, char** argv) {
                                 {
                                     std::lock_guard<std::mutex> lock(status.mutex);
                                     status.currentView = Status::View::DOWNLOADING;
-                                    status.currentDownloadIndex = 0;
+                                    status.currentDownloadIndex.store(0);
                                     status.currentDownloadedBytes.store(0);
                                     status.totalDownloadedBytes.store(0);
                                     status.totalDownloadBytes.store(0);

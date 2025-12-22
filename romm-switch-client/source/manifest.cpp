@@ -1,4 +1,5 @@
 #include "romm/manifest.hpp"
+#include "romm/models.hpp"
 #include "mini/json.hpp"
 #include <algorithm>
 #include <sstream>
@@ -44,7 +45,11 @@ std::string manifestToJson(const Manifest& m) {
         }
         oss << "}";
     }
-    oss << "]}";
+    oss << "]";
+    if (!m.failureReason.empty()) {
+        oss << ",\"failure_reason\":\"" << escapeJson(m.failureReason) << "\"";
+    }
+    oss << "}";
     return oss.str();
 }
 
@@ -73,6 +78,7 @@ bool manifestFromJson(const std::string& json, Manifest& out, std::string& err) 
     getStr("url", out.url);
     getNum("total_size", out.totalSize);
     getNum("part_size", out.partSize);
+    getStr("failure_reason", out.failureReason);
 
     auto pit = obj.find("parts");
     if (pit != obj.end() && pit->second.type == mini::Value::Type::Array) {
@@ -157,6 +163,15 @@ ResumePlan planResume(const Manifest& m,
 
     plan.bytesNeed = (m.totalSize > plan.bytesHave) ? (m.totalSize - plan.bytesHave) : 0;
     return plan;
+}
+
+bool manifestCompatible(const Manifest& m, const Game& g, uint64_t expectedTotalSize, uint64_t expectedPartSize) {
+    if (expectedTotalSize != 0 && m.totalSize != expectedTotalSize) return false;
+    if (expectedPartSize != 0 && m.partSize != expectedPartSize) return false;
+    if (!g.id.empty() && !m.rommId.empty() && m.rommId != g.id) return false;
+    if (!g.fileId.empty() && !m.fileId.empty() && m.fileId != g.fileId) return false;
+    if (!g.downloadUrl.empty() && !m.url.empty() && m.url != g.downloadUrl) return false;
+    return true;
 }
 
 } // namespace romm

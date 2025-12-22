@@ -1,5 +1,6 @@
 #include "catch.hpp"
 #include "romm/manifest.hpp"
+#include "romm/models.hpp"
 
 TEST_CASE("manifest serialize/deserialize roundtrip") {
     romm::Manifest m;
@@ -111,4 +112,33 @@ TEST_CASE("planResume requires contiguity from part 0") {
         REQUIRE(plan.invalidParts.size() == 1);
         REQUIRE(plan.invalidParts[0] == 2);
     }
+}
+
+TEST_CASE("manifestCompatible matches game identity and sizes") {
+    romm::Manifest m;
+    m.rommId = "id1";
+    m.fileId = "file1";
+    m.fsName = "foo.nsp";
+    m.url = "http://example/game";
+    m.totalSize = 300;
+    m.partSize = 100;
+
+    romm::Game g;
+    g.id = "id1";
+    g.fileId = "file1";
+    g.downloadUrl = "http://example/game";
+
+    REQUIRE(romm::manifestCompatible(m, g, 300, 100));
+
+    g.id = "other";
+    REQUIRE_FALSE(romm::manifestCompatible(m, g, 300, 100));
+    g.id = "id1";
+    g.fileId = "otherfile";
+    REQUIRE_FALSE(romm::manifestCompatible(m, g, 300, 100));
+    g.fileId = "file1";
+    g.downloadUrl = "http://example/other";
+    REQUIRE_FALSE(romm::manifestCompatible(m, g, 300, 100));
+    g.downloadUrl = "http://example/game";
+    REQUIRE_FALSE(romm::manifestCompatible(m, g, 200, 100));
+    REQUIRE_FALSE(romm::manifestCompatible(m, g, 300, 200));
 }

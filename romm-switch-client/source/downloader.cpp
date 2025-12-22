@@ -4,6 +4,7 @@
 #include "romm/api.hpp"
 #include "romm/util.hpp"
 #include "romm/raii.hpp"
+#include "romm/http_common.hpp"
 #include "romm/manifest.hpp"
 #include "romm/speed_test.hpp"
 #include <switch.h>
@@ -23,6 +24,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <chrono>
+#include <thread>
 #include <fstream>
 #include <sys/iosupport.h>
 #include <switch/runtime/devices/fs_dev.h> // fsdevSetConcatenationFileAttribute
@@ -31,23 +33,12 @@ namespace romm {
 
 namespace {
 
-// Send entire buffer, handling short writes and EINTR.
-static bool sendAll(int fd, const char* data, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, data + sent, len - sent, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        sent += static_cast<size_t>(n);
-    }
-    return true;
-}
-
 constexpr uint64_t kPartSize = 0xFFFF0000ULL; // DBI/Tinfoil split size
 constexpr uint64_t kFreeSpaceMarginBytes = 200ULL * 1024ULL * 1024ULL; // ~200MB margin
+constexpr size_t kPreflightHeaderBuf = 1024;
+constexpr int kSocketRecvBufBytes = 256 * 1024;
+constexpr size_t kStreamBufferBytes = 256 * 1024;
+constexpr int kMaxRetryBackoffMs = 2000;
 
 struct DownloadContext {
     std::thread worker;
@@ -150,9 +141,9 @@ static bool parsePartIndex(const std::string& name, int& outIdx) {
 // Preflight: try HEAD first; if it fails or is rejected, fall back to Range: 0-0 GET.
 static bool preflight(const std::string& url, const std::string& authBasic, int timeoutSec, PreflightInfo& info) {
     info = {};
-    auto doRequest = [&](const std::string& method, const std::string& extraHeader, int& outCode, std::string& headers) -> bool {
+    auto doRequest = [&](const std::string& method, const std::string& extraHeader, int& outCode, std::string& headerBlock) -> bool {
         outCode = 0;
-        headers.clear();
+        headerBlock.clear();
         std::string host, portStr, path, perr;
         if (!romm::parseHttpUrl(url, host, portStr, path, perr)) return false;
         struct addrinfo hints{};
@@ -178,7 +169,7 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
             return false;
         }
         std::string headerAccum;
-        char buf[1024];
+        char buf[kPreflightHeaderBuf];
         while (true) {
             ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
             if (n <= 0) break;
@@ -187,22 +178,18 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
         }
         auto hdrEnd = headerAccum.find("\r\n\r\n");
         if (hdrEnd == std::string::npos) return false;
-        std::string headerBlock = headerAccum.substr(0, hdrEnd);
-        std::istringstream hs(headerBlock);
-        std::string statusLine;
-        if (!std::getline(hs, statusLine)) return false;
-        if (!statusLine.empty() && statusLine.back() == '\r') statusLine.pop_back();
-        std::istringstream sl(statusLine);
-        std::string httpVer; sl >> httpVer >> outCode;
-        headers = headerBlock;
+        headerBlock = headerAccum.substr(0, hdrEnd);
+        ParsedHttpResponse parsed{};
+        std::string perrParse;
+        if (!parseHttpResponseHeaders(headerBlock, parsed, perrParse)) return false;
+        outCode = parsed.statusCode;
         return true;
     };
 
     int code = 0;
     std::string headers;
-    // Try HEAD
-    if (doRequest("HEAD", "", code, headers) && code >= 200 && code < 300) {
-        std::istringstream hs(headers);
+    auto parseContentRangeTotal = [](const std::string& hdrs) -> uint64_t {
+        std::istringstream hs(hdrs);
         std::string line;
         while (std::getline(hs, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -213,12 +200,23 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
             while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
             std::string keyLower = key;
             for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (keyLower == "content-length") {
-                info.contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
-            } else if (keyLower == "accept-ranges" && val.find("bytes") != std::string::npos) {
-                info.supportsRanges = true;
+            if (keyLower == "content-range") {
+                auto slash = val.find('/');
+                if (slash != std::string::npos) {
+                    std::string totalStr = val.substr(slash + 1);
+                    return static_cast<uint64_t>(std::strtoull(totalStr.c_str(), nullptr, 10));
+                }
             }
         }
+        return 0;
+    };
+    // Try HEAD
+    if (doRequest("HEAD", "", code, headers) && code >= 200 && code < 300) {
+        ParsedHttpResponse parsed{};
+        std::string perr;
+        if (!parseHttpResponseHeaders(headers, parsed, perr)) return false;
+        info.contentLength = parsed.contentLength;
+        info.supportsRanges = parsed.acceptRanges;
         return info.contentLength > 0;
     }
     if (code != 0 && (code < 200 || code >= 300)) {
@@ -227,34 +225,21 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
 
     // Fallback: GET with Range 0-0
     if (!doRequest("GET", "Range: bytes=0-0", code, headers)) return false;
-    if (code == 206) info.supportsRanges = true;
+    ParsedHttpResponse parsed{};
+    std::string perr;
+    if (!parseHttpResponseHeaders(headers, parsed, perr)) return false;
+    if (code == 206 || parsed.acceptRanges) info.supportsRanges = true;
     if (!(code == 200 || code == 206)) {
         logLine("Preflight Range GET returned HTTP " + std::to_string(code));
         return false;
     }
-    std::istringstream hs(headers);
-    std::string line;
-    while (std::getline(hs, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        auto colonPos = line.find(':');
-        if (colonPos == std::string::npos) continue;
-        std::string key = line.substr(0, colonPos);
-        std::string val = line.substr(colonPos + 1);
-    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
-    std::string keyLower = key;
-    for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (keyLower == "content-range") {
-        // Expect bytes 0-0/total
-        auto slash = val.find('/');
-        if (slash != std::string::npos) {
-            std::string totalStr = val.substr(slash + 1);
-            info.contentLength = static_cast<uint64_t>(std::strtoull(totalStr.c_str(), nullptr, 10));
-        }
-    } else if (keyLower == "content-length" && info.contentLength == 0) {
-        info.contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
+    uint64_t crTotal = parseContentRangeTotal(headers);
+    if (crTotal > 0) {
+        info.contentLength = crTotal;
+    } else if (parsed.contentLength > 0) {
+        info.contentLength = parsed.contentLength;
     }
-}
-return info.contentLength > 0;
+    return info.contentLength > 0;
 }
 
 #ifdef UNIT_TEST
@@ -297,9 +282,9 @@ static bool streamDownload(const std::string& url,
         setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
     // Bump receive buffer for faster pulls.
-    int rcvbuf = 256 * 1024;
+    int rcvbuf = kSocketRecvBufBytes;
     setsockopt(sock.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    if (connect(sock.fd, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); err = "Connect failed"; return false; }
+    if (connect(sock.fd, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); err = std::string("Connect failed: ") + std::strerror(errno); return false; }
     freeaddrinfo(res);
 
     std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n";
@@ -316,62 +301,105 @@ static bool streamDownload(const std::string& url,
     // Read headers
     std::string headerAccum;
     // Large user-space buffer for faster pulls.
-    static thread_local char buf[256 * 1024];
+    static thread_local char buf[kStreamBufferBytes];
     bool headersDone = false;
     size_t bodyStartOffset = 0;
     int statusCode = 0;
     uint64_t contentLength = 0;
+    uint64_t contentRangeStart = 0;
+    uint64_t contentRangeEnd = 0;
+    bool hasContentRange = false;
     bool transferChunked = false;
     uint64_t expectedBody = totalSize - startOffset;
     const uint64_t kProbeBytes = 10ULL * 1024ULL * 1024ULL; // 10 MB probe for throughput log
     bool probeLogged = false;
     auto transferStart = std::chrono::steady_clock::now();
+    // Use a bounded stall timeout to avoid hanging forever on dead sockets.
+    int timeoutSec = cfg.httpTimeoutSeconds > 0 ? cfg.httpTimeoutSeconds : 10;
+    if (timeoutSec > 30) timeoutSec = 30;
+    auto stallTimeout = std::chrono::seconds(timeoutSec);
+    auto headerStart = std::chrono::steady_clock::now();
+    logLine("Stream start: url=" + url + " range=" + (useRange ? "true" : "false") +
+            " start=" + std::to_string(startOffset) + " expect=" + std::to_string(expectedBody));
     while (!headersDone) {
         ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
-        if (n <= 0) { err = "No HTTP headers received"; return false; }
+        if (n <= 0) {
+            err = (n == 0) ? "No HTTP headers received" :
+                  ((errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" : (std::string("Recv failed: ") + std::strerror(errno)));
+            logLine("Stream header error: " + err);
+            return false;
+        }
         headerAccum.append(buf, buf + n);
         auto hdrEnd = headerAccum.find("\r\n\r\n");
-        if (hdrEnd == std::string::npos) continue;
+        if (hdrEnd == std::string::npos) {
+            if (gCtx.stopRequested.load()) { err = "Stopped"; return false; }
+            auto now = std::chrono::steady_clock::now();
+            if (now - headerStart > stallTimeout) { err = "Header timeout"; logLine("Stream header timeout url=" + url); return false; }
+            continue;
+        }
         headersDone = true;
         bodyStartOffset = hdrEnd + 4;
         std::string headers = headerAccum.substr(0, hdrEnd);
-        std::istringstream hs(headers);
-        std::string statusLine;
-        std::getline(hs, statusLine);
-        if (!statusLine.empty() && statusLine.back() == '\r') statusLine.pop_back();
-        std::istringstream sl(statusLine);
-        std::string httpVer; sl >> httpVer >> statusCode;
+        ParsedHttpResponse parsed{};
+        std::string perr;
+        if (!parseHttpResponseHeaders(headers, parsed, perr)) { err = perr; return false; }
+        statusCode = parsed.statusCode;
         if (useRange && statusCode != 206) { err = "Range not honored (status " + std::to_string(statusCode) + ")"; return false; }
         if (!useRange && statusCode != 200) { err = "HTTP status " + std::to_string(statusCode); return false; }
-        std::string line;
-        while (std::getline(hs, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            auto cpos = line.find(':');
-            if (cpos == std::string::npos) continue;
-            std::string key = line.substr(0, cpos);
-            std::string val = line.substr(cpos + 1);
-            while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
-            std::string keyLower = key;
-            for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (keyLower == "content-length") {
-                contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
-            } else if (keyLower == "content-range") {
-                // Optional: validate total size from content-range
-            } else if (keyLower == "transfer-encoding" && val.find("chunked") != std::string::npos) {
-                transferChunked = true;
+        transferChunked = parsed.chunked;
+        contentLength = parsed.contentLength;
+        // Parse Content-Range: bytes start-end/total
+        {
+            std::istringstream hs(headers);
+            std::string line;
+            while (std::getline(hs, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                auto colonPos = line.find(':');
+                if (colonPos == std::string::npos) continue;
+                std::string key = line.substr(0, colonPos);
+                std::string val = line.substr(colonPos + 1);
+                while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+                std::string keyLower = key;
+                for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (keyLower == "content-range") {
+                    // bytes START-END/TOTAL
+                    auto bytesPos = val.find("bytes");
+                    auto dash = val.find('-', bytesPos == std::string::npos ? 0 : bytesPos);
+                    auto slash = val.find('/', dash == std::string::npos ? 0 : dash);
+                    if (dash != std::string::npos && slash != std::string::npos) {
+                        std::string startStr = val.substr(bytesPos == std::string::npos ? 0 : bytesPos + 5, dash - (bytesPos == std::string::npos ? 0 : bytesPos + 5));
+                        std::string endStr = val.substr(dash + 1, slash - dash - 1);
+                        contentRangeStart = static_cast<uint64_t>(std::strtoull(startStr.c_str(), nullptr, 10));
+                        contentRangeEnd = static_cast<uint64_t>(std::strtoull(endStr.c_str(), nullptr, 10));
+                        hasContentRange = true;
+                    }
+                }
             }
         }
         if (transferChunked) {
             err = "Chunked transfer not supported for streaming downloads";
+            logLine("Stream headers rejected (chunked) url=" + url);
             return false;
         }
-        if (contentLength > 0) {
+        if (hasContentRange) {
+            if (contentRangeStart != startOffset) {
+                err = "Content-Range start mismatch";
+                return false;
+            }
+            if (contentRangeEnd >= contentRangeStart) {
+                expectedBody = (contentRangeEnd - contentRangeStart) + 1;
+            }
+        } else if (!useRange && contentLength > 0) {
             expectedBody = contentLength;
         }
         if (contentLength && expectedBody && contentLength < expectedBody) {
             err = "Short body (Content-Length " + std::to_string(contentLength) + " < expected " + std::to_string(expectedBody) + ")";
             return false;
         }
+        logLine("Stream headers ok: status=" + std::to_string(statusCode) +
+                " clen=" + std::to_string(contentLength) +
+                " expected=" + std::to_string(expectedBody) +
+                (useRange ? " (range)" : ""));
     }
 
     // Buffered writer that keeps one part file open at a time.
@@ -398,12 +426,13 @@ static bool streamDownload(const std::string& url,
                 std::string partPath = tmpDir + "/" + partName + ".part";
                 partFile = fopen(partPath.c_str(), "r+b");
                 if (!partFile) partFile = fopen(partPath.c_str(), "w+b");
-                if (!partFile) { err = "Open part failed"; return false; }
+                if (!partFile) { err = "Open part failed"; logLine("Open part failed: " + partPath); return false; }
                 // Large stdio buffer to reduce syscalls.
-                static thread_local char ioBuf[256 * 1024];
+                static thread_local char ioBuf[kStreamBufferBytes];
                 setvbuf(partFile, ioBuf, _IOFBF, sizeof(ioBuf));
                 if (fseek(partFile, static_cast<long>(partOff), SEEK_SET) != 0) {
                     err = "Seek failed";
+                    logLine("Seek failed in part " + partPath + " offset=" + std::to_string(partOff));
                     closePart();
                     return false;
                 }
@@ -443,16 +472,28 @@ static bool streamDownload(const std::string& url,
     }
 
     auto lastBeat = std::chrono::steady_clock::now();
+    auto lastData = lastBeat;
     uint64_t bytesSinceBeat = 0;
     const uint64_t kLogEvery = 100ULL * 1024ULL * 1024ULL; // ~100MB
     while (globalOffset - startOffset < expectedBody && !gCtx.stopRequested.load()) {
         ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n == 0) {
+                err = "Short read";
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                err = "Recv timed out";
+            } else {
+                err = std::string("Recv failed: ") + std::strerror(errno);
+            }
+            logLine("Stream recv error: " + err);
+            break;
+        }
         size_t toUse = static_cast<size_t>(std::min<uint64_t>((uint64_t)n, expectedBody - (globalOffset - startOffset)));
         if (toUse > 0) {
             if (!writeSpan(globalOffset, buf, toUse)) { return false; }
             status.currentDownloadedBytes.fetch_add(toUse);
             status.totalDownloadedBytes.fetch_add(toUse);
+            lastData = std::chrono::steady_clock::now();
             bytesSinceBeat += toUse;
             uint64_t received = globalOffset - startOffset;
             if (!probeLogged && received >= kProbeBytes) {
@@ -490,6 +531,11 @@ static bool streamDownload(const std::string& url,
                 lastBeat = now;
                 bytesSinceBeat = 0;
             }
+        }
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastData > stallTimeout) {
+            err = "Timed out waiting for data";
+            break;
         }
     }
     sock.reset();
@@ -641,9 +687,16 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     PreflightInfo pf;
     uint64_t originalSize = g.sizeBytes;
     if (!preflight(g.downloadUrl, auth, cfg.httpTimeoutSeconds, pf)) {
-        logLine("Preflight failed for " + g.title + " (HEAD/Range probe). Proceeding with metadata size=" + std::to_string(g.sizeBytes));
-        pf.contentLength = g.sizeBytes;
-        pf.supportsRanges = false;
+        logLine("Preflight failed for " + g.title + " (HEAD/Range probe). Aborting download.");
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.lastDownloadError = "Preflight failed";
+        }
+        // Persist a manifest with failure reason so restart shows the failure.
+        Manifest failManifest = buildManifestFor(g, g.sizeBytes);
+        failManifest.failureReason = "Preflight failed (HEAD/Range)";
+        writeManifestFile(tmpDir + "/manifest.json", failManifest);
+        return false;
     } else {
         logLine("Preflight for " + g.title + " len=" + std::to_string(pf.contentLength) +
                 " ranges=" + (pf.supportsRanges ? "true" : "false"));
@@ -682,9 +735,8 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     bool needRewrite = true;
     if (haveManifest) {
         // Reuse only if consistent with current download parameters.
-        if (manifest.totalSize == totalSize &&
-            manifest.partSize == kPartSize &&
-            manifest.url == g.downloadUrl) {
+        if (manifestCompatible(manifest, g, totalSize, kPartSize) &&
+            manifest.failureReason.empty()) {
             needRewrite = false;
         }
     }
@@ -710,6 +762,10 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
         closedir(d);
     }
     auto resumePlan = planResume(manifest, observedParts);
+    logLine("Resume plan: valid=" + std::to_string(resumePlan.validParts.size()) +
+            " partial=" + std::to_string(resumePlan.partialIndex) +
+            " bytesHave=" + std::to_string(resumePlan.bytesHave) +
+            " bytesNeed=" + std::to_string(resumePlan.bytesNeed));
     // Drop any invalid parts so we never append onto bad data.
     for (int idx : resumePlan.invalidParts) {
         std::string p = tmpDir + "/";
@@ -742,6 +798,9 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
         status.currentDownloadedBytes.store(haveBytes);
         status.currentDownloadTitle = g.title;
     }
+    logLine("Resume state: haveBytes=" + std::to_string(haveBytes) +
+            " total=" + std::to_string(totalSize) +
+            " ranges=" + (pf.supportsRanges ? "true" : "false"));
     // Count any already-present bytes toward total downloaded so the bar doesn't regress
     uint64_t creditedExisting = 0;
     if (haveBytes > 0) {
@@ -776,7 +835,10 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
         status.currentDownloadedBytes.store(0);
         status.totalDownloadedBytes.store(0);
         status.currentDownloadSize.store(g.sizeBytes);
-        status.currentDownloadTitle = g.title;
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.currentDownloadTitle = g.title;
+        }
         if (!preflight(g.downloadUrl, auth, cfg.httpTimeoutSeconds, pf)) {
             logLine("Preflight after refresh failed");
             err = "Preflight after refresh failed";
@@ -819,6 +881,10 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
         }
         err.clear();
         uint64_t totalBefore = status.totalDownloadedBytes.load();
+        logLine("Begin stream attempt " + std::to_string(attempt + 1) +
+                " range=" + (useRange ? "true" : "false") +
+                " haveBytes=" + std::to_string(haveBytes) +
+                " totalSize=" + std::to_string(totalSize));
         okStream = streamDownload(g.downloadUrl, auth, useRange, haveBytes, totalSize, tmpDir, status, cfg, err);
         if (!okStream) {
             logLine("Download attempt " + std::to_string(attempt + 1) + " failed: " + err);
@@ -832,6 +898,10 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
             status.currentDownloadedBytes.store(haveBytes);
             attempt++;
             if (gCtx.stopRequested.load()) break;
+            // Backoff between attempts (capped) to be friendlier on slow/unstable links.
+            int backoffMs = 500 * attempt;
+            if (backoffMs > kMaxRetryBackoffMs) backoffMs = kMaxRetryBackoffMs;
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
             if (!err.empty() && err.find("HTTP status 404") != std::string::npos) {
                 // Stale URL (manifest pointing to old file_id). Try to refresh once.
                 if (refreshMetadata()) {
@@ -942,7 +1012,7 @@ static void workerLoop() {
             if (st->downloadQueue.empty() || gCtx.stopRequested.load()) break;
             st->lastDownloadFailed.store(false);
             st->lastDownloadError.clear();
-            st->currentDownloadIndex = 0;
+            st->currentDownloadIndex.store(0);
             next = st->downloadQueue.front(); // copy
             // Prime UI fields for the next item.
             st->currentDownloadTitle = next.game.title;
@@ -1033,6 +1103,10 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         if (allDone) {
             qi.state = QueueState::Completed;
             qi.error.clear();
+        }
+        if (!m.failureReason.empty()) {
+            qi.state = QueueState::Failed;
+            qi.error = m.failureReason;
         }
         status.downloadHistory.push_back(qi);
     }

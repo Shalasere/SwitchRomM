@@ -15,6 +15,7 @@ TARGET := romm_tests
 SOURCES := ../source/api.cpp \
            ../source/config.cpp \
            ../source/manifest.cpp \
+           ../source/http_common.cpp \
            ../source/cover_loader.cpp \
            ../source/stb_image_impl.cpp \
            ../tests/downloader_stubs.cpp \

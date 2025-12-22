@@ -53,6 +53,8 @@ P2 - quality
 - Manifest + optional hashes; fsync temp/manifest; richer error codes.
 - UI polish (paging/search optional), tidy navStack, config flag cleanup.
 - Expand tests: URL builder, file selection, downloader segmentation/resume edge cases, input mapping, chunked detection/error, logger.
+- Broader file support: make file selection heuristic extension-agnostic (allow emulator ROMs/zips), surface chosen filename in UI, and keep completion detection extension-agnostic while retaining human-readable fsName + ID suffix.
+- HTTPS support: extend HTTP layer to optional TLS (currently http-only); design shared HTTP helpers with TLS-capable plumbing.
 
 ## Constraints / Deployment
 - Network: http only; use on trusted LAN or behind TLS-terminating proxy.

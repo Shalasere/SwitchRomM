@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include "romm/models.hpp"
 
 namespace romm {
 
@@ -21,6 +22,7 @@ struct Manifest {
     uint64_t totalSize{0};
     uint64_t partSize{0};
     std::vector<ManifestPart> parts;
+    std::string failureReason; // optional: set when download aborted (e.g., preflight fail)
 };
 
 // Serialize/deserialize manifest as JSON strings (host-testable).
@@ -39,5 +41,8 @@ struct ResumePlan {
 
 ResumePlan planResume(const Manifest& m,
                       const std::vector<std::pair<int, uint64_t>>& observedParts);
+
+// Check if an existing manifest matches the requested game/size/partSize.
+bool manifestCompatible(const Manifest& m, const Game& g, uint64_t expectedTotalSize, uint64_t expectedPartSize);
 
 } // namespace romm

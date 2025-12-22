@@ -1,6 +1,6 @@
 # Logging
 
-Logs go to `sdmc:/switch/romm_switch_client/log.txt`, mirrored to stdout/nxlink, and a debug SVC string so you can see output without nxlink.
+Logs go to `sdmc:/switch/romm_switch_client/log.txt`, mirrored to stdout/nxlink, and a debug SVC string so you can see output without nxlink. The log file is kept open with a mutex-protected sink and a simple size cap (~512KB) that rotates to `log.txt.1` to reduce SD wear.
 
 - Default: `info`. Set `log_level=debug|info|warn|error` in `.env`/`config.json`.
 - Tags: `[APP]` lifecycle (default), `[API]` API info/debug, `[DL]` download heartbeat/finalize, `[UI]` render traces, `[SDL]` SDL init issues.

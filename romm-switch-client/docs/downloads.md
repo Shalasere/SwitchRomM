@@ -2,6 +2,7 @@
 
 ### How it works
 - One streaming HTTP GET per ROM. We stop at Content-Length. If preflight sees `Accept-Ranges: bytes`, we resume partial data (including one partial part); otherwise the ROM restarts. **HTTP only; no TLS.** Use on trusted LAN or put TLS in front of RomM.
+- Chunked transfer is not supported for streaming downloads; servers/proxies must send Content-Length. Redirects are not followed.
 - Client-side split into FAT32/DBI parts: `0xFFFF0000` (00, 01, 02 ...) inside a temp dir. Each temp dir has a `manifest.json` with expected part sizes and which parts/partials are complete.
 - Temps live under `<download_dir>/temp/<safe-12>_<id>.tmp/00.part`. After full download:
   - **Single-part**: rename/copy `00.part` to `<download_dir>/<Title or fsName>_<id>.<ext>` (ID-suffixed to avoid collisions); temp folder and manifest removed.
@@ -29,9 +30,11 @@
 - On restart, the app reuses complete parts and a single partial part using `manifest.json` (size-only validation today). Resume is enforced to contiguous parts only; any gap invalidates later parts. If Range is unavailable, the ROM restarts from zero.
 - Preflight logs HTTP status; on tiny Content-Length or 404 we refresh metadata once, then fail fast.
 - Finalize logs the SD error string; single-part finalize falls back to copy-on-write if a rename fails.
+- Slow WAN links: timeouts are bounded by `http_timeout_seconds` (also applied as stall detection during stream). Increase cautiously; too low can abort on jitter, too high can hang on dead links.
 
 ### TODO (known gaps)
 - Resume validation is size-only; add hashes/checks or stronger validation even though contiguity is enforced now (hashing optional/expensive; server does not provide hashes).
 - Final output naming now includes ID suffix; still consider additional collision handling if needed.
 - (done) Effective total size uses server Content-Length when present; progress/completion counters reflect that value.
 - download_url from API may be relative/unencoded; absolutize against SERVER_URL and use full URL encoding for path components (spaces-only encoding is insufficient).
+- Add optional redirect handling and, longer term, HTTPS support once a TLS story exists.

@@ -3,13 +3,19 @@
 #include <fstream>
 #include <iostream>
 #include <cctype>
+#include <mutex>
+#include <filesystem>
 #include <switch.h>
 
 namespace romm {
 
 static const char* kLogPath = "sdmc:/switch/romm_switch_client/log.txt";
+static constexpr size_t kMaxLogBytes = 512 * 1024; // simple cap to limit SD wear
 static bool gLogReady = false;
 static LogLevel gMinLevel = LogLevel::Info;
+static std::mutex gLogMutex;
+static std::ofstream gLogFile;
+static size_t gLogBytes = 0;
 
 void initLogFile() {
     // Ensure the log directory exists before creating the file.
@@ -20,10 +26,11 @@ void initLogFile() {
         romm::ensureDirectory(logDir);
     }
     // Start a fresh log file on launch
-    std::ofstream lf(kLogPath, std::ios::trunc);
-    if (lf) {
-        lf << "RomM Switch Client log start\n";
-        lf.flush();
+    gLogFile.open(kLogPath, std::ios::trunc);
+    if (gLogFile) {
+        gLogFile << "RomM Switch Client log start\n";
+        gLogFile.flush();
+        gLogBytes = static_cast<size_t>(gLogFile.tellp());
         gLogReady = true;
     }
 }
@@ -44,13 +51,41 @@ static void logInternal(LogLevel level, const std::string& tag, const std::strin
     if (level < gMinLevel) return;
     std::string line = "[" + tag + "] " + msg;
     // Write to stdio (nxlink), debug SVC, and append to sdmc log file
+    // stdout/nxlink + debug monitor
     std::cout << line << std::endl;
     printf("%s\n", line.c_str());
-    // Mirror to debug monitor so nxlink sees output even without nxlinkStdio
     svcOutputDebugString(line.c_str(), line.size());
-    if (gLogReady) {
-        std::ofstream lf(kLogPath, std::ios::app);
-        if (lf) { lf << line << "\n"; lf.flush(); }
+    if (!gLogReady) return;
+
+    std::lock_guard<std::mutex> lock(gLogMutex);
+    if (!gLogReady) return;
+
+    auto rotate = []() {
+        if (gLogFile.is_open()) gLogFile.close();
+        std::error_code ec;
+        std::filesystem::path p(kLogPath);
+        std::filesystem::path rotated = p;
+        rotated += ".1";
+        std::filesystem::remove(rotated, ec);
+        ec.clear();
+        std::filesystem::rename(p, rotated, ec); // best-effort
+        gLogFile.open(kLogPath, std::ios::trunc);
+        gLogBytes = 0;
+        if (gLogFile) {
+            gLogFile << "RomM Switch Client log start (rotated)\n";
+            gLogFile.flush();
+            gLogBytes = static_cast<size_t>(gLogFile.tellp());
+        }
+    };
+
+    size_t writeBytes = line.size() + 1; // newline
+    if (gLogBytes + writeBytes > kMaxLogBytes) {
+        rotate();
+    }
+    if (gLogFile) {
+        gLogFile << line << "\n";
+        gLogFile.flush();
+        gLogBytes += writeBytes;
     }
 }
 

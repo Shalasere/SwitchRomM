@@ -2,6 +2,7 @@
 #include "romm/logger.hpp"
 #include "romm/util.hpp"
 #include "romm/raii.hpp"
+#include "romm/http_common.hpp"
 #include "mini/json.hpp"
 // TODO(http): centralize HTTP client with structured errors/timeouts and optional token auth.
 
@@ -18,6 +19,7 @@
 #include <iomanip>
 #include <cctype>
 #include <functional>
+#include <cerrno>
 #ifndef UNIT_TEST
 #include <sys/socket.h>
 #include <netdb.h>
@@ -27,12 +29,19 @@
 
 namespace romm {
 
+namespace {
+constexpr size_t kApiRecvBuf = 8192;
+constexpr int64_t kRetryDelayFastNs = 250'000'000LL; // 250ms
+constexpr int64_t kRetryDelaySlowNs = 1'000'000'000LL; // 1s
+}
+
 bool parseHttpUrl(const std::string& url,
                   std::string& host,
                   std::string& portStr,
                   std::string& path,
                   std::string& err)
 {
+    // TODO: support https:// via TLS in future; currently http-only.
     if (url.rfind("http://", 0) != 0) {
         err = "Only http:// URLs are supported (TLS not implemented)";
         return false;
@@ -300,7 +309,7 @@ bool httpRequestStream(const std::string& method,
     }
 
     if (connect(sockFd.fd, res->ai_addr, res->ai_addrlen) != 0) {
-        err = "Connect failed";
+        err = std::string("Connect failed: ") + std::strerror(errno);
         freeaddrinfo(res);
         return false;
     }
@@ -316,19 +325,13 @@ bool httpRequestStream(const std::string& method,
     req << "\r\n";
     std::string reqStr = req.str();
 
-    size_t totalSent = 0;
-    while (totalSent < reqStr.size()) {
-        ssize_t n = send(sockFd.fd, reqStr.data() + totalSent,
-                         reqStr.size() - totalSent, 0);
-        if (n <= 0) {
-            err = "Send failed";
-            return false;
-        }
-        totalSent += static_cast<size_t>(n);
+    if (!romm::sendAll(sockFd.fd, reqStr.data(), reqStr.size())) {
+        err = "Send failed";
+        return false;
     }
 
     std::string headerBuf; // only used until headers parsed
-    char buf[8192];
+    char buf[kApiRecvBuf];
     bool headersDone = false;
     size_t bytesSentToSink = 0;
     bool chunked = false;
@@ -337,7 +340,11 @@ bool httpRequestStream(const std::string& method,
     while (true) {
         ssize_t n = recv(sockFd.fd, buf, sizeof(buf), 0);
         if (n < 0) {
-            err = "Recv failed or timed out";
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                err = "Recv timed out";
+            } else {
+                err = std::string("Recv failed: ") + std::strerror(errno);
+            }
             return false;
         } else if (n == 0) {
             break; // EOF
@@ -353,40 +360,15 @@ bool httpRequestStream(const std::string& method,
             size_t bodyStart = hdrEnd + 4;
 
             std::string headerBlock = headerBuf.substr(0, hdrEnd);
-            auto firstCrLf = headerBlock.find("\r\n");
-            if (firstCrLf == std::string::npos) {
-                err = "Malformed HTTP response (no status line CRLF)";
+            ParsedHttpResponse parsed{};
+            if (!parseHttpResponseHeaders(headerBlock, parsed, err)) {
                 return false;
             }
-            resp.headersRaw = headerBlock.substr(firstCrLf + 2);
-
-            std::string statusLine = headerBlock.substr(0, firstCrLf);
-            if (!statusLine.empty() && statusLine.back() == '\r') statusLine.pop_back();
-            std::istringstream sl(statusLine);
-            std::string httpVer;
-            sl >> httpVer >> resp.statusCode;
-            std::getline(sl, resp.statusText);
-            if (!resp.statusText.empty() && resp.statusText.front() == ' ') resp.statusText.erase(resp.statusText.begin());
-
-            std::istringstream hs(headerBlock);
-            std::string line;
-            std::getline(hs, line); // discard status line
-            while (std::getline(hs, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                auto colon = line.find(':');
-                if (colon == std::string::npos) continue;
-                std::string key = line.substr(0, colon);
-                std::string val = line.substr(colon + 1);
-                while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
-                std::string keyLower = key;
-                for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                if (keyLower == "content-length") {
-                    contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
-                } else if (keyLower == "transfer-encoding" && val.find("chunked") != std::string::npos) {
-                    chunked = true;
-                }
-            }
-
+            resp.statusCode = parsed.statusCode;
+            resp.statusText = parsed.statusText;
+            resp.headersRaw = parsed.headersRaw;
+            contentLength = parsed.contentLength;
+            chunked = parsed.chunked;
             if (chunked) {
                 err = "Chunked encoding not supported for streaming downloads";
                 return false;
@@ -545,7 +527,7 @@ static bool httpGetJsonWithRetry(const std::string& url,
         lastErr = e.empty() ? "HTTP transport failure" : e;
         if (attempt < maxAttempts) {
             // basic backoff: 250ms, 1s
-            int64_t delayNs = (attempt == 1) ? 250000000LL : 1000000000LL;
+            int64_t delayNs = (attempt == 1) ? kRetryDelayFastNs : kRetryDelaySlowNs;
             svcSleepThread(delayNs);
         }
     }
