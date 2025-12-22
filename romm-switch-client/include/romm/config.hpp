@@ -12,10 +12,10 @@ struct Config {
     // Optional Basic auth credentials
     std::string username;
     std::string password;
-    // Platform slug (defaults to switch)
-    std::string platform{"switch"};
-    // Destination directory on SD for downloads
-    std::string downloadDir{"sdmc:/romm_cache/switch"};
+    // Platform slug (optional; UI drives selection when empty)
+    std::string platform{""};
+    // Destination directory on SD for downloads (platform/rom subfolders created automatically)
+    std::string downloadDir{"sdmc:/romm_cache"};
     // HTTP timeout (seconds) for network calls
     int httpTimeoutSeconds{30};
     // FAT32-safe split flag
