@@ -360,6 +360,31 @@ static bool streamDownload(const std::string& url,
         std::string perr;
         if (!parseHttpResponseHeaders(headers, parsed, perr)) { err = perr; return false; }
         statusCode = parsed.statusCode;
+        if (statusCode >= 300 && statusCode < 400) {
+            // Explicit redirect failure with Location if present.
+            std::string location;
+            {
+                std::istringstream hs(headers);
+                std::string line;
+                while (std::getline(hs, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    auto colonPos = line.find(':');
+                    if (colonPos == std::string::npos) continue;
+                    std::string key = line.substr(0, colonPos);
+                    std::string val = line.substr(colonPos + 1);
+                    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+                    std::string keyLower = key;
+                    for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (keyLower == "location") {
+                        location = val;
+                        break;
+                    }
+                }
+            }
+            err = "Redirect not supported (HTTP " + std::to_string(statusCode) +
+                  (location.empty() ? "" : " to " + location) + ")";
+            return false;
+        }
         if (useRange && statusCode != 206) { err = "Range not honored (status " + std::to_string(statusCode) + ")"; return false; }
         if (!useRange && statusCode != 200) { err = "HTTP status " + std::to_string(statusCode); return false; }
         transferChunked = parsed.chunked;
@@ -1046,9 +1071,11 @@ static void workerLoop() {
                 std::lock_guard<std::mutex> lock(st->mutex);
                 if (!st->downloadQueue.empty()) {
                     if (wasStopped) {
-                        // Leave in queue as Pending so user can resume later.
-                        st->downloadQueue.front().state = QueueState::Pending;
-                        st->downloadQueue.front().error.clear();
+                        // Mark as cancelled so UI distinguishes from never-started Pending.
+                        st->downloadQueue.front().state = QueueState::Cancelled;
+                        st->downloadQueue.front().error = "Cancelled";
+                        st->downloadHistory.push_back(st->downloadQueue.front());
+                        st->downloadQueue.erase(st->downloadQueue.begin());
                     } else {
                         st->downloadQueue.front().state = QueueState::Failed;
                         st->downloadQueue.front().error = st->lastDownloadError;

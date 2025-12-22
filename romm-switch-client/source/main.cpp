@@ -713,7 +713,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         for (const auto& qi : snap.downloadHistory) {
             if (qi.state == romm::QueueState::Failed ||
                 qi.state == romm::QueueState::Completed ||
-                qi.state == romm::QueueState::Resumable) {
+                qi.state == romm::QueueState::Resumable ||
+                qi.state == romm::QueueState::Cancelled ||
+                qi.state == romm::QueueState::Finalizing) {
                 queueStateById[qi.game.id] = qi.state;
             }
         }
@@ -765,20 +767,26 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
                 return;
             }
             switch (*st) {
-                case romm::QueueState::Pending:
+                case romm::QueueState::Pending:     // grey = queued
                     drawFilledCircle(x + r, y + r, r - 2, SDL_Color{140,140,140,255});
                     break;
-                case romm::QueueState::Downloading:
+                case romm::QueueState::Downloading: // white = active download
                     drawFilledCircle(x + r, y + r, r - 2, SDL_Color{230,230,230,255});
                     break;
-                case romm::QueueState::Completed:
+                case romm::QueueState::Finalizing:  // yellow = moving/renaming
+                    drawFilledCircle(x + r, y + r, r - 2, SDL_Color{200,200,120,255});
+                    break;
+                case romm::QueueState::Completed:   // green = done
                     drawFilledCircle(x + r, y + r, r - 2, SDL_Color{50,200,110,255});
                     break;
-                case romm::QueueState::Resumable:
+                case romm::QueueState::Resumable:   // orange = resumable
                     drawFilledCircle(x + r, y + r, r - 2, SDL_Color{230,150,60,255});
                     break;
-                case romm::QueueState::Failed:
+                case romm::QueueState::Failed:      // red = failed
                     drawFilledCircle(x + r, y + r, r - 2, SDL_Color{220,70,70,255});
+                    break;
+                case romm::QueueState::Cancelled:   // amber = cancelled by user
+                    drawFilledCircle(x + r, y + r, r - 2, SDL_Color{255,180,80,255});
                     break;
             }
         };
@@ -919,12 +927,14 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
                 switch (q.state) {
                     case romm::QueueState::Pending: stateStr = "pending"; break;
                     case romm::QueueState::Downloading: stateStr = "downloading"; break;
+                    case romm::QueueState::Finalizing: stateStr = "finalizing"; break;
                     case romm::QueueState::Completed: stateStr = "done"; break;
                     case romm::QueueState::Resumable: stateStr = "resumable"; break;
                     case romm::QueueState::Failed: stateStr = "failed"; break;
+                    case romm::QueueState::Cancelled: stateStr = "cancelled"; break;
                 }
                 drawText(renderer, r.x + 680, r.y + 4, sz + " " + stateStr, fg, 2);
-                if ((q.state == romm::QueueState::Failed || q.state == romm::QueueState::Resumable) && !q.error.empty()) {
+                if ((q.state == romm::QueueState::Failed || q.state == romm::QueueState::Resumable || q.state == romm::QueueState::Cancelled) && !q.error.empty()) {
                     drawText(renderer, r.x + 10, r.y + 22, ellipsize(q.error, 58), SDL_Color{255,160,160,255}, 2);
                 }
             }
@@ -972,9 +982,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             switch (*st) {
                 case romm::QueueState::Pending:     return "queued";
                 case romm::QueueState::Downloading: return "downloading";
+                case romm::QueueState::Finalizing:  return "finalizing";
                 case romm::QueueState::Completed:   return "completed";
                 case romm::QueueState::Resumable:   return "resumable";
                 case romm::QueueState::Failed:      return "failed";
+                case romm::QueueState::Cancelled:   return "cancelled";
             }
             return "unknown";
         };
@@ -1055,7 +1067,7 @@ int main(int argc, char** argv) {
     ScrollHold scrollHold;
     auto resetNav = [&]() { status.navStack.clear(); };
 
-    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0"); // use positional mapping; ensures physical A(right)/B(bottom) match expectations
+    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "1"); // use label mapping (Nintendo layout)
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software"); // enforce software before creating renderer
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
         romm::logLine(std::string("SDL_Init failed: ") + SDL_GetError());
@@ -1074,8 +1086,6 @@ int main(int argc, char** argv) {
         }
         if (!pad) romm::logLine("No compatible controller opened.");
     }
-
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software"); // enforce software to avoid GPU crashes
 
     window = SDL_CreateWindow("RomM Switch Client",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,

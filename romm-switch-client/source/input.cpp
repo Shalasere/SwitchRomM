@@ -5,16 +5,16 @@ namespace romm {
 
 Action translateEvent(const SDL_Event& e) {
     if (e.type == SDL_QUIT) return Action::Quit;
-    // Use SDL controller events (Nintendo layout remap) and ignore raw joystick duplicates.
+    // Use SDL controller events (Nintendo layout) and ignore raw joystick duplicates.
     if (e.type == SDL_JOYBUTTONDOWN) {
         romm::logDebug("Ignoring SDL_JOYBUTTONDOWN code=" + std::to_string(e.jbutton.button), "INPUT");
         return Action::None;
     }
-    // Map controller buttons to Actions. Using positional mapping (SDL hint set to labels=0):
-    // - SDL A (bottom) -> back
-    // - SDL B (right)  -> select
-    // - SDL X (left)   -> queue
-    // - SDL Y (top)    -> start downloads
+    // Map controller buttons to Actions (label mode, Nintendo layout):
+    // - B (bottom) -> back
+    // - A (right)  -> select
+    // - Y (left)   -> queue
+    // - X (top)    -> start downloads
     if (e.type == SDL_CONTROLLERBUTTONDOWN) {
         static Uint32 lastTicks[SDL_CONTROLLER_BUTTON_MAX] = {};
         Uint32 now = SDL_GetTicks();
@@ -33,10 +33,10 @@ Action translateEvent(const SDL_Event& e) {
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN: act = Action::Down; break;
             case SDL_CONTROLLER_BUTTON_DPAD_LEFT: act = Action::Left; break;
             case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: act = Action::Right; break;
-            case SDL_CONTROLLER_BUTTON_A: act = Action::Back; break;            // bottom -> back
-            case SDL_CONTROLLER_BUTTON_B: act = Action::Select; break;          // right -> select/confirm
-            case SDL_CONTROLLER_BUTTON_X: act = Action::OpenQueue; break;       // left -> queue view
-            case SDL_CONTROLLER_BUTTON_Y: act = Action::StartDownload; break;   // top -> start downloads
+            case SDL_CONTROLLER_BUTTON_B: act = Action::Back; break;            // bottom -> back
+            case SDL_CONTROLLER_BUTTON_A: act = Action::Select; break;          // right -> select/confirm
+            case SDL_CONTROLLER_BUTTON_Y: act = Action::OpenQueue; break;       // left -> queue view
+            case SDL_CONTROLLER_BUTTON_X: act = Action::StartDownload; break;   // top -> start downloads
             case SDL_CONTROLLER_BUTTON_START: act = Action::Quit; break;        // Plus -> exit app
             default: break;
         }
