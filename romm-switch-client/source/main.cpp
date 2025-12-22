@@ -374,7 +374,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         int currentDownloadIndex{0};
         std::string lastError;
         std::unordered_set<std::string> completedOnDisk;
-        double lastSpeedMbps{0.0};
+        double lastSpeedMBps{0.0};
     } snap;
 
     {
@@ -395,7 +395,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.currentDownloadTitle = status.currentDownloadTitle;
         snap.currentDownloadIndex = status.currentDownloadIndex.load();
         snap.lastError = status.lastError;
-        snap.lastSpeedMbps = status.lastSpeedMbps;
+        snap.lastSpeedMBps = status.lastSpeedMBps;
     }
     // Populate on-disk completion set outside the status lock (uses config).
     // Cache results and rescan only when ROM list changes or on a timed interval to avoid per-frame disk IO.
@@ -542,12 +542,12 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
 
     // If we have a speed reading, prepend it to the right-hand status.
     std::vector<std::string> rightParts;
-    if (snap.lastSpeedMbps > 0.05) {
+    if (snap.lastSpeedMBps > 0.05) {
         std::ostringstream oss;
-        oss << "SPD:" << std::fixed << std::setprecision(1) << snap.lastSpeedMbps << " MB/s";
+        oss << "SPD:" << std::fixed << std::setprecision(1) << snap.lastSpeedMBps << " MB/s";
         rightParts.push_back(oss.str());
-    } else if (snap.lastSpeedMbps < 0.0) {
-        rightParts.push_back(snap.lastSpeedMbps == -2.0 ? "SPD:err" : "SPD:...");
+    } else if (snap.lastSpeedMBps < 0.0) {
+        rightParts.push_back(snap.lastSpeedMBps == -2.0 ? "SPD:err" : "SPD:...");
     }
     rightParts.push_back(sysInfo);
     std::string rightInfo;
@@ -591,11 +591,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
                      "Overall  " + std::to_string(pctInt) + "% (" +
                      humanSize(totalDone) + " / " +
                      humanSize(totalBytes) + ")" +
-                     (snap.lastSpeedMbps > 0.1 ? ("  @" + [] (double mbps) {
-                         std::ostringstream oss;
-                         oss << std::fixed << std::setprecision(1) << " " << mbps << " MB/s";
-                         return oss.str();
-                     }(snap.lastSpeedMbps)) : std::string()),
+                     (snap.lastSpeedMBps > 0.1 ? ("  @" + [] (double mbps) {
+                        std::ostringstream oss;
+                        oss << std::fixed << std::setprecision(1) << " " << mbps << " MB/s";
+                        return oss.str();
+                     }(snap.lastSpeedMBps)) : std::string()),
                      fg, 2);
             if (totalDone == 0) {
                 static const char* dots[] = {"", ".", "..", "..."};
@@ -1117,17 +1117,17 @@ int main(int argc, char** argv) {
             const Config cfgCopy = config;
             {
                 std::lock_guard<std::mutex> lock(status.mutex);
-                status.lastSpeedMbps = -1.0; // pending
+                status.lastSpeedMBps = -1.0; // pending
             }
             speedTestThread = std::thread([cfgCopy, &status]() {
                 std::string err;
                 constexpr uint64_t kProbeBytes = 40ULL * 1024ULL * 1024ULL;
                 if (romm::runSpeedTest(cfgCopy, status, kProbeBytes, err)) {
                     std::lock_guard<std::mutex> lock(status.mutex);
-                    romm::logLine("Startup speed test: " + std::to_string(status.lastSpeedMbps) + " MB/s");
+                    romm::logLine("Startup speed test: " + std::to_string(status.lastSpeedMBps) + " MB/s");
                 } else {
                     std::lock_guard<std::mutex> lock(status.mutex);
-                    status.lastSpeedMbps = -2.0; // failed
+                    status.lastSpeedMBps = -2.0; // failed
                     romm::logLine("Startup speed test failed: " + err);
                 }
             });

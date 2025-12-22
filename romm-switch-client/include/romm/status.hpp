@@ -1,7 +1,6 @@
 #pragma once
 
 #include "romm/models.hpp"
-#include "romm/models.hpp"
 #include <atomic>
 #include <string>
 #include <vector>
@@ -42,14 +41,13 @@ struct Status {
     // Download queue and progress
     std::vector<QueueItem> downloadQueue;
     std::vector<QueueItem> downloadHistory; // completed/failed items for UI display
-    bool isDownloading{false};
     std::atomic<size_t> currentDownloadIndex{0};
     std::atomic<uint64_t> currentDownloadSize{0};
     std::atomic<uint64_t> currentDownloadedBytes{0};
     std::atomic<uint64_t> totalDownloadBytes{0};
     std::atomic<uint64_t> totalDownloadedBytes{0};
     std::string currentDownloadTitle;
-    double lastSpeedMbps{0.0}; // last measured throughput (Mbps), updated by worker
+    double lastSpeedMBps{0.0}; // last measured throughput in MB/s, updated by worker
     std::atomic<bool> downloadWorkerRunning{false};
     std::atomic<bool> lastDownloadFailed{false};
     std::string lastDownloadError;

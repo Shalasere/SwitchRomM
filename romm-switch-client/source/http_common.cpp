@@ -62,11 +62,13 @@ bool parseHttpResponseHeaders(const std::string& headerBlock, ParsedHttpResponse
         while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
         std::string keyLower = key;
         for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        std::string valLower = val;
+        for (auto& c : valLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         if (keyLower == "content-length") {
             out.contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
-        } else if (keyLower == "transfer-encoding" && val.find("chunked") != std::string::npos) {
+        } else if (keyLower == "transfer-encoding" && valLower.find("chunked") != std::string::npos) {
             out.chunked = true;
-        } else if (keyLower == "accept-ranges" && val.find("bytes") != std::string::npos) {
+        } else if (keyLower == "accept-ranges" && valLower.find("bytes") != std::string::npos) {
             out.acceptRanges = true;
         }
     }

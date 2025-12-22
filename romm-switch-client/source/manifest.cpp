@@ -170,7 +170,12 @@ bool manifestCompatible(const Manifest& m, const Game& g, uint64_t expectedTotal
     if (expectedPartSize != 0 && m.partSize != expectedPartSize) return false;
     if (!g.id.empty() && !m.rommId.empty() && m.rommId != g.id) return false;
     if (!g.fileId.empty() && !m.fileId.empty() && m.fileId != g.fileId) return false;
-    if (!g.downloadUrl.empty() && !m.url.empty() && m.url != g.downloadUrl) return false;
+    // If we have strong identifiers (rommId/fileId), tolerate URL changes (tokens/hosts).
+    bool haveStrongId = !g.id.empty() && !m.rommId.empty();
+    haveStrongId = haveStrongId || (!g.fileId.empty() && !m.fileId.empty());
+    if (!haveStrongId) {
+        if (!g.downloadUrl.empty() && !m.url.empty() && m.url != g.downloadUrl) return false;
+    }
     return true;
 }
 

@@ -91,6 +91,35 @@ struct PreflightInfo {
     uint64_t contentLength{0};
 };
 
+static void parseLengthAndRanges(const std::string& headers, PreflightInfo& info) {
+    std::istringstream hs(headers);
+    std::string line;
+    while (std::getline(hs, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto colonPos = line.find(':');
+        if (colonPos == std::string::npos) continue;
+        std::string key = line.substr(0, colonPos);
+        std::string val = line.substr(colonPos + 1);
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+        std::string keyLower = key;
+        for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        std::string valLower = val;
+        for (auto& c : valLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (keyLower == "accept-ranges" && valLower.find("bytes") != std::string::npos) {
+            info.supportsRanges = true;
+        } else if (keyLower == "content-length") {
+            info.contentLength = static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10));
+        } else if (keyLower == "content-range") {
+            auto slash = val.find('/');
+            if (slash != std::string::npos) {
+                std::string totalStr = val.substr(slash + 1);
+                uint64_t total = static_cast<uint64_t>(std::strtoull(totalStr.c_str(), nullptr, 10));
+                if (total > 0) info.contentLength = total;
+            }
+        }
+    }
+}
+
 static Manifest buildManifestFor(const Game& g, uint64_t totalSize) {
     Manifest m;
     m.rommId = g.id;
@@ -147,7 +176,7 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
         std::string host, portStr, path, perr;
         if (!romm::parseHttpUrl(url, host, portStr, path, perr)) return false;
         struct addrinfo hints{};
-        hints.ai_family = AF_INET;
+        hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         struct addrinfo* res = nullptr;
         int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
@@ -189,26 +218,9 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
     int code = 0;
     std::string headers;
     auto parseContentRangeTotal = [](const std::string& hdrs) -> uint64_t {
-        std::istringstream hs(hdrs);
-        std::string line;
-        while (std::getline(hs, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            auto colonPos = line.find(':');
-            if (colonPos == std::string::npos) continue;
-            std::string key = line.substr(0, colonPos);
-            std::string val = line.substr(colonPos + 1);
-            while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
-            std::string keyLower = key;
-            for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (keyLower == "content-range") {
-                auto slash = val.find('/');
-                if (slash != std::string::npos) {
-                    std::string totalStr = val.substr(slash + 1);
-                    return static_cast<uint64_t>(std::strtoull(totalStr.c_str(), nullptr, 10));
-                }
-            }
-        }
-        return 0;
+        PreflightInfo info{};
+        parseLengthAndRanges(hdrs, info);
+        return info.contentLength;
     };
     // Try HEAD
     if (doRequest("HEAD", "", code, headers) && code >= 200 && code < 300) {
@@ -269,7 +281,7 @@ static bool streamDownload(const std::string& url,
     if (!romm::parseHttpUrl(url, host, portStr, path, perr)) { err = perr; return false; }
 
     struct addrinfo hints{};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* res = nullptr;
     int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
@@ -461,10 +473,10 @@ static bool streamDownload(const std::string& url,
                 double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - transferStart).count();
                 if (secs <= 0.0) secs = 1e-6;
                 double mbps = (received / (1024.0 * 1024.0)) / secs; // MB/s
-                logLine("Throughput estimate ~" + std::to_string(mbps) + " Mbps (first 10MB)");
+                logLine("Throughput estimate ~" + std::to_string(mbps) + " MB/s (first 10MB)");
                 {
                     std::lock_guard<std::mutex> lock(status.mutex);
-                    status.lastSpeedMbps = mbps;
+                    status.lastSpeedMBps = mbps;
                 }
                 probeLogged = true;
             }
@@ -500,10 +512,10 @@ static bool streamDownload(const std::string& url,
                 double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - transferStart).count();
                 if (secs <= 0.0) secs = 1e-6;
                 double mbps = (received / (1024.0 * 1024.0)) / secs; // MB/s
-                logLine("Throughput estimate ~" + std::to_string(mbps) + " Mbps (first 10MB)");
+                logLine("Throughput estimate ~" + std::to_string(mbps) + " MB/s (first 10MB)");
                 {
                     std::lock_guard<std::mutex> lock(status.mutex);
-                    status.lastSpeedMbps = mbps;
+                    status.lastSpeedMBps = mbps;
                 }
                 probeLogged = true;
             }
@@ -514,7 +526,7 @@ static bool streamDownload(const std::string& url,
                     double mbps = (bytesSinceBeat / (1024.0 * 1024.0)) / beatSecs; // MB/s
                     {
                         std::lock_guard<std::mutex> lock(status.mutex);
-                        status.lastSpeedMbps = mbps;
+                        status.lastSpeedMBps = mbps;
                     }
                 }
                 std::string titleCopy;
@@ -1071,12 +1083,23 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
     outError.clear();
     const fs::path tempRoot = fs::path(cfg.downloadDir) / "temp";
     if (!fs::exists(tempRoot)) return true; // nothing to load
-    std::lock_guard<std::mutex> lock(status.mutex);
+
+    struct Found {
+        Manifest manifest;
+        fs::path dirPath;
+    };
+    std::vector<Found> manifests;
     for (const auto& entry : fs::directory_iterator(tempRoot)) {
         if (!entry.is_directory()) continue;
         fs::path manifestPath = entry.path() / "manifest.json";
         Manifest m;
         if (!fs::exists(manifestPath) || !readManifestFile(manifestPath.string(), m)) continue;
+        manifests.push_back({m, entry.path()});
+    }
+
+    std::lock_guard<std::mutex> lock(status.mutex);
+    for (const auto& found : manifests) {
+        const Manifest& m = found.manifest;
         auto alreadyQ = std::find_if(status.downloadQueue.begin(), status.downloadQueue.end(),
             [&](const QueueItem& qi) {
                 if (!m.rommId.empty()) return qi.game.id == m.rommId;

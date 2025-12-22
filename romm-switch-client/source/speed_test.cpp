@@ -30,7 +30,7 @@ static bool measureSpeed(const std::string& url,
     romm::logLine("SpeedTest: target=" + url + " bytes=" + std::to_string(testBytes));
 
     struct addrinfo hints{};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* res = nullptr;
     int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
@@ -128,7 +128,7 @@ bool runSpeedTest(const Config& cfg, Status& status, uint64_t testBytes, std::st
     }
     {
         std::lock_guard<std::mutex> lock(status.mutex);
-        status.lastSpeedMbps = mbps;
+        status.lastSpeedMBps = mbps;
     }
     return true;
 }

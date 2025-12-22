@@ -137,7 +137,8 @@ TEST_CASE("manifestCompatible matches game identity and sizes") {
     REQUIRE_FALSE(romm::manifestCompatible(m, g, 300, 100));
     g.fileId = "file1";
     g.downloadUrl = "http://example/other";
-    REQUIRE_FALSE(romm::manifestCompatible(m, g, 300, 100));
+    // URL differences are tolerated when IDs are present.
+    REQUIRE(romm::manifestCompatible(m, g, 300, 100));
     g.downloadUrl = "http://example/game";
     REQUIRE_FALSE(romm::manifestCompatible(m, g, 200, 100));
     REQUIRE_FALSE(romm::manifestCompatible(m, g, 300, 200));

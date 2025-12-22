@@ -19,9 +19,6 @@ void reapDownloadWorkerIfDone();
 // Scan temp manifests under download_dir to seed history of resumable items.
 bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError);
 
-// Run a speed test against cfg.speedTestUrl (if set) up to testBytes; updates Status::lastSpeedMbps.
-bool runSpeedTest(const Config& cfg, Status& status, uint64_t testBytes, std::string& outError);
-
 #ifdef UNIT_TEST
 // Test helper: parse HTTP headers for content length and range support.
 bool parseLengthAndRangesForTest(const std::string& headers, bool& supportsRanges, uint64_t& contentLength);

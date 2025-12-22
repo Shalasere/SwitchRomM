@@ -1,6 +1,5 @@
 #include "romm/downloader.hpp"
 #include "romm/manifest.hpp"
-#include "romm/events.hpp"
 #include <fstream>
 #include <sstream>
 #include <mutex>
@@ -9,8 +8,9 @@
 
 namespace romm {
 
-// Minimal stubs to satisfy linker for unit tests (no libnx).
-bool pollDownloadEvent(DownloadEvent& ev) { (void)ev; return false; }
+// Minimal stubs to satisfy linker for unit tests (no libnx). Events are unused.
+struct DownloadEvent {};
+bool pollDownloadEvent(DownloadEvent&) { return false; }
 
 void startDownloadWorker(Status& status, const Config& cfg) {
     (void)cfg;

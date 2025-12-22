@@ -143,7 +143,7 @@ bool httpRequest(const std::string& method,
     }
 
     struct addrinfo hints{};
-    hints.ai_family   = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* res = nullptr;
 
@@ -284,7 +284,7 @@ bool httpRequestStream(const std::string& method,
     }
 
     struct addrinfo hints{};
-    hints.ai_family   = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* res = nullptr;
 

@@ -14,7 +14,7 @@ struct HttpResponse {
     std::string body;
 };
 
-// Stubbed API client; replace with real HTTP soon.
+// HTTP/JSON API client (http only; no redirects/chunked streaming).
 bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError);
 bool fetchGamesForPlatform(const Config& cfg, const std::string& platformId, Status& status, std::string& outError);
 bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData, std::string& outError);
