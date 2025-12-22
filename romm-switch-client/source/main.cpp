@@ -1071,7 +1071,9 @@ int main(int argc, char** argv) {
     ScrollHold scrollHold;
     auto resetNav = [&]() { status.navStack.clear(); };
 
-    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "1"); // use label mapping (Nintendo layout)
+    // Force positional mapping (Xbox-style) so we can map buttons explicitly.
+    SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0", SDL_HINT_OVERRIDE);
+    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software"); // enforce software before creating renderer
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
         romm::logLine(std::string("SDL_Init failed: ") + SDL_GetError());
@@ -1433,10 +1435,17 @@ int main(int argc, char** argv) {
                                     status.totalDownloadedBytes.store(0);
                                     status.totalDownloadBytes.store(0);
                                     status.downloadCompleted = false; // clear any prior completion banner
-                                    for (auto& q : status.downloadQueue) status.totalDownloadBytes.fetch_add(q.game.sizeBytes);
+                                    for (auto& q : status.downloadQueue) {
+                                        uint64_t sz = q.bundle.totalSize();
+                                        if (sz == 0) sz = q.game.sizeBytes;
+                                        status.totalDownloadBytes.fetch_add(sz);
+                                    }
                                     if (!status.downloadQueue.empty()) {
-                                        status.currentDownloadSize.store(status.downloadQueue[0].game.sizeBytes);
-                                        status.currentDownloadTitle = status.downloadQueue[0].game.title;
+                                        const auto& first = status.downloadQueue[0];
+                                        uint64_t firstSize = first.bundle.totalSize();
+                                        if (firstSize == 0) firstSize = first.game.sizeBytes;
+                                        status.currentDownloadSize.store(firstSize);
+                                        status.currentDownloadTitle = first.bundle.title.empty() ? first.game.title : first.bundle.title;
                                         status.downloadQueue[0].state = romm::QueueState::Downloading;
                                     }
                                 }

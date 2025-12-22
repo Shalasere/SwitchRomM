@@ -71,6 +71,18 @@ static void removeDirRecursive(const std::string& path) {
     }
 }
 
+// Remove empty parent directories up to (but not including) stopDir.
+static void removeEmptyParents(std::filesystem::path p, const std::filesystem::path& stopDir) {
+    std::error_code ec;
+    while (p != stopDir && p.has_parent_path()) {
+        if (!std::filesystem::exists(p, ec)) break;
+        if (!std::filesystem::is_empty(p, ec)) break;
+        std::filesystem::remove(p, ec);
+        if (ec) break;
+        p = p.parent_path();
+    }
+}
+
 // Check (best effort) if there is enough free space at path for neededBytes + margin.
 static bool ensureFreeSpace(const std::string& path, uint64_t neededBytes) {
     struct statvfs vfs{};
@@ -700,8 +712,10 @@ static bool downloadOneFile(Game g, Status& status, const Config& cfg) {
     std::string fileSafe = safeName(g.fileId);
     if (romSafe.empty()) romSafe = "rom";
     if (fileSafe.empty()) fileSafe = "file";
-    std::string baseDir = cfg.downloadDir + "/" + platSafe + "/" + romSafe;
+    // Final outputs live under <downloadDir>/<platform>/<title__id.ext>
+    std::string baseDir = cfg.downloadDir + "/" + platSafe;
     ensureDirectory(baseDir);
+    // Temps live under <downloadDir>/temp/<platform>/<romId>/<fileId>/...
     std::string tempRoot = cfg.downloadDir + "/temp/" + platSafe + "/" + romSafe + "/" + fileSafe;
     ensureDirectory(tempRoot);
 
@@ -1029,6 +1043,12 @@ static bool downloadOneFile(Game g, Status& status, const Config& cfg) {
         status.lastDownloadError = "Finalize failed";
         return false;
     }
+    // Clean up temp root for this fileId now that finalize succeeded.
+    removeDirRecursive(tempRoot);
+    // Remove any empty parent directories under <downloadDir>/temp/<platform>/<romId>/...
+    std::filesystem::path stop = std::filesystem::path(cfg.downloadDir) / "temp";
+    removeEmptyParents(std::filesystem::path(tempRoot).parent_path(), stop);
+    removeEmptyParents(std::filesystem::path(tempRoot).parent_path().parent_path(), stop);
     {
         std::lock_guard<std::mutex> lock(status.mutex);
         // Keep UI counters aligned with the completed file.
