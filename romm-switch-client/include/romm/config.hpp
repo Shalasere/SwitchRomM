@@ -18,12 +18,16 @@ struct Config {
     std::string downloadDir{"sdmc:/romm_cache/switch"};
     // HTTP timeout (seconds) for network calls
     int httpTimeoutSeconds{30};
-    // FAT32-safe split flag (currently not used in downloader logic)
+    // FAT32-safe split flag
     bool fat32Safe{false};
     // Logging verbosity (debug, info, warn, error)
     std::string logLevel{"info"};
     // Optional URL to fetch ~10MB for a quick throughput estimate; blank to skip.
     std::string speedTestUrl;
+    // Platform prefs source selection
+    std::string platformPrefsMode{"auto"};      // auto | sd | romfs
+    std::string platformPrefsPathSd{"sdmc:/switch/romm/platform_prefs.json"};
+    std::string platformPrefsPathRomfs{"romfs:/platform_prefs.json"};
 };
 
 bool loadConfig(Config& outCfg, std::string& outError);

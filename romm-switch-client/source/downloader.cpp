@@ -51,7 +51,11 @@ DownloadContext gCtx; // global download context shared with worker
 
 static void recomputeTotals(Status& st) {
     uint64_t remaining = 0;
-    for (auto& q : st.downloadQueue) remaining += q.game.sizeBytes;
+    for (auto& q : st.downloadQueue) {
+        uint64_t sz = q.bundle.totalSize();
+        if (sz == 0) sz = q.game.sizeBytes;
+        remaining += sz;
+    }
     st.totalDownloadBytes.store(st.totalDownloadedBytes.load() + remaining);
 }
 
@@ -684,14 +688,21 @@ static bool finalizeParts(const std::string& tmpDir, const std::string& finalDir
 }
 
 // Download a single Game into FAT32-safe parts. Resumes completed parts; deletes partial fragments.
-static bool downloadOne(Game g, Status& status, const Config& cfg) {
+// Download a single file (Game-compatible) into FAT32-safe parts. Resumes completed parts; deletes partial fragments.
+static bool downloadOneFile(Game g, Status& status, const Config& cfg) {
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
         auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
     }
-    std::string baseDir = cfg.downloadDir;
+    std::string platformSlug = g.platformSlug.empty() ? "unknown" : g.platformSlug;
+    std::string platSafe = safeName(platformSlug);
+    std::string romSafe = safeName(!g.id.empty() ? g.id : g.fileId);
+    std::string fileSafe = safeName(g.fileId);
+    if (romSafe.empty()) romSafe = "rom";
+    if (fileSafe.empty()) fileSafe = "file";
+    std::string baseDir = cfg.downloadDir + "/" + platSafe + "/" + romSafe;
     ensureDirectory(baseDir);
-    std::string tempRoot = baseDir + "/temp";
+    std::string tempRoot = cfg.downloadDir + "/temp/" + platSafe + "/" + romSafe + "/" + fileSafe;
     ensureDirectory(tempRoot);
 
     // free space check for full ROM upfront (best effort)
@@ -1029,6 +1040,47 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     return true;
 }
 
+static DownloadBundle bundleFromGame(const Game& g) {
+    DownloadBundle b;
+    b.romId = g.id;
+    b.title = g.title;
+    b.platformSlug = g.platformSlug;
+    DownloadFileSpec f;
+    f.fileId = g.fileId;
+    f.name = g.fsName.empty() ? g.title : g.fsName;
+    f.url = g.downloadUrl;
+    f.sizeBytes = g.sizeBytes;
+    b.files.push_back(std::move(f));
+    return b;
+}
+
+// Download a bundle (supports multiple files iteratively).
+static bool downloadBundle(const DownloadBundle& bundle, Status& status, const Config& cfg) {
+    DownloadBundle b = bundle;
+    if (b.files.empty()) {
+        logLine("Bundle has no files; falling back to single file from game metadata");
+        return false;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < b.files.size(); ++i) {
+        const auto& f = b.files[i];
+        Game g;
+        g.id = b.romId;
+        g.title = b.title;
+        g.platformSlug = b.platformSlug;
+        g.fsName = f.name;
+        g.fileId = f.fileId;
+        g.downloadUrl = f.url;
+        g.sizeBytes = f.sizeBytes;
+        status.currentDownloadIndex.store(static_cast<size_t>(i));
+        if (!downloadOneFile(g, status, cfg)) {
+            ok = false;
+            break;
+        }
+    }
+    return ok;
+}
+
 // Background worker: processes the downloadQueue sequentially, updating Status.
 static void workerLoop() {
     Status* st = gCtx.status;
@@ -1043,7 +1095,11 @@ static void workerLoop() {
         st->downloadCompleted = false;
         st->totalDownloadBytes.store(0);
         st->totalDownloadedBytes.store(0);
-        for (auto& q : st->downloadQueue) st->totalDownloadBytes.fetch_add(q.game.sizeBytes);
+        for (auto& q : st->downloadQueue) {
+            uint64_t sz = q.bundle.totalSize();
+            if (sz == 0) sz = q.game.sizeBytes;
+            st->totalDownloadBytes.fetch_add(sz);
+        }
         for (auto& q : st->downloadQueue) q.state = QueueState::Pending;
     }
     logLine("Worker start, total bytes=" + std::to_string(st->totalDownloadBytes.load()));
@@ -1056,13 +1112,19 @@ static void workerLoop() {
             st->lastDownloadError.clear();
             st->currentDownloadIndex.store(0);
             next = st->downloadQueue.front(); // copy
+            if (next.bundle.files.empty()) {
+                next.bundle = bundleFromGame(next.game);
+                st->downloadQueue.front().bundle = next.bundle;
+            }
             // Prime UI fields for the next item.
-            st->currentDownloadTitle = next.game.title;
-            st->currentDownloadSize.store(next.game.sizeBytes);
+            uint64_t bundleSize = next.bundle.totalSize();
+            if (bundleSize == 0) bundleSize = next.game.sizeBytes;
+            st->currentDownloadTitle = next.bundle.title.empty() ? next.game.title : next.bundle.title;
+            st->currentDownloadSize.store(bundleSize);
             st->currentDownloadedBytes.store(0);
             st->downloadQueue.front().state = QueueState::Downloading;
         }
-        if (!downloadOne(next.game, *st, cfg)) {
+        if (!downloadBundle(next.bundle, *st, cfg)) {
             bool wasStopped = gCtx.stopRequested.load();
             logLine(std::string("Download failed or stopped for ") + next.game.title +
                     (wasStopped ? " (stop requested)" : ""));
@@ -1121,12 +1183,12 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         fs::path dirPath;
     };
     std::vector<Found> manifests;
-    for (const auto& entry : fs::directory_iterator(tempRoot)) {
-        if (!entry.is_directory()) continue;
-        fs::path manifestPath = entry.path() / "manifest.json";
+    for (const auto& entry : fs::recursive_directory_iterator(tempRoot)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().filename() != "manifest.json") continue;
         Manifest m;
-        if (!fs::exists(manifestPath) || !readManifestFile(manifestPath.string(), m)) continue;
-        manifests.push_back({m, entry.path()});
+        if (!readManifestFile(entry.path().string(), m)) continue;
+        manifests.push_back({m, entry.path().parent_path()});
     }
 
     std::lock_guard<std::mutex> lock(status.mutex);
@@ -1150,6 +1212,7 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         qi.game.fsName = m.fsName;
         qi.game.downloadUrl = m.url;
         qi.game.sizeBytes = m.totalSize;
+        qi.bundle = bundleFromGame(qi.game);
         qi.state = QueueState::Resumable;
         qi.error = "Resume available";
         bool allDone = !m.parts.empty() &&

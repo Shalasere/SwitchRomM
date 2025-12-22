@@ -60,7 +60,12 @@ bool isGameCompletedOnDisk(const Game& g, const Config& cfg) {
 
     auto addVariants = [&](const std::string& stem, const std::string& extension, std::vector<std::filesystem::path>& out) {
         std::filesystem::path dir(cfg.downloadDir);
-        auto pushPath = [&](const std::string& name) { out.push_back(dir / name); };
+        std::string plat = g.platformSlug.empty() ? "unknown" : g.platformSlug;
+        auto pushPath = [&](const std::string& name) {
+            out.push_back(dir / plat / name);
+            // Backward compatibility: also check flat layout.
+            out.push_back(dir / name);
+        };
         std::string base = stem + extension;
         pushPath(base);
         if (!idSafe.empty()) {

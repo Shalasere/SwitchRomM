@@ -847,27 +847,24 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
         return false;
     }
 
+    g.files.clear();
     uint64_t bestSize = 0;
     std::string bestName;
     std::string bestId;
     std::string bestDownloadUrl;
+    int fileCount = 0;
 
     auto stripLeadingSlash = [](std::string s) {
         while (!s.empty() && s.front() == '/') s.erase(s.begin());
         return s;
     };
 
-    int fileCount = 0;
     for (auto& f : itf->second.array) {
         if (f.type != mini::Value::Type::Object) continue;
         const auto& fo = f.object;
         ++fileCount;
 
         std::string fname;
-        std::string fid;
-        uint64_t fsize = 0;
-
-        // File name: prefer RomM schema fields
         if (auto n = fo.find("file_name"); n != fo.end() && n->second.type == mini::Value::Type::String)
             fname = n->second.str;
         else if (auto n2 = fo.find("name"); n2 != fo.end() && n2->second.type == mini::Value::Type::String)
@@ -876,19 +873,15 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
             fname = n3->second.str;
         fname = stripLeadingSlash(fname);
 
-        auto idit = fo.find("id");
-        if (idit != fo.end()) {
+        std::string fid;
+        if (auto idit = fo.find("id"); idit != fo.end()) {
             if (idit->second.type == mini::Value::Type::Number)
                 fid = std::to_string(static_cast<uint64_t>(idit->second.number));
             else if (idit->second.type == mini::Value::Type::String)
                 fid = idit->second.str;
         }
-        std::string downloadUrlField;
-        if (auto dl = fo.find("download_url"); dl != fo.end() && dl->second.type == mini::Value::Type::String) {
-            downloadUrlField = dl->second.str;
-        }
 
-        // Size: prefer file_size_bytes
+        uint64_t fsize = 0;
         if (auto sz = fo.find("file_size_bytes"); sz != fo.end() && sz->second.type == mini::Value::Type::Number)
             fsize = static_cast<uint64_t>(sz->second.number);
         else if (auto sz2 = fo.find("size_bytes"); sz2 != fo.end() && sz2->second.type == mini::Value::Type::Number)
@@ -900,12 +893,41 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
                 fsize = std::strtoull(sz3->second.str.c_str(), nullptr, 10);
         }
 
-        if (fname.empty() || fid.empty()) continue;
+        std::string fpath;
+        if (auto p = fo.find("path"); p != fo.end() && p->second.type == mini::Value::Type::String)
+            fpath = stripLeadingSlash(p->second.str);
+
+        std::string category;
+        if (auto c = fo.find("category"); c != fo.end() && c->second.type == mini::Value::Type::String)
+            category = c->second.str;
+
+        std::string downloadUrlField;
+        if (auto dl = fo.find("download_url"); dl != fo.end() && dl->second.type == mini::Value::Type::String) {
+            downloadUrlField = dl->second.str;
+        }
+        std::string finalUrl = absolutizeUrl(downloadUrlField);
+        if (finalUrl.empty() && !fid.empty() && !fname.empty()) {
+            finalUrl = cfg.serverUrl + "/api/romsfiles/" + fid + "/content/" + romm::util::urlEncode(fname);
+        }
+
+        if (fname.empty() || fid.empty() || fsize == 0 || finalUrl.empty()) {
+            logInfo("Skipping file with missing fields (name/id/size/url) in files[]", "API");
+            continue;
+        }
+
+        RomFile rf;
+        rf.id = fid;
+        rf.name = fname;
+        rf.path = fpath;
+        rf.url = finalUrl;
+        rf.sizeBytes = fsize;
+        rf.category = category;
+        g.files.push_back(rf);
 
         std::string lower = fname;
         for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-        bool preferredExt = (lower.rfind(".xci") != std::string::npos) || (lower.rfind(".nsp") != std::string::npos);
+        bool preferredExt = (lower.size() >= 4) &&
+                            (lower.rfind(".xci") != std::string::npos || lower.rfind(".nsp") != std::string::npos);
         bool bestIsPreferred = (!bestName.empty() &&
                                 (bestName.rfind(".xci") != std::string::npos || bestName.rfind(".nsp") != std::string::npos));
 
@@ -920,33 +942,29 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
             bestName = fname;
             bestId   = fid;
             bestSize = fsize;
-            bestDownloadUrl = downloadUrlField;
+            bestDownloadUrl = finalUrl;
         }
 
         logDebug("files[] entry: name=" + fname + " id=" + fid +
                  " size=" + std::to_string(fsize), "API");
     }
 
-    if (bestId.empty() || bestName.empty()) {
-        outError = "No suitable file (.xci/.nsp) in files array (" + std::to_string(fileCount) + " entries)";
+    if (g.files.empty()) {
+        outError = "No valid files for ROM.";
         return false;
     }
 
-    g.fsName = bestName;
-    g.fileId = bestId;
-    if (bestSize > 0) g.sizeBytes = bestSize;
-    if (!bestDownloadUrl.empty()) {
+    if (!bestId.empty()) {
+        g.fsName = bestName;
+        g.fileId = bestId;
+        g.sizeBytes = bestSize;
         g.downloadUrl = bestDownloadUrl;
-        logInfo("Using download_url field for " + g.title, "API");
+        logInfo("Selected file via files[] id=" + bestId + " name=" + bestName +
+                " size=" + std::to_string(bestSize) + " for " + g.title, "API");
     } else {
-        g.downloadUrl = cfg.serverUrl + "/api/roms/" + g.id +
-                        "/content/" + romm::util::urlEncode(bestName) +
-                        "?file_ids=" + bestId;
-        logInfo("Constructed download URL for " + g.title, "API");
+        logInfo("No preferred (.xci/.nsp) file found; bundle selection will use full files list.", "API");
     }
 
-    logInfo("Selected file via files[] id=" + bestId + " name=" + bestName +
-            " size=" + std::to_string(bestSize) + " for " + g.title, "API");
     return true;
 }
 

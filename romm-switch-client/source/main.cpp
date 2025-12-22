@@ -38,6 +38,8 @@ extern "C" void stbi_image_free(void *retval_from_stbi_load);
 #include "romm/logger.hpp"
 #include "romm/downloader.hpp"
 #include "romm/cover_loader.hpp"
+#include "romm/planner.hpp"
+#include "romm/platform_prefs.hpp"
 #include "romm/queue_policy.hpp"
 #include "romm/speed_test.hpp"
 
@@ -922,7 +924,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             if (idx < snap.downloadQueue.size()) {
                 const auto& q = snap.downloadQueue[idx];
                 drawText(renderer, r.x + 10, r.y + 4, ellipsize(q.game.title, 58), fg, 2);
-                std::string sz = humanSize(q.game.sizeBytes);
+                uint64_t qSize = q.bundle.totalSize();
+                if (qSize == 0) qSize = q.game.sizeBytes;
+                std::string sz = humanSize(qSize);
                 std::string stateStr;
                 switch (q.state) {
                     case romm::QueueState::Pending: stateStr = "pending"; break;
@@ -1111,10 +1115,7 @@ int main(int argc, char** argv) {
         {
             std::lock_guard<std::mutex> lock(status.mutex);
             status.currentView = Status::View::ERROR;
-        {
-            std::lock_guard<std::mutex> lock(status.mutex);
             status.lastError = cfgError;
-        }
         }
         romm::logLine(cfgError);
     } else {
@@ -1123,6 +1124,22 @@ int main(int argc, char** argv) {
         romm::logLine(" server_url=" + config.serverUrl);
         romm::logLine(" download_dir=" + config.downloadDir);
         romm::logLine(std::string(" fat32_safe=") + (config.fat32Safe ? "true" : "false"));
+        // Load platform prefs and stash in status for planner use.
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.platformPrefs = romm::defaultPlatformPrefs();
+        }
+        {
+            std::string prefsErr;
+            romm::PlatformPrefs prefs;
+            if (romm::loadPlatformPrefs(config.platformPrefsMode, config.platformPrefsPathSd, config.platformPrefsPathRomfs, prefs, prefsErr)) {
+                romm::logLine("Platform prefs loaded (mode=" + config.platformPrefsMode + ")");
+                std::lock_guard<std::mutex> lock(status.mutex);
+                status.platformPrefs = prefs;
+            } else if (!prefsErr.empty()) {
+                romm::logLine("Platform prefs load failed: " + prefsErr);
+            }
+        }
         romm::ensureDirectory(config.downloadDir);
         if (!config.speedTestUrl.empty()) {
             // Kick off a background speed test (20MB range) without blocking UI; join on exit.
@@ -1194,7 +1211,7 @@ int main(int argc, char** argv) {
                 }
             }
             for (const auto& q : status.downloadQueue) {
-                remaining += q.game.sizeBytes;
+                remaining += q.bundle.totalSize();
             }
             uint64_t already = status.totalDownloadedBytes.load();
             status.totalDownloadBytes.store(already + remaining);
@@ -1301,6 +1318,10 @@ int main(int argc, char** argv) {
                                   romm::logLine("Failed to enrich ROM with files: " + err);
                                   break;
                               }
+                              romm::DownloadBundle bundle = romm::buildBundleFromGame(enriched, status.platformPrefs);
+                              if (!bundle.files.empty()) {
+                                  enriched.sizeBytes = bundle.totalSize();
+                              }
                               if (!romm::canEnqueueGame(status, enriched)) {
                                   romm::logLine("ROM already queued this session: " + enriched.title);
                                   gViewTraceFrames = 4;
@@ -1309,15 +1330,19 @@ int main(int argc, char** argv) {
                               {
                                   std::lock_guard<std::mutex> lock(status.mutex);
                                   status.roms[sel] = enriched;
-                                  status.downloadQueue.push_back(romm::QueueItem{enriched, romm::QueueState::Pending, ""});
+                                  romm::QueueItem qi;
+                                  qi.game = enriched;
+                                  qi.bundle = bundle;
+                                  qi.state = romm::QueueState::Pending;
+                                  status.downloadQueue.push_back(std::move(qi));
                                   status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
                                   status.downloadCompleted = false; // new work pending, clear stale banner
                                   status.prevQueueView = Status::View::DETAIL;
                                   status.currentView = Status::View::QUEUE;
                               }
                               recomputeTotals();
-                                  romm::logLine("Queued ROM: " + enriched.title +
-                                                " | Queue size=" + std::to_string(status.downloadQueue.size()));
+                              romm::logLine("Queued ROM: " + enriched.title +
+                                            " | Queue size=" + std::to_string(status.downloadQueue.size()));
                               gViewTraceFrames = 8;
                               viewChangedThisFrame = true;
                           }

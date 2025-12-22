@@ -13,6 +13,15 @@ struct Platform {
     int romCount{0};
 };
 
+struct RomFile {
+    std::string id;
+    std::string name;
+    std::string path;    // optional relative path from API
+    std::string url;
+    uint64_t sizeBytes{0};
+    std::string category; // e.g., "game", "dlc", "update"
+};
+
 struct Game {
     std::string id;
     std::string title;
@@ -23,6 +32,7 @@ struct Game {
     std::string coverUrl;
     uint64_t sizeBytes{0};
     std::string downloadUrl;
+    std::vector<RomFile> files; // full file list from API detail
     bool isLocal{false};
 };
 

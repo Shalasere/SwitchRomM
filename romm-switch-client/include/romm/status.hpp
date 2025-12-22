@@ -1,6 +1,8 @@
 #pragma once
 
 #include "romm/models.hpp"
+#include "romm/platform_prefs.hpp"
+#include "romm/planner.hpp"
 #include <atomic>
 #include <string>
 #include <vector>
@@ -13,8 +15,13 @@ enum class QueueState { Pending, Downloading, Finalizing, Completed, Resumable, 
 
 struct QueueItem {
     Game game;
+    DownloadBundle bundle;
     QueueState state{QueueState::Pending};
     std::string error;
+
+    QueueItem() = default;
+    QueueItem(const Game& g, QueueState s, const std::string& errStr = std::string())
+        : game(g), state(s), error(errStr) {}
 };
 
 struct Status {
@@ -30,6 +37,7 @@ struct Status {
     // Data loaded from API
     std::vector<Platform> platforms;
     std::vector<Game> roms;
+    PlatformPrefs platformPrefs;
 
     // Selection indices for views
     int selectedPlatformIndex{0};

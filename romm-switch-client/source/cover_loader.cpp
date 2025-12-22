@@ -1,5 +1,6 @@
 #include "romm/cover_loader.hpp"
 #include "stb_image.h"
+#include <chrono>
 
 namespace romm {
 
@@ -53,6 +54,13 @@ void CoverLoader::workerLoop() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [&] { return stop_.load() || job_.has_value(); });
+            if (stop_.load()) break;
+            // Coalesce rapid-fire requests: wait a short window for newer jobs, then take the latest.
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            while (!stop_.load()) {
+                if (cv_.wait_until(lock, deadline, [&]{ return stop_.load(); })) break;
+                if (std::chrono::steady_clock::now() >= deadline) break;
+            }
             if (stop_.load()) break;
             job = *job_;
             job_.reset();

@@ -44,6 +44,9 @@ static bool parseEnvStream(std::istream& in, Config& outCfg) {
             outCfg.fat32Safe = (v == "1" || v == "true" || v == "yes");
         } else if (key == "log_level") outCfg.logLevel = toLower(val);
         else if (key == "speed_test_url") outCfg.speedTestUrl = val;
+        else if (key == "platform_prefs_mode") outCfg.platformPrefsMode = val;
+        else if (key == "platform_prefs_sd") outCfg.platformPrefsPathSd = val;
+        else if (key == "platform_prefs_romfs") outCfg.platformPrefsPathRomfs = val;
     }
     return true;
 }
@@ -95,6 +98,9 @@ static bool parseJson(const std::string& path, Config& outCfg, std::string& outE
         if (!lvl.empty()) outCfg.logLevel = toLower(lvl);
     }
     getStr("speed_test_url", outCfg.speedTestUrl);
+    getStr("platform_prefs_mode", outCfg.platformPrefsMode);
+    getStr("platform_prefs_sd", outCfg.platformPrefsPathSd);
+    getStr("platform_prefs_romfs", outCfg.platformPrefsPathRomfs);
     return true;
 }
 
