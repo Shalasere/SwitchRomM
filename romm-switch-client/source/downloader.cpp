@@ -33,7 +33,7 @@ namespace romm {
 
 namespace {
 
-constexpr uint64_t kPartSize = 0xFFFF0000ULL; // DBI/Tinfoil split size
+constexpr uint64_t kDbiPartSizeBytes = 0xFFFF0000ULL; // DBI/Tinfoil split size
 constexpr uint64_t kFreeSpaceMarginBytes = 200ULL * 1024ULL * 1024ULL; // ~200MB margin
 constexpr size_t kPreflightHeaderBuf = 1024;
 constexpr int kSocketRecvBufBytes = 256 * 1024;
@@ -120,16 +120,19 @@ static void parseLengthAndRanges(const std::string& headers, PreflightInfo& info
     }
 }
 
-static Manifest buildManifestFor(const Game& g, uint64_t totalSize) {
+static uint64_t partSizeFor(const Config& cfg, uint64_t totalSize) {
+    return cfg.fat32Safe ? kDbiPartSizeBytes : totalSize;
+}
+
+static Manifest buildManifestFor(const Game& g, uint64_t totalSize, uint64_t partSize) {
     Manifest m;
     m.rommId = g.id;
     m.fileId = g.fileId;
     m.fsName = g.fsName.empty() ? safeName(g.title) : g.fsName;
     m.url = g.downloadUrl;
     m.totalSize = totalSize;
-    m.partSize = kPartSize;
-    if (m.partSize == 0) m.partSize = totalSize; // safety
-    uint64_t partSize = m.partSize;
+    m.partSize = partSize == 0 ? totalSize : partSize;
+    partSize = m.partSize;
     uint64_t remaining = totalSize;
     int idx = 0;
     while (remaining > 0) {
@@ -273,6 +276,7 @@ static bool streamDownload(const std::string& url,
                            bool useRange,
                            uint64_t startOffset,
                            uint64_t totalSize,
+                           uint64_t partSize,
                            const std::string& tmpDir,
                            Status& status,
                            const Config& cfg,
@@ -428,9 +432,9 @@ static bool streamDownload(const std::string& url,
         size_t remaining = len;
         size_t idx = 0;
         while (remaining > 0) {
-            uint64_t partIdx = globalOffset / kPartSize;
-            uint64_t partOff = globalOffset % kPartSize;
-            uint64_t space = kPartSize - partOff;
+            uint64_t partIdx = globalOffset / partSize;
+            uint64_t partOff = globalOffset % partSize;
+            uint64_t space = partSize - partOff;
             size_t toWrite = static_cast<size_t>(std::min<uint64_t>(space, remaining));
             if (currentPart != static_cast<int>(partIdx)) {
                 closePart();
@@ -705,7 +709,7 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
             status.lastDownloadError = "Preflight failed";
         }
         // Persist a manifest with failure reason so restart shows the failure.
-        Manifest failManifest = buildManifestFor(g, g.sizeBytes);
+        Manifest failManifest = buildManifestFor(g, g.sizeBytes, partSizeFor(cfg, g.sizeBytes));
         failManifest.failureReason = "Preflight failed (HEAD/Range)";
         writeManifestFile(tmpDir + "/manifest.json", failManifest);
         return false;
@@ -737,6 +741,7 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     }
 
     uint64_t totalSize = status.currentDownloadSize.load();
+    uint64_t partSize = partSizeFor(cfg, totalSize);
     bool refreshedMetadata = false;
     const uint64_t kTinyContentThreshold = 1024ULL * 1024ULL; // 1 MB
 
@@ -747,13 +752,13 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
     bool needRewrite = true;
     if (haveManifest) {
         // Reuse only if consistent with current download parameters.
-        if (manifestCompatible(manifest, g, totalSize, kPartSize) &&
+        if (manifestCompatible(manifest, g, totalSize, partSize) &&
             manifest.failureReason.empty()) {
             needRewrite = false;
         }
     }
     if (needRewrite) {
-        manifest = buildManifestFor(g, totalSize);
+        manifest = buildManifestFor(g, totalSize, partSize);
         writeManifestFile(manifestPath, manifest);
     }
 
@@ -840,7 +845,7 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
         }
         removeDirRecursive(tmpDir);
         ensureDirectory(tmpDir);
-        manifest = buildManifestFor(g, g.sizeBytes);
+        manifest = buildManifestFor(g, g.sizeBytes, partSizeFor(cfg, g.sizeBytes));
         writeManifestFile(manifestPath, manifest);
         haveBytes = 0;
         creditedExisting = 0;
@@ -897,7 +902,7 @@ static bool downloadOne(Game g, Status& status, const Config& cfg) {
                 " range=" + (useRange ? "true" : "false") +
                 " haveBytes=" + std::to_string(haveBytes) +
                 " totalSize=" + std::to_string(totalSize));
-        okStream = streamDownload(g.downloadUrl, auth, useRange, haveBytes, totalSize, tmpDir, status, cfg, err);
+        okStream = streamDownload(g.downloadUrl, auth, useRange, haveBytes, totalSize, partSize, tmpDir, status, cfg, err);
         if (!okStream) {
             logLine("Download attempt " + std::to_string(attempt + 1) + " failed: " + err);
             // Roll back bytes credited during this failed attempt so overall doesn't exceed 100%.
