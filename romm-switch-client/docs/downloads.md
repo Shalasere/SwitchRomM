@@ -3,7 +3,7 @@
 ### How it works
 - One streaming HTTP GET per ROM. We stop at Content-Length. If preflight sees `Accept-Ranges: bytes`, we resume partial data (including one partial part); otherwise the ROM restarts. **HTTP only; no TLS.** Use on trusted LAN or put TLS in front of RomM.
 - Chunked transfer is not supported for streaming downloads; servers/proxies must send Content-Length. Redirects are not followed.
-- Client-side split into FAT32/DBI parts: `0xFFFF0000` (00, 01, 02 ...) inside a temp dir. Each temp dir has a `manifest.json` with expected part sizes and which parts/partials are complete.
+- Client-side split into FAT32/DBI parts: `0xFFFF0000` (00, 01, 02 ...) inside a temp dir when `fat32_safe=true`. If `fat32_safe=false`, the ROM stays as a single part. Each temp dir has a `manifest.json` with expected part sizes and which parts/partials are complete.
 - Temps live under `<download_dir>/temp/<safe-12>_<id>.tmp/00.part`. After full download:
   - **Single-part**: rename/copy `00.part` to `<download_dir>/<Title or fsName>_<id>.<ext>` (ID-suffixed to avoid collisions); temp folder and manifest removed.
   - **Multi-part**: rename `.part` -> `00/01...`, move temp to `<download_dir>/<Title or fsName>_<id>.<ext>/`, set archive bit so DBI treats it as one title; manifest removed.
