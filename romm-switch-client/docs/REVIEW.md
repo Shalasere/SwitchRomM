@@ -1,12 +1,12 @@
 # RomM Switch Client - Technical Review
 
 Quick review of the C++17/libnx/SDL2 codebase: architecture, flows, risks, and pointers for contributors.  
-Last updated: 2025-12-21 (code mapping is A=Back/B=Select; resume contiguity enforced; ID-suffixed temps/finals; chunked fail-fast; speed test optional; FAT32 splitting toggle).
+Last updated: 2025-12-21 (controls intended A=Select/B=Back; resume contiguity enforced; ID-suffixed temps/finals; chunked fail-fast; speed test optional; FAT32 splitting toggle).
 
 ## Architecture snapshot
 - **Entry/UI**: `source/main.cpp` - SDL init, config load, API fetch, input handling, view transitions, rendering.
 - **State**: `include/romm/status.hpp` (UI/download state), `include/romm/models.hpp` (Platform/Game), `include/romm/config.hpp` (server/auth/download_dir/fat32_safe). Config keys in `docs/config.md`.
-- **Input**: `source/input.cpp` - SDL controller mapping (A=Back, B=Select, Y=Queue, X=Start Downloads, Plus=Quit; UI footers may still show the older A=Select/B=Back text) with debounce; raw JOY ignored; log_level from `.env`. Controls in `docs/controls.md`.
+- **Input**: `source/input.cpp` - SDL controller mapping (A=Select, B=Back, Y=Queue, X=Start Downloads, Plus=Quit; Nintendo layout) with debounce; raw JOY ignored; log_level from `.env`. Controls in `docs/controls.md`.
 - **Data/API**: `source/api.cpp` - minimal HTTP (HTTP-only, Basic auth), JSON via `mini/json.hpp`; fetches `/api/roms/{id}`, picks `.xci/.nsp` via `file_id`, builds `/content/<fs_name>?file_ids=<id>`; Range preflight.
 - **Covers**: cover_url parsed, relative URLs prefixed; reliability in DETAIL view still TODO.
 - **Downloader**: `source/downloader.cpp` - background worker; FAT32 parts (0xFFFF0000) when `fat32_safe=true`, otherwise single-part; temp dirs `<safe-12>_<id>.tmp`; skips complete parts, deletes partials; single-part rename/copy fallback; multi-part archive bit; queue not locked; resume keeps counters aligned; one GET per ROM with large recv buffer; finalized outputs are ID-suffixed/collision-safe.
