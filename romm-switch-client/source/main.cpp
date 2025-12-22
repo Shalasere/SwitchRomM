@@ -1172,10 +1172,7 @@ int main(int argc, char** argv) {
             {
                 std::lock_guard<std::mutex> lock(status.mutex);
                 status.currentView = Status::View::ERROR;
-                {
-                    std::lock_guard<std::mutex> lock(status.mutex);
-                    status.lastError = err;
-                }
+                status.lastError = err;
             }
             romm::logLine("Failed to fetch platforms: " + err);
         }
@@ -1269,6 +1266,14 @@ int main(int argc, char** argv) {
                         std::string err;
                         if (romm::fetchGamesForPlatform(config, pid, status, err)) {
                             std::lock_guard<std::mutex> lock(status.mutex);
+                            // Propagate platform slug from the selected platform (authoritative).
+                            std::string selSlug;
+                            if (sel >= 0 && sel < (int)status.platforms.size()) {
+                                selSlug = status.platforms[sel].slug;
+                            }
+                            if (!selSlug.empty()) {
+                                for (auto& r : status.roms) r.platformSlug = selSlug;
+                            }
                             resetNav();
                             status.currentView = Status::View::ROMS;
                             status.selectedRomIndex = 0;
@@ -1279,10 +1284,7 @@ int main(int argc, char** argv) {
                         } else {
                             std::lock_guard<std::mutex> lock(status.mutex);
                             status.currentView = Status::View::ERROR;
-                            {
-                                std::lock_guard<std::mutex> lock(status.mutex);
-                                status.lastError = err;
-                            }
+                            status.lastError = err;
                             romm::logLine("Failed to fetch ROMs: " + err);
                         }
                     } else if (currentView == Status::View::ROMS) {
@@ -1313,10 +1315,7 @@ int main(int argc, char** argv) {
                               if (!romm::enrichGameWithFiles(config, enriched, err)) {
                                   std::lock_guard<std::mutex> lock(status.mutex);
                                   status.currentView = Status::View::ERROR;
-                                  {
-                                      std::lock_guard<std::mutex> lock(status.mutex);
-                                      status.lastError = err;
-                                  }
+                                  status.lastError = err;
                                   romm::logLine("Failed to enrich ROM with files: " + err);
                                   break;
                               }

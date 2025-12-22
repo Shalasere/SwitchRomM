@@ -13,6 +13,13 @@ static std::string toLower(std::string s) {
     return s;
 }
 
+static std::string normalizeExt(const std::string& ext) {
+    std::string e = toLower(ext);
+    if (e.empty()) return e;
+    if (e.front() != '.') e.insert(e.begin(), '.');
+    return e;
+}
+
 PlatformPrefs defaultPlatformPrefs() {
     PlatformPrefs prefs;
     prefs.version = 1;
@@ -44,7 +51,7 @@ static bool parsePlatformPrefsJson(const std::string& body, PlatformPrefs& out, 
         if (auto ig = def.find("ignore_ext"); ig != def.end() && ig->second.type == mini::Value::Type::Array) {
             prefs.defaultIgnoreExt.clear();
             for (const auto& it : ig->second.array) {
-                if (it.type == mini::Value::Type::String) prefs.defaultIgnoreExt.push_back(toLower(it.str));
+                if (it.type == mini::Value::Type::String) prefs.defaultIgnoreExt.push_back(normalizeExt(it.str));
             }
         }
     }
@@ -58,12 +65,12 @@ static bool parsePlatformPrefsJson(const std::string& body, PlatformPrefs& out, 
             }
             if (auto pe = po.find("prefer_ext"); pe != po.end() && pe->second.type == mini::Value::Type::Array) {
                 for (const auto& it : pe->second.array) {
-                    if (it.type == mini::Value::Type::String) pp.preferExt.push_back(toLower(it.str));
+                    if (it.type == mini::Value::Type::String) pp.preferExt.push_back(normalizeExt(it.str));
                 }
             }
             if (auto ig = po.find("ignore_ext"); ig != po.end() && ig->second.type == mini::Value::Type::Array) {
                 for (const auto& it : ig->second.array) {
-                    if (it.type == mini::Value::Type::String) pp.ignoreExt.push_back(toLower(it.str));
+                    if (it.type == mini::Value::Type::String) pp.ignoreExt.push_back(normalizeExt(it.str));
                 }
             }
             prefs.bySlug[toLower(kv.first)] = pp;

@@ -41,60 +41,35 @@ uint64_t getFreeSpace(const std::string& path) {
 
 bool isGameCompletedOnDisk(const Game& g, const Config& cfg) {
     std::string idSafe = safeName(!g.id.empty() ? g.id : g.fileId);
-    std::string fileIdSafe = g.fileId.empty() ? "" : safeName(g.fileId);
-    std::string baseStem;
-    std::string ext;
-    if (!g.fsName.empty()) {
-        auto dot = g.fsName.rfind('.');
-        if (dot != std::string::npos) {
-            baseStem = g.fsName.substr(0, dot);
-            ext = g.fsName.substr(dot);
-        } else {
-            baseStem = g.fsName;
-        }
-    } else {
-        baseStem = safeName(g.title);
-    }
-    if (baseStem.empty() && !g.id.empty()) baseStem = idSafe;
-    if (baseStem.empty()) baseStem = "rom";
-
-    auto addVariants = [&](const std::string& stem, const std::string& extension, std::vector<std::filesystem::path>& out) {
-        std::filesystem::path dir(cfg.downloadDir);
-        std::string plat = g.platformSlug.empty() ? "unknown" : g.platformSlug;
-        auto pushPath = [&](const std::string& name) {
-            out.push_back(dir / plat / name);
-            // Backward compatibility: also check flat layout.
-            out.push_back(dir / name);
-        };
-        std::string base = stem + extension;
-        pushPath(base);
-        if (!idSafe.empty()) {
-            pushPath(stem + "_" + idSafe + extension);
-            pushPath(stem + "." + idSafe + extension);
-        }
-        if (!fileIdSafe.empty() && fileIdSafe != idSafe) {
-            pushPath(stem + "_" + fileIdSafe + extension);
-            pushPath(stem + "." + fileIdSafe + extension);
-        }
-    };
-
-    std::vector<std::filesystem::path> candidates;
-    if (!ext.empty()) {
-        addVariants(baseStem, ext, candidates);
-    } else {
-        addVariants(baseStem, "", candidates);
-        addVariants(baseStem, ".xci", candidates);
-        addVariants(baseStem, ".nsp", candidates);
-    }
+    std::string romSafe = idSafe.empty() ? safeName(g.title) : idSafe;
+    if (romSafe.empty()) romSafe = "rom";
+    std::string titleSafe = safeName(g.title);
+    std::string folder = romSafe;
+    if (!titleSafe.empty()) folder = titleSafe + "_" + romSafe;
+    std::string plat = g.platformSlug.empty() ? "unknown" : g.platformSlug;
     std::error_code ec;
-    for (const auto& p : candidates) {
-        if (!std::filesystem::exists(p, ec)) continue;
-        if (std::filesystem::is_regular_file(p, ec)) return true;
-        if (std::filesystem::is_directory(p, ec)) {
-            auto it = std::filesystem::directory_iterator(p, ec);
+
+    // Primary new layout: <downloadDir>/<platform>/<title_id>/...
+    std::filesystem::path baseDir = std::filesystem::path(cfg.downloadDir) / plat / folder;
+    if (std::filesystem::exists(baseDir, ec)) {
+        if (std::filesystem::is_regular_file(baseDir, ec)) return true;
+        if (std::filesystem::is_directory(baseDir, ec)) {
+            auto it = std::filesystem::directory_iterator(baseDir, ec);
             if (!ec && it != std::filesystem::end(it)) return true;
         }
     }
+
+    // Backward compatibility: flat layout under <downloadDir>/<platform>/ and <downloadDir>/.
+    std::vector<std::filesystem::path> candidates;
+    candidates.push_back(std::filesystem::path(cfg.downloadDir) / plat / (romSafe + ".xci"));
+    candidates.push_back(std::filesystem::path(cfg.downloadDir) / plat / (romSafe + ".nsp"));
+    candidates.push_back(std::filesystem::path(cfg.downloadDir) / (romSafe + ".xci"));
+    candidates.push_back(std::filesystem::path(cfg.downloadDir) / (romSafe + ".nsp"));
+    for (const auto& p : candidates) {
+        if (!std::filesystem::exists(p, ec)) continue;
+        if (std::filesystem::is_regular_file(p, ec)) return true;
+    }
+
     return false;
 }
 

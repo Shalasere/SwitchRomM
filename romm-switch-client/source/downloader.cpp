@@ -102,6 +102,15 @@ static std::string safeName(const std::string& in) {
     return out;
 }
 
+static std::string romFolderName(const Game& g) {
+    std::string idSafe = safeName(!g.id.empty() ? g.id : g.fileId);
+    if (idSafe.empty() && !g.fsName.empty()) idSafe = safeName(g.fsName);
+    if (idSafe.empty()) idSafe = "rom";
+    std::string titleSafe = safeName(g.title);
+    if (titleSafe.empty()) return idSafe;
+    return titleSafe + "_" + idSafe;
+}
+
 struct PreflightInfo {
     bool supportsRanges{false};
     uint64_t contentLength{0};
@@ -700,8 +709,33 @@ static bool finalizeParts(const std::string& tmpDir, const std::string& finalDir
 }
 
 // Download a single Game into FAT32-safe parts. Resumes completed parts; deletes partial fragments.
+// Sanitize a relative path (may include directories) for output.
+static std::string sanitizeRelativePath(const std::string& rel) {
+    std::string out;
+    out.reserve(rel.size());
+    for (char c : rel) {
+        if (c == '/' || c == '\\') out.push_back('/');
+        else if (c >= 32 && c < 127 && c != ':') out.push_back(c);
+    }
+    // collapse duplicate slashes
+    std::string cleaned;
+    bool prevSlash = false;
+    for (char c : out) {
+        if (c == '/') {
+            if (prevSlash) continue;
+            prevSlash = true;
+            cleaned.push_back(c);
+        } else {
+            prevSlash = false;
+            cleaned.push_back(c);
+        }
+    }
+    while (!cleaned.empty() && cleaned.front() == '/') cleaned.erase(cleaned.begin());
+    return cleaned;
+}
+
 // Download a single file (Game-compatible) into FAT32-safe parts. Resumes completed parts; deletes partial fragments.
-static bool downloadOneFile(Game g, Status& status, const Config& cfg) {
+static bool downloadOneFile(Game g, const DownloadFileSpec* spec, Status& status, const Config& cfg) {
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
         auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
@@ -713,7 +747,7 @@ static bool downloadOneFile(Game g, Status& status, const Config& cfg) {
     if (romSafe.empty()) romSafe = "rom";
     if (fileSafe.empty()) fileSafe = "file";
     // Final outputs live under <downloadDir>/<platform>/<title__id.ext>
-    std::string baseDir = cfg.downloadDir + "/" + platSafe;
+    std::string baseDir = cfg.downloadDir + "/" + platSafe + "/" + romFolderName(g);
     ensureDirectory(baseDir);
     // Temps live under <downloadDir>/temp/<platform>/<romId>/<fileId>/...
     std::string tempRoot = cfg.downloadDir + "/temp/" + platSafe + "/" + romSafe + "/" + fileSafe;
@@ -1016,28 +1050,31 @@ static bool downloadOneFile(Game g, Status& status, const Config& cfg) {
         return false;
     }
 
-    std::string finalBase = safeName(g.title);
-    if (finalBase.empty() && !g.fsName.empty()) finalBase = safeName(g.fsName);
-    if (finalBase.empty()) finalBase = g.id.empty() ? "rom" : g.id;
-    if (!idSuffix.empty()) {
-        finalBase += "_" + idSuffix;
-    }
-    std::string finalName = baseDir + "/" + finalBase;
-    // ensure extension from fsName if present
-    if (!g.fsName.empty()) {
-        auto dot = g.fsName.rfind('.');
-        if (dot != std::string::npos) finalName += g.fsName.substr(dot);
+    // Build final output path
+    std::string relOut;
+    if (spec && !spec->relativePath.empty()) {
+        relOut = sanitizeRelativePath(spec->relativePath);
+    } else if (!g.fsName.empty()) {
+        relOut = sanitizeRelativePath(g.fsName);
+    } else if (spec) {
+        relOut = sanitizeRelativePath(spec->name);
     } else {
-        finalName += ".nsp";
+        relOut = sanitizeRelativePath(g.title);
+        if (relOut.empty()) relOut = "rom";
+        if (!idSuffix.empty()) relOut += "_" + idSuffix;
+        relOut += ".nsp";
     }
+    if (relOut.empty()) relOut = "rom_" + idSuffix + ".nsp";
+    std::filesystem::path finalPath = std::filesystem::path(baseDir) / std::filesystem::path(relOut);
+    ensureDirectory(finalPath.parent_path().string());
     // Avoid overwriting an existing file/dir by disambiguating if path already exists.
     std::error_code finalEc;
-    if (std::filesystem::exists(finalName, finalEc)) {
+    if (std::filesystem::exists(finalPath, finalEc)) {
         std::string suffix = idSuffix.empty() ? "dup" : idSuffix;
-        finalName += "." + suffix;
+        finalPath += ("." + suffix);
     }
-    logLine("Finalize: moving temp to " + finalName);
-    bool okFinal = finalizeParts(tmpDir, finalName);
+    logLine("Finalize: moving temp to " + finalPath.string());
+    bool okFinal = finalizeParts(tmpDir, finalPath.string());
     if (!okFinal) {
         std::lock_guard<std::mutex> lock(status.mutex);
         status.lastDownloadError = "Finalize failed";
@@ -1093,7 +1130,7 @@ static bool downloadBundle(const DownloadBundle& bundle, Status& status, const C
         g.downloadUrl = f.url;
         g.sizeBytes = f.sizeBytes;
         status.currentDownloadIndex.store(static_cast<size_t>(i));
-        if (!downloadOneFile(g, status, cfg)) {
+        if (!downloadOneFile(g, &f, status, cfg)) {
             ok = false;
             break;
         }
@@ -1201,6 +1238,7 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
     struct Found {
         Manifest manifest;
         fs::path dirPath;
+        std::string platformSlug;
     };
     std::vector<Found> manifests;
     for (const auto& entry : fs::recursive_directory_iterator(tempRoot)) {
@@ -1208,7 +1246,19 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         if (entry.path().filename() != "manifest.json") continue;
         Manifest m;
         if (!readManifestFile(entry.path().string(), m)) continue;
-        manifests.push_back({m, entry.path().parent_path()});
+        fs::path parent = entry.path().parent_path();
+        // temp/<platform>/<rom>/<file>/... -> extract platform slug as first element after tempRoot
+        std::string platSlug = "unknown";
+        fs::path rel;
+        std::error_code ec;
+        rel = fs::relative(parent, tempRoot, ec);
+        if (!ec && rel.has_parent_path()) {
+            auto it = rel.begin();
+            if (it != rel.end()) {
+                platSlug = it->string();
+            }
+        }
+        manifests.push_back({m, parent, platSlug});
     }
 
     std::lock_guard<std::mutex> lock(status.mutex);
@@ -1216,14 +1266,24 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         const Manifest& m = found.manifest;
         auto alreadyQ = std::find_if(status.downloadQueue.begin(), status.downloadQueue.end(),
             [&](const QueueItem& qi) {
-                if (!m.rommId.empty()) return qi.game.id == m.rommId;
-                return qi.game.fsName == m.fsName;
+                if (!m.rommId.empty()) {
+                    if (qi.game.id != m.rommId) return false;
+                } else if (qi.game.fsName != m.fsName) {
+                    return false;
+                }
+                if (!m.fileId.empty()) return qi.game.fileId == m.fileId;
+                return true;
             });
         if (alreadyQ != status.downloadQueue.end()) continue;
         auto already = std::find_if(status.downloadHistory.begin(), status.downloadHistory.end(),
             [&](const QueueItem& qi) {
-                if (!m.rommId.empty()) return qi.game.id == m.rommId;
-                return qi.game.fsName == m.fsName;
+                if (!m.rommId.empty()) {
+                    if (qi.game.id != m.rommId) return false;
+                } else if (qi.game.fsName != m.fsName) {
+                    return false;
+                }
+                if (!m.fileId.empty()) return qi.game.fileId == m.fileId;
+                return true;
             });
         if (already != status.downloadHistory.end()) continue;
         QueueItem qi;
@@ -1232,6 +1292,7 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         qi.game.fsName = m.fsName;
         qi.game.downloadUrl = m.url;
         qi.game.sizeBytes = m.totalSize;
+        qi.game.platformSlug = found.platformSlug;
         qi.bundle = bundleFromGame(qi.game);
         qi.state = QueueState::Resumable;
         qi.error = "Resume available";
