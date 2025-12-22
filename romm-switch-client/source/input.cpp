@@ -10,7 +10,11 @@ Action translateEvent(const SDL_Event& e) {
         romm::logDebug("Ignoring SDL_JOYBUTTONDOWN code=" + std::to_string(e.jbutton.button), "INPUT");
         return Action::None;
     }
-    // Map controller buttons to Actions. Physical layout assumed: A=right, B=bottom, X=top, Y=left, Plus=start.
+    // Map controller buttons to Actions. Using positional mapping (SDL hint set to labels=0):
+    // - SDL A (bottom) -> back
+    // - SDL B (right)  -> select
+    // - SDL X (left)   -> queue
+    // - SDL Y (top)    -> start downloads
     if (e.type == SDL_CONTROLLERBUTTONDOWN) {
         static Uint32 lastTicks[SDL_CONTROLLER_BUTTON_MAX] = {};
         Uint32 now = SDL_GetTicks();
@@ -29,10 +33,10 @@ Action translateEvent(const SDL_Event& e) {
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN: act = Action::Down; break;
             case SDL_CONTROLLER_BUTTON_DPAD_LEFT: act = Action::Left; break;
             case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: act = Action::Right; break;
-            case SDL_CONTROLLER_BUTTON_A: act = Action::Back; break;            // physical right on Nintendo
-            case SDL_CONTROLLER_BUTTON_B: act = Action::Select; break;          // physical bottom
-            case SDL_CONTROLLER_BUTTON_Y: act = Action::StartDownload; break;   // physical left -> start downloads
-            case SDL_CONTROLLER_BUTTON_X: act = Action::OpenQueue; break;       // physical top -> queue
+            case SDL_CONTROLLER_BUTTON_A: act = Action::Back; break;            // bottom -> back
+            case SDL_CONTROLLER_BUTTON_B: act = Action::Select; break;          // right -> select/confirm
+            case SDL_CONTROLLER_BUTTON_X: act = Action::OpenQueue; break;       // left -> queue view
+            case SDL_CONTROLLER_BUTTON_Y: act = Action::StartDownload; break;   // top -> start downloads
             case SDL_CONTROLLER_BUTTON_START: act = Action::Quit; break;        // Plus -> exit app
             default: break;
         }

@@ -1055,6 +1055,8 @@ int main(int argc, char** argv) {
     ScrollHold scrollHold;
     auto resetNav = [&]() { status.navStack.clear(); };
 
+    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0"); // use positional mapping; ensures physical A(right)/B(bottom) match expectations
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software"); // enforce software before creating renderer
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
         romm::logLine(std::string("SDL_Init failed: ") + SDL_GetError());
         goto exit_app;
