@@ -33,7 +33,7 @@ Action translateEvent(const SDL_Event& e) {
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN: act = Action::Down; break;
             case SDL_CONTROLLER_BUTTON_DPAD_LEFT: act = Action::Left; break;
             case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: act = Action::Right; break;
-            // SDL codes are positional (A=bottom, B=right, X=left, Y=top).
+            // SDL codes are positional (A=bottom, B=right, X=left, Y=top) with label hint off.
             case SDL_CONTROLLER_BUTTON_A: act = Action::Back; break;            // bottom -> back
             case SDL_CONTROLLER_BUTTON_B: act = Action::Select; break;          // right -> select/confirm
             case SDL_CONTROLLER_BUTTON_X: act = Action::OpenQueue; break;       // top -> queue view

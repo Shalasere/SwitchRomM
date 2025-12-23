@@ -604,14 +604,19 @@ static bool parseGames(const std::string& body,
                        const std::string& serverUrl,
                        std::string& err)
 {
-    auto encodeSpaces = [](const std::string& s) {
+    auto encodePath = [](const std::string& s) {
         std::string out;
         out.reserve(s.size());
-        for (char c : s) {
-            if (c == ' ')
-                out += "%20";
-            else
-                out.push_back(c);
+        for (unsigned char c : s) {
+            if (c == ' ') { out += "%20"; continue; }
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/' || c == ':'
+                || c == '?' || c == '&' || c == '=' || c == '%') {
+                out.push_back(static_cast<char>(c));
+            } else {
+                char buf[4];
+                std::snprintf(buf, sizeof(buf), "%%%02X", c);
+                out.append(buf);
+            }
         }
         return out;
     };
@@ -644,14 +649,14 @@ static bool parseGames(const std::string& body,
         };
         auto absolutizeUrl = [&](const std::string& url) -> std::string {
             if (url.empty()) return url;
-            if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) return encodeSpaces(url);
-            if (!serverUrl.empty() && url.front() == '/') {
-                if (serverUrl.back() == '/')
-                    return encodeSpaces(serverUrl.substr(0, serverUrl.size() - 1) + url);
-                return encodeSpaces(serverUrl + url);
-            }
-            return encodeSpaces(url);
-        };
+        if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) return encodePath(url);
+        if (!serverUrl.empty() && url.front() == '/') {
+            if (serverUrl.back() == '/')
+                return encodePath(serverUrl.substr(0, serverUrl.size() - 1) + url);
+            return encodePath(serverUrl + url);
+        }
+        return encodePath(url);
+    };
 
         if (auto it = o.find("id"); it != o.end())
             g.id = valToString(it->second);
@@ -808,27 +813,32 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
         return false;
     }
 
-    auto encodeSpaces = [](const std::string& s) {
+    auto encodePath = [](const std::string& s) {
         std::string out;
         out.reserve(s.size());
-        for (char c : s) {
-            if (c == ' ')
-                out += "%20";
-            else
-                out.push_back(c);
+        for (unsigned char c : s) {
+            if (c == ' ') { out += "%20"; continue; }
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/' || c == ':'
+                || c == '?' || c == '&' || c == '=' || c == '%') {
+                out.push_back(static_cast<char>(c));
+            } else {
+                char buf[4];
+                std::snprintf(buf, sizeof(buf), "%%%02X", c);
+                out.append(buf);
+            }
         }
         return out;
     };
 
     auto absolutizeUrl = [&](const std::string& url) -> std::string {
         if (url.empty()) return url;
-        if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) return encodeSpaces(url);
+        if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) return encodePath(url);
         if (!cfg.serverUrl.empty() && url.front() == '/') {
             if (cfg.serverUrl.back() == '/')
-                return encodeSpaces(cfg.serverUrl.substr(0, cfg.serverUrl.size() - 1) + url);
-            return encodeSpaces(cfg.serverUrl + url);
+                return encodePath(cfg.serverUrl.substr(0, cfg.serverUrl.size() - 1) + url);
+            return encodePath(cfg.serverUrl + url);
         }
-        return encodeSpaces(url);
+        return encodePath(url);
     };
 
     if (auto covp = obj.find("path_cover_small"); covp != obj.end() && covp->second.type == mini::Value::Type::String) {

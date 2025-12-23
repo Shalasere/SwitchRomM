@@ -16,6 +16,7 @@ struct ParsedHttpResponse {
     bool chunked{false};
     bool acceptRanges{false};
     std::string headersRaw;
+    std::string location;
 };
 
 // Parse HTTP status line + headers (headerBlock excludes the trailing CRLFCRLF).

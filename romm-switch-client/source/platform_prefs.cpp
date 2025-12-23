@@ -73,6 +73,11 @@ static bool parsePlatformPrefsJson(const std::string& body, PlatformPrefs& out, 
                     if (it.type == mini::Value::Type::String) pp.ignoreExt.push_back(normalizeExt(it.str));
                 }
             }
+            if (auto av = po.find("avoid_name_tokens"); av != po.end() && av->second.type == mini::Value::Type::Array) {
+                for (const auto& it : av->second.array) {
+                    if (it.type == mini::Value::Type::String) pp.avoidNameTokens.push_back(toLower(it.str));
+                }
+            }
             prefs.bySlug[toLower(kv.first)] = pp;
         }
     }

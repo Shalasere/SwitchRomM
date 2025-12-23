@@ -11,6 +11,7 @@ struct PlatformPref {
     std::string mode;                  // "single_best", "bundle_best", or "all_files"
     std::vector<std::string> preferExt; // ordered list of preferred extensions (lowercase, with dot)
     std::vector<std::string> ignoreExt; // extensions to skip outright
+    std::vector<std::string> avoidNameTokens; // substrings to strongly penalize
 };
 
 struct PlatformPrefs {

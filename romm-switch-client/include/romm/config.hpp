@@ -26,7 +26,7 @@ struct Config {
     std::string speedTestUrl;
     // Platform prefs source selection
     std::string platformPrefsMode{"auto"};      // auto | sd | romfs
-    std::string platformPrefsPathSd{"sdmc:/switch/romm/platform_prefs.json"};
+    std::string platformPrefsPathSd{"sdmc:/switch/SwitchRomM/platform_prefs.json"};
     std::string platformPrefsPathRomfs{"romfs:/platform_prefs.json"};
 };
 

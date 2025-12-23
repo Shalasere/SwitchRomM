@@ -240,6 +240,9 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
         std::string perrParse;
         if (!parseHttpResponseHeaders(headerBlock, parsed, perrParse)) return false;
         outCode = parsed.statusCode;
+        if (outCode >= 300 && outCode < 400 && !parsed.location.empty()) {
+            logLine("Redirect not supported (" + std::to_string(outCode) + ") to " + parsed.location);
+        }
         return true;
     };
 
@@ -711,27 +714,33 @@ static bool finalizeParts(const std::string& tmpDir, const std::string& finalDir
 // Download a single Game into FAT32-safe parts. Resumes completed parts; deletes partial fragments.
 // Sanitize a relative path (may include directories) for output.
 static std::string sanitizeRelativePath(const std::string& rel) {
-    std::string out;
-    out.reserve(rel.size());
+    // Split on separators, drop "." and "..", collapse empties, clamp segment length.
+    std::vector<std::string> segments;
+    std::string cur;
+    auto flush = [&]() {
+        if (cur.empty()) return;
+        if (cur == "." || cur == "..") {
+            cur.clear();
+            return;
+        }
+        if (cur.size() > 80) cur = cur.substr(0, 80);
+        segments.push_back(cur);
+        cur.clear();
+    };
     for (char c : rel) {
-        if (c == '/' || c == '\\') out.push_back('/');
-        else if (c >= 32 && c < 127 && c != ':') out.push_back(c);
-    }
-    // collapse duplicate slashes
-    std::string cleaned;
-    bool prevSlash = false;
-    for (char c : out) {
-        if (c == '/') {
-            if (prevSlash) continue;
-            prevSlash = true;
-            cleaned.push_back(c);
-        } else {
-            prevSlash = false;
-            cleaned.push_back(c);
+        if (c == '/' || c == '\\') {
+            flush();
+        } else if (c >= 32 && c < 127 && c != ':') {
+            cur.push_back(c);
         }
     }
-    while (!cleaned.empty() && cleaned.front() == '/') cleaned.erase(cleaned.begin());
-    return cleaned;
+    flush();
+    std::string out;
+    for (size_t i = 0; i < segments.size(); ++i) {
+        if (i) out.push_back('/');
+        out += segments[i];
+    }
+    return out;
 }
 
 // Download a single file (Game-compatible) into FAT32-safe parts. Resumes completed parts; deletes partial fragments.
@@ -1067,6 +1076,19 @@ static bool downloadOneFile(Game g, const DownloadFileSpec* spec, Status& status
     if (relOut.empty()) relOut = "rom_" + idSuffix + ".nsp";
     std::filesystem::path finalPath = std::filesystem::path(baseDir) / std::filesystem::path(relOut);
     ensureDirectory(finalPath.parent_path().string());
+    // If the final path already exists and matches expected size, treat as complete.
+    if (spec && spec->sizeBytes > 0) {
+        std::error_code sizeEc;
+        if (std::filesystem::exists(finalPath, sizeEc) && std::filesystem::is_regular_file(finalPath, sizeEc)) {
+            uint64_t existing = static_cast<uint64_t>(std::filesystem::file_size(finalPath, sizeEc));
+            if (!sizeEc && existing == spec->sizeBytes) {
+                logLine("Skipping existing complete file " + finalPath.string());
+                status.totalDownloadedBytes.fetch_add(existing);
+                status.currentDownloadedBytes.store(existing);
+                return true;
+            }
+        }
+    }
     // Avoid overwriting an existing file/dir by disambiguating if path already exists.
     std::error_code finalEc;
     if (std::filesystem::exists(finalPath, finalEc)) {

@@ -70,6 +70,8 @@ bool parseHttpResponseHeaders(const std::string& headerBlock, ParsedHttpResponse
             out.chunked = true;
         } else if (keyLower == "accept-ranges" && valLower.find("bytes") != std::string::npos) {
             out.acceptRanges = true;
+        } else if (keyLower == "location") {
+            out.location = val;
         }
     }
     out.headersRaw = raw.str();
