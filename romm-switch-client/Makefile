@@ -27,8 +27,9 @@ INCLUDES    := include
 ROMFS       := romfs
 
 APP_TITLE   := RomM Switch Client
-APP_AUTHOR  := Homebrew Sample
-APP_VERSION := 0.1.0
+APP_AUTHOR  := Shalasere
+APP_VERSION := 0.2.0
+ICON        := assets/icon.jpg
 
 #---------------------------------------------------------------------------------
 # Options for code generation (align with libnx template)
