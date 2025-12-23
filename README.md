@@ -42,8 +42,7 @@ Put `.env` at `sdmc:/switch/romm_switch_client/.env` (sample):
 SERVER_URL=http://YOUR_ROMM_HOST:PORT      # HTTP only; TLS not supported by the client
 USERNAME=your_username
 PASSWORD=your_password
-PLATFORM=switch
-DOWNLOAD_DIR=sdmc:/romm_cache/switch
+DOWNLOAD_DIR=sdmc:/romm_cache               # base cache; platform/title_id subfolders are created
 HTTP_TIMEOUT_SECONDS=30
 FAT32_SAFE=true
 LOG_LEVEL=info          # debug|info|warn|error
@@ -59,25 +58,25 @@ SPEED_TEST_URL=         # optional; URL to fetch ~40MB (Range) to estimate throu
 
 ### Controls (current mapping)
 - D-Pad: navigate lists
-- A (right): Select / confirm
 - B (bottom): Back
-- Y (left): Queue view / add to queue
-- X (top): Start downloads (from queue)
+- A (right): Select / confirm
+- X (top): Queue view / add to queue
+- Y (left): Start downloads (from queue)
 - Plus/Start: Quit
-Mappings are fixed in `source/input.cpp` (Nintendo layout); UI hints match.
+Mappings are fixed in `source/input.cpp` (positional codes); UI hints match.
 
 ### Queue / status behavior
 - Badges per ROM: hollow (not queued), grey (queued), white (downloading), green (completed on disk), orange (resumable), red (failed).
-- Footer shows status text for the selected ROM; stable position (no shifting).
-- Completed detection checks final output on disk (`fsName`, or `fsName`.xci/.nsp, or multipart dir). Final outputs are suffixed with IDs to avoid collisions; detection still keys off `fsName`.
+- Footer shows status text for the selected ROM.
+- Completed detection checks final output on disk under `<download_dir>/<platform>/<title_id>/...` (flat fallbacks supported).
 - No duplicate enqueue per session; failed/incomplete items can be retried, completed are blocked. Resumable items show as orange and can be retried manually; they are not auto-queued.
-- Temp manifests load into history as Resumable (“Resume available”) and do not auto-queue; 404/tiny preflight triggers one metadata refresh, then fails fast.
+- Temp manifests load into history as Resumable ("Resume available") and do not auto-queue; 404/tiny preflight triggers one metadata refresh, then fails fast.
 
 ### Current client features
 - SDL2 UI (1280x720): platforms -> ROMs -> detail, queue, downloading, error.
-- RomM API: lists platforms/ROMs, then fetches per-ROM file_id (.xci/.nsp).
-- Downloads: one HTTP GET per ROM, FAT32/DBI splits, Range resume, temp isolation, archive bit set.
-- Networking: HTTP only (no TLS); run on trusted LAN or put TLS in front of RomM.
+- RomM API: lists platforms/ROMs, fetches per-ROM files[]; bundles respect relative paths; per-ROM folder naming `title_id`.
+- Downloads: FAT32/DBI splits when enabled, Range resume with contiguity enforcement, temp isolation under `<download_dir>/temp/<platform>/<rom>/<file>/...`, archive bit set for multi-part.
+- Networking: HTTP only (no TLS); run on trusted LAN or put TLS in front of RomM. Redirects are not followed (Location logged).
 - Logging: leveled (`LOG_LEVEL`); debug is noisy.
 - Font: HD44780 bitmap font from `romfs/HD44780_font.txt` with macron glyph.
 
