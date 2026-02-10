@@ -73,6 +73,12 @@ struct Status {
     std::atomic<bool> romsReady{false};
     std::atomic<bool> downloadInProgress{false};
 
+    // Network/IO busy indicator for UI throbber.
+    std::atomic<bool> netBusy{false};
+    std::atomic<uint32_t> netBusySinceMs{0};
+    std::string netBusyWhat;
+    uint64_t romFetchGeneration{0}; // increments to cancel/ignore stale ROM fetches
+
     std::string lastError;
 };
 

@@ -384,6 +384,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         std::string lastDownloadError;
         std::string currentDownloadTitle;
         int currentDownloadIndex{0};
+        bool netBusy{false};
+        uint32_t netBusySinceMs{0};
+        std::string netBusyWhat;
         std::string lastError;
         double lastSpeedMBps{0.0};
     } snap;
@@ -419,6 +422,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.lastDownloadError = status.lastDownloadError;
         snap.currentDownloadTitle = status.currentDownloadTitle;
         snap.currentDownloadIndex = status.currentDownloadIndex.load();
+        snap.netBusy = status.netBusy.load();
+        snap.netBusySinceMs = status.netBusySinceMs.load();
+        snap.netBusyWhat = status.netBusyWhat;
         snap.lastError = status.lastError;
         snap.lastSpeedMBps = status.lastSpeedMBps;
 
@@ -585,7 +591,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     }
     SDL_RenderClear(renderer);
 
-    auto drawHeaderBar = [&](const std::string& left, const std::string& right) {
+    auto drawHeaderBar = [&](const std::string& left, const std::string& right, bool showThrobber) {
         SDL_Rect bar{0, 0, 1280, 52};
         SDL_SetRenderDrawColor(renderer, headerBar.r, headerBar.g, headerBar.b, 255);
         SDL_RenderFillRect(renderer, &bar);
@@ -599,6 +605,20 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             int x = 1280 - 72 - textW; // leave extra padding on the right to avoid clipping battery/time
             if (x < 32) x = 32;
             drawText(renderer, x, 14, right, fg, 2);
+
+            if (showThrobber) {
+                static const char* frames[] = {"|", "/", "-", "\\"};
+                Uint32 t = SDL_GetTicks();
+                const char* frame = frames[(t / 150) % 4];
+                std::string thr = std::string("[") + frame + "]";
+                int thrW = static_cast<int>(thr.size()) * charW;
+                int tx = x - 24 - thrW; // place in dead space between left title and right sys info
+                // Keep a minimum gap from left-side header to avoid overlap.
+                int leftW = static_cast<int>(left.size()) * charW;
+                int minX = 32 + leftW + 24;
+                if (tx < minX) tx = minX;
+                drawText(renderer, tx, 14, thr, fg, 2);
+            }
         }
     };
 
@@ -786,12 +806,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     std::string header;
     std::string controls;
     if (snap.view == Status::View::PLATFORMS) {
-        header = "PLATFORMS count=" + std::to_string(snap.platforms.size()) +
-                 " sel=" + std::to_string(selPlat);
+        header = "PLATFORMS  Count: " + std::to_string(snap.platforms.size());
         if (selPlat >= 0 && selPlat < (int)snap.platforms.size()) {
             const auto& p = snap.platforms[selPlat];
-            if (!p.slug.empty()) header += " slug=" + ellipsize(p.slug, 14);
-            else if (!p.id.empty()) header += " id=" + ellipsize(p.id, 10);
+            if (!p.slug.empty()) header += "  RomM Platform: " + ellipsize(p.slug, 16);
+            else if (!p.id.empty()) header += "  RomM Platform: " + ellipsize(p.id, 16);
         }
         SDL_Color fg{255,255,255,255};
         int listHeight = static_cast<int>(snap.platforms.size()) * 26 + 32;
@@ -810,23 +829,15 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         }
     } else if (snap.view == Status::View::ROMS) {
         std::string platName = snap.currentPlatformName;
-        std::string platSlug = snap.currentPlatformSlug;
         if (platName.empty() && selPlat >= 0 && selPlat < (int)snap.platforms.size()) {
             platName = snap.platforms[selPlat].name;
-        }
-        if (platSlug.empty() && selPlat >= 0 && selPlat < (int)snap.platforms.size()) {
-            platSlug = snap.platforms[selPlat].slug;
         }
         std::string platLabel;
         if (!platName.empty()) {
             platLabel = ellipsize(platName, 18);
-            if (!platSlug.empty()) {
-                platLabel += ":" + ellipsize(platSlug, 12);
-            }
         }
         header = "ROMS " + (platLabel.empty() ? "" : ("[" + platLabel + "] ")) +
-                 "count=" + std::to_string(snap.romsCount) +
-                 " sel=" + std::to_string(selRom);
+                 "Count: " + std::to_string(snap.romsCount);
         SDL_Color fg{255,255,255,255};
         auto drawFilledCircle = [&](int cx, int cy, int r, SDL_Color c) {
             SDL_SetRenderDrawColor(renderer, c.r, c.g, c.b, c.a);
@@ -911,7 +922,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         SDL_SetRenderDrawColor(renderer, 12, 90, 120, 180);
         SDL_RenderFillRect(renderer, &listBg);
         if (snap.romsCount == 0) {
-            drawText(renderer, 64, 96, "No ROMs found for this platform.", fg, 2);
+            if (snap.netBusy) {
+                drawText(renderer, 64, 96, "Loading ROM list...", fg, 2);
+            } else {
+                drawText(renderer, 64, 96, "No ROMs found for this platform.", fg, 2);
+            }
         }
         if (selRom >= 0 && selRom < (int)snap.romsCount && !snap.romsVisible.empty()) {
             size_t selOffset = 0;
@@ -992,8 +1007,8 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         }
     } else if (snap.view == Status::View::QUEUE) {
         uint64_t total = snap.queueTotalBytes;
-        header = "QUEUE items=" + std::to_string(snap.queueCount) +
-                 " total=" + humanSize(snap.queueTotalBytes);
+        header = "QUEUE  Items: " + std::to_string(snap.queueCount) +
+                 "  Total: " + humanSize(snap.queueTotalBytes);
         SDL_Color fg{255,255,255,255};
         size_t visible = snap.queueVisible.size();
         size_t start = snap.queueStart;
@@ -1040,7 +1055,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             }
         }
     } else if (snap.view == Status::View::DOWNLOADING) {
-        header = "DOWNLOADING sel=" + std::to_string(snap.currentDownloadIndex);
+        header = "DOWNLOADING";
     } else if (snap.view == Status::View::ERROR) {
         header = "ERROR";
         SDL_Color fg{255,255,255,255};
@@ -1170,7 +1185,14 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     }
 
     if (!header.empty()) {
-        drawHeaderBar(header, rightInfo);
+        bool showThr = false;
+        if (snap.netBusy) {
+            Uint32 nowMs = SDL_GetTicks();
+            if (nowMs >= snap.netBusySinceMs && (nowMs - snap.netBusySinceMs) >= 2000) {
+                showThr = true;
+            }
+        }
+        drawHeaderBar(header, rightInfo, showThr);
     }
     if (!controls.empty()) {
         // Draw only the left footer text here; status is drawn with fixed positioning below.
@@ -1200,6 +1222,8 @@ int main(int argc, char** argv) {
     setvbuf(stderr, nullptr, _IONBF, 0);
     socketInitializeDefault();
     std::thread speedTestThread;
+    std::thread romFetchThread;
+    std::atomic<bool> romFetchRunning{false};
 #if HAS_NXLINK
     int nxfd = nxlinkStdio();
     if (nxfd >= 0) {
@@ -1238,12 +1262,135 @@ int main(int argc, char** argv) {
     int numJoy = 0;
     Config config;
     Status status;
+    struct PendingRomFetch {
+        std::string pid;
+        std::string slug;
+        std::string name;
+    };
+    std::optional<PendingRomFetch> pendingRomFetch;
     std::string cfgError;
     bool running = true;
     ScrollHold scrollHold;
     auto resetNav = [&]() { status.navStack.clear(); };
 
-    // Force positional mapping (Xbox-style) so we can map buttons explicitly.
+    // Start an async ROM fetch so the UI can keep rendering (including throbber) while HTTP runs.
+    // Declared early to avoid crossing initialization with goto exit paths.
+    auto startRomFetch = [&](const PendingRomFetch& req) -> bool {
+        if (romFetchRunning.load()) return false;
+        if (romFetchThread.joinable()) {
+            romFetchThread.join();
+        }
+
+        uint64_t myGen = 0;
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.netBusy.store(true);
+            status.netBusySinceMs.store(SDL_GetTicks());
+            status.netBusyWhat = "Fetching ROMs...";
+            status.romFetchGeneration++;
+            myGen = status.romFetchGeneration;
+        }
+
+        romm::logLine("Async fetch ROMs for platform id=" + req.pid +
+                      (req.slug.empty() ? "" : " slug=" + req.slug));
+
+        Config cfgCopy = config;
+        romFetchRunning.store(true);
+        romFetchThread = std::thread([&status, cfgCopy, req, myGen, &romFetchRunning]() mutable {
+            struct RunningGuard {
+                std::atomic<bool>* running;
+                ~RunningGuard() { running->store(false); }
+            } guard{&romFetchRunning};
+
+            romm::Status tmp;
+            std::string err;
+            if (!romm::fetchGamesForPlatform(cfgCopy, req.pid, tmp, err)) {
+                romm::logLine("Failed to fetch ROMs: " + err);
+                std::lock_guard<std::mutex> lock(status.mutex);
+                if (status.romFetchGeneration != myGen) return;
+                status.netBusy.store(false);
+                status.netBusyWhat.clear();
+                status.currentView = Status::View::ERROR;
+                status.lastError = err;
+                return;
+            }
+
+            std::vector<romm::Game> games = std::move(tmp.roms);
+
+            // Guardrail: Some server versions may ignore platform_id filter and return all ROMs.
+            if (!req.pid.empty()) {
+                bool anyDifferentId = false;
+                bool anyHasId = false;
+                for (const auto& r : games) {
+                    if (!r.platformId.empty()) {
+                        anyHasId = true;
+                        if (r.platformId != req.pid) { anyDifferentId = true; break; }
+                    }
+                }
+                if (anyHasId && anyDifferentId) {
+                    size_t before = games.size();
+                    games.erase(std::remove_if(games.begin(), games.end(),
+                        [&](const romm::Game& r) {
+                            return !r.platformId.empty() && r.platformId != req.pid;
+                        }),
+                        games.end());
+                    romm::logLine("Client-side filtered ROMs by platform_id: " +
+                                  std::to_string(before) + " -> " + std::to_string(games.size()));
+                }
+            }
+
+            if (!req.slug.empty()) {
+                bool anyDifferentSlug = false;
+                bool anyHasSlug = false;
+                for (const auto& r : games) {
+                    if (!r.platformSlug.empty()) {
+                        anyHasSlug = true;
+                        if (r.platformSlug != req.slug) { anyDifferentSlug = true; break; }
+                    }
+                }
+                if (anyHasSlug && anyDifferentSlug) {
+                    size_t before = games.size();
+                    games.erase(std::remove_if(games.begin(), games.end(),
+                        [&](const romm::Game& r) {
+                            return !r.platformSlug.empty() && r.platformSlug != req.slug;
+                        }),
+                        games.end());
+                    romm::logLine("Client-side filtered ROMs by platform_slug: " +
+                                  std::to_string(before) + " -> " + std::to_string(games.size()));
+                }
+                // Only fill missing slugs; don't overwrite per-ROM metadata.
+                for (auto& r : games) {
+                    if (r.platformSlug.empty()) r.platformSlug = req.slug;
+                }
+            }
+
+            const size_t finalCount = games.size();
+            std::string firstTitle;
+            if (!games.empty()) firstTitle = games[0].title;
+
+            {
+                std::lock_guard<std::mutex> lock(status.mutex);
+                if (status.romFetchGeneration != myGen) return;
+                status.roms = std::move(games);
+                status.romsRevision++;
+                status.currentPlatformId = req.pid;
+                status.currentPlatformSlug = req.slug;
+                status.currentPlatformName = req.name;
+                status.selectedRomIndex = 0;
+                status.navStack.clear();
+                status.currentView = Status::View::ROMS;
+                status.netBusy.store(false);
+                status.netBusyWhat.clear();
+            }
+
+            romm::logLine("Fetched ROMs count=" + std::to_string(finalCount) +
+                          (firstTitle.empty() ? "" : " first=" + firstTitle));
+        });
+        return true;
+    };
+
+    // Use positional button codes on Switch (A=bottom, B=right, X=left, Y=top).
+    // We keep the UI text in Nintendo labels, but map input based on what SDL actually reports.
     SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0", SDL_HINT_OVERRIDE);
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software"); // enforce software before creating renderer
@@ -1356,6 +1503,19 @@ int main(int argc, char** argv) {
     while (running && appletMainLoop()) {
         // If a previous worker has finished, join and release it so we can start a fresh session.
         romm::reapDownloadWorkerIfDone();
+        if (!romFetchRunning.load() && romFetchThread.joinable()) {
+            romFetchThread.join();
+            if (pendingRomFetch) {
+                PendingRomFetch req = *pendingRomFetch;
+                pendingRomFetch.reset();
+                startRomFetch(req);
+            } else {
+                // If we cancelled a ROM fetch, ensure the throbber clears once the stale thread ends.
+                std::lock_guard<std::mutex> lock(status.mutex);
+                status.netBusy.store(false);
+                status.netBusyWhat.clear();
+            }
+        }
         processCoverResult(renderer);
         bool viewChangedThisFrame = false;
         // TODO(nav): extract view transitions into a ViewController and align hints with mapping.
@@ -1434,80 +1594,32 @@ int main(int argc, char** argv) {
                             romm::logLine("Select on PLATFORMS but index out of range.");
                             break;
                         }
-                        romm::logLine("Fetching ROMs for platform id=" + pid);
-                        std::string err;
-                            if (romm::fetchGamesForPlatform(config, pid, status, err)) {
-                                std::lock_guard<std::mutex> lock(status.mutex);
-                            // Propagate platform slug from the selected platform (authoritative).
-                            std::string selSlug;
-                            std::string selName;
+                        std::string selSlug;
+                        std::string selName;
+                        {
+                            std::lock_guard<std::mutex> lock(status.mutex);
                             if (sel >= 0 && sel < (int)status.platforms.size()) {
                                 selSlug = status.platforms[sel].slug;
                                 selName = status.platforms[sel].name;
                             }
-                            // Some server versions may ignore platform_id filter and return all ROMs.
-                            // If the payload includes per-ROM platform metadata, filter client-side as a guardrail.
-                            if (!pid.empty()) {
-                                bool anyDifferentId = false;
-                                bool anyHasId = false;
-                                for (const auto& r : status.roms) {
-                                    if (!r.platformId.empty()) {
-                                        anyHasId = true;
-                                        if (r.platformId != pid) { anyDifferentId = true; break; }
-                                    }
-                                }
-                                if (anyHasId && anyDifferentId) {
-                                    size_t before = status.roms.size();
-                                    status.roms.erase(std::remove_if(status.roms.begin(), status.roms.end(),
-                                        [&](const romm::Game& r) {
-                                            return !r.platformId.empty() && r.platformId != pid;
-                                        }),
-                                        status.roms.end());
-                                    romm::logLine("Client-side filtered ROMs by platform_id: " +
-                                                  std::to_string(before) + " -> " + std::to_string(status.roms.size()));
-                                }
-                            }
-                                if (!selSlug.empty()) {
-                                bool anyDifferentSlug = false;
-                                bool anyHasSlug = false;
-                                for (const auto& r : status.roms) {
-                                    if (!r.platformSlug.empty()) {
-                                        anyHasSlug = true;
-                                        if (r.platformSlug != selSlug) { anyDifferentSlug = true; break; }
-                                    }
-                                }
-                                if (anyHasSlug && anyDifferentSlug) {
-                                    size_t before = status.roms.size();
-                                    status.roms.erase(std::remove_if(status.roms.begin(), status.roms.end(),
-                                        [&](const romm::Game& r) {
-                                            return !r.platformSlug.empty() && r.platformSlug != selSlug;
-                                        }),
-                                        status.roms.end());
-                                    romm::logLine("Client-side filtered ROMs by platform_slug: " +
-                                                  std::to_string(before) + " -> " + std::to_string(status.roms.size()));
-                                }
-                                // Only fill missing slugs; don't overwrite per-ROM metadata.
-                                    for (auto& r : status.roms) {
-                                        if (r.platformSlug.empty()) r.platformSlug = selSlug;
-                                    }
-                                }
-                                status.romsRevision++;
-                                status.currentPlatformId = pid;
-                                status.currentPlatformSlug = selSlug;
-                                status.currentPlatformName = selName;
-                                resetNav();
-                                status.currentView = Status::View::ROMS;
-                            status.selectedRomIndex = 0;
-                            gViewTraceFrames = 8;
-                            romm::logLine("Fetched ROMs count=" + std::to_string(status.roms.size()) +
-                                          (status.roms.empty() ? "" : " first=" + status.roms[0].title));
-                            viewChangedThisFrame = true;
-                        } else {
-                            std::lock_guard<std::mutex> lock(status.mutex);
-                            status.currentView = Status::View::ERROR;
-                            status.lastError = err;
-                            romm::logLine("Failed to fetch ROMs: " + err);
                         }
+                        PendingRomFetch req{pid, selSlug, selName};
+                        // Async fetch so UI can keep rendering (including throbber) while the HTTP call runs.
+                        if (romFetchRunning.load()) {
+                            // Cancel the in-flight fetch (ignore its result) and queue the new selection.
+                            pendingRomFetch = req;
+                            {
+                                std::lock_guard<std::mutex> lock(status.mutex);
+                                status.romFetchGeneration++;
+                                status.netBusy.store(true);
+                                status.netBusySinceMs.store(SDL_GetTicks());
+                                status.netBusyWhat = "Switching platform...";
+                            }
+                            romm::logLine("ROM fetch running; queued platform id=" + pid);
+                        } else {
+                            startRomFetch(req);
+                        }
+                        viewChangedThisFrame = true;
                     } else if (currentView == Status::View::ROMS) {
                         {
                             std::lock_guard<std::mutex> lock(status.mutex);
@@ -1583,6 +1695,15 @@ int main(int argc, char** argv) {
                     romm::logLine(std::string("Back pressed in view=") + viewName(cur));
                     {
                         std::lock_guard<std::mutex> lock(status.mutex);
+                        // Allow cancelling a platform ROM fetch while staying on PLATFORMS.
+                        if (cur == Status::View::PLATFORMS && status.netBusy.load()) {
+                            pendingRomFetch.reset();
+                            status.romFetchGeneration++;
+                            status.netBusy.store(false);
+                            status.netBusyWhat.clear();
+                            romm::logLine("Cancelled ROM fetch.");
+                            viewChangedThisFrame = true;
+                        } else
                         if (cur == Status::View::ROMS) {
                             status.currentView = Status::View::PLATFORMS;
                             resetNav();
@@ -1738,6 +1859,9 @@ exit_app:
     romm::stopDownloadWorker();
     if (speedTestThread.joinable()) {
         speedTestThread.join();
+    }
+    if (romFetchThread.joinable()) {
+        romFetchThread.join();
     }
     // Restore default sleep/dim behavior on exit.
     appletSetMediaPlaybackState(false);
