@@ -1180,29 +1180,31 @@ static void workerLoop() {
             st->totalDownloadBytes.fetch_add(sz);
         }
         for (auto& q : st->downloadQueue) q.state = QueueState::Pending;
+        st->downloadQueueRevision++;
     }
     logLine("Worker start, total bytes=" + std::to_string(st->totalDownloadBytes.load()));
     while (true) {
         QueueItem next;
-        {
-            std::lock_guard<std::mutex> lock(st->mutex);
-            if (st->downloadQueue.empty() || gCtx.stopRequested.load()) break;
-            st->lastDownloadFailed.store(false);
-            st->lastDownloadError.clear();
-            st->currentDownloadIndex.store(0);
-            next = st->downloadQueue.front(); // copy
-            if (next.bundle.files.empty()) {
-                next.bundle = bundleFromGame(next.game);
-                st->downloadQueue.front().bundle = next.bundle;
+            {
+                std::lock_guard<std::mutex> lock(st->mutex);
+                if (st->downloadQueue.empty() || gCtx.stopRequested.load()) break;
+                st->lastDownloadFailed.store(false);
+                st->lastDownloadError.clear();
+                st->currentDownloadIndex.store(0);
+                next = st->downloadQueue.front(); // copy
+                if (next.bundle.files.empty()) {
+                    next.bundle = bundleFromGame(next.game);
+                    st->downloadQueue.front().bundle = next.bundle;
+                }
+                // Prime UI fields for the next item.
+                uint64_t bundleSize = next.bundle.totalSize();
+                if (bundleSize == 0) bundleSize = next.game.sizeBytes;
+                st->currentDownloadTitle = next.bundle.title.empty() ? next.game.title : next.bundle.title;
+                st->currentDownloadSize.store(bundleSize);
+                st->currentDownloadedBytes.store(0);
+                st->downloadQueue.front().state = QueueState::Downloading;
+                st->downloadQueueRevision++;
             }
-            // Prime UI fields for the next item.
-            uint64_t bundleSize = next.bundle.totalSize();
-            if (bundleSize == 0) bundleSize = next.game.sizeBytes;
-            st->currentDownloadTitle = next.bundle.title.empty() ? next.game.title : next.bundle.title;
-            st->currentDownloadSize.store(bundleSize);
-            st->currentDownloadedBytes.store(0);
-            st->downloadQueue.front().state = QueueState::Downloading;
-        }
         if (!downloadBundle(next.bundle, *st, cfg)) {
             bool wasStopped = gCtx.stopRequested.load();
             logLine(std::string("Download failed or stopped for ") + next.game.title +
@@ -1217,11 +1219,15 @@ static void workerLoop() {
                         st->downloadQueue.front().error = "Cancelled";
                         st->downloadHistory.push_back(st->downloadQueue.front());
                         st->downloadQueue.erase(st->downloadQueue.begin());
+                        st->downloadQueueRevision++;
+                        st->downloadHistoryRevision++;
                     } else {
                         st->downloadQueue.front().state = QueueState::Failed;
                         st->downloadQueue.front().error = st->lastDownloadError;
                         st->downloadHistory.push_back(st->downloadQueue.front());
                         st->downloadQueue.erase(st->downloadQueue.begin());
+                        st->downloadQueueRevision++;
+                        st->downloadHistoryRevision++;
                     }
                 }
                 recomputeTotals(*st);
@@ -1234,6 +1240,8 @@ static void workerLoop() {
                 st->downloadQueue.front().state = QueueState::Completed;
                 st->downloadHistory.push_back(st->downloadQueue.front());
                 st->downloadQueue.erase(st->downloadQueue.begin());
+                st->downloadQueueRevision++;
+                st->downloadHistoryRevision++;
             }
             recomputeTotals(*st);
         }
@@ -1331,6 +1339,7 @@ bool loadLocalManifests(Status& status, const Config& cfg, std::string& outError
         }
         status.downloadHistory.push_back(qi);
     }
+    if (!manifests.empty()) status.downloadHistoryRevision++;
     return true;
 }
 

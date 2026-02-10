@@ -361,10 +361,16 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     struct Snapshot {
         Status::View view{Status::View::PLATFORMS};
         std::vector<romm::Platform> platforms;
-        std::vector<romm::Game> roms;
+        std::vector<romm::Game> romsVisible;
+        size_t romsStart{0};
+        size_t romsCount{0};
         uint64_t romsRevision{0};
-        std::vector<romm::QueueItem> downloadQueue;
-        std::vector<romm::QueueItem> downloadHistory;
+        std::vector<romm::QueueItem> queueVisible;
+        size_t queueStart{0};
+        size_t queueCount{0};
+        uint64_t queueTotalBytes{0};
+        uint64_t downloadQueueRevision{0};
+        uint64_t downloadHistoryRevision{0};
         int selectedPlatformIndex{0};
         int selectedRomIndex{0};
         int selectedQueueIndex{0};
@@ -382,14 +388,24 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         double lastSpeedMBps{0.0};
     } snap;
 
+    static std::unordered_map<std::string, romm::QueueState> sQueueStateById;
+    static uint64_t sQueueRev = 0;
+    static uint64_t sHistRev = 0;
+    std::vector<romm::QueueItem> rebuildQueueCopy;
+    std::vector<romm::QueueItem> rebuildHistCopy;
+    uint64_t rebuildQueueRev = 0;
+    uint64_t rebuildHistRev = 0;
+    bool needRebuildQueueState = false;
+
     {
         std::lock_guard<std::mutex> guard(status.mutex);
         snap.view = status.currentView;
-        snap.platforms = status.platforms;
-        snap.roms = status.roms;
+        snap.platforms = status.platforms; // platforms are typically small; copy is OK
         snap.romsRevision = status.romsRevision;
-        snap.downloadQueue = status.downloadQueue;
-        snap.downloadHistory = status.downloadHistory;
+        snap.romsCount = status.roms.size();
+        snap.queueCount = status.downloadQueue.size();
+        snap.downloadQueueRevision = status.downloadQueueRevision;
+        snap.downloadHistoryRevision = status.downloadHistoryRevision;
         snap.selectedPlatformIndex = status.selectedPlatformIndex;
         snap.selectedRomIndex = status.selectedRomIndex;
         snap.selectedQueueIndex = status.selectedQueueIndex;
@@ -405,25 +421,117 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.currentDownloadIndex = status.currentDownloadIndex.load();
         snap.lastError = status.lastError;
         snap.lastSpeedMBps = status.lastSpeedMBps;
-    }
-    // Populate on-disk completion set outside the status lock (uses config).
-    // Cache results and rescan only when ROM list changes or on a timed interval to avoid per-frame disk IO.
-    static std::unordered_map<std::string, bool> completedCache;
-    static uint64_t cacheRevision = 0;
-    static std::chrono::steady_clock::time_point lastScanSteady{};
 
-    auto nowSteady = std::chrono::steady_clock::now();
-    bool needScan = (snap.romsRevision != cacheRevision) || (nowSteady - lastScanSteady > std::chrono::seconds(2));
-    if (needScan) {
-        completedCache.clear();
-        cacheRevision = snap.romsRevision;
-        lastScanSteady = nowSteady;
-        for (const auto& g : snap.roms) {
-            std::string key = !g.id.empty() ? g.id : g.fsName;
-            bool found = isGameCompletedOnDisk(g, config);
-            if (!key.empty()) completedCache[key] = found;
+        // Copy only the visible slice for large lists to avoid per-frame O(N) copies.
+        if (snap.view == Status::View::ROMS) {
+            const size_t visible = status.roms.size() < 18 ? status.roms.size() : 18;
+            size_t start = 0;
+            int sel = status.selectedRomIndex;
+            if (sel < 0) sel = 0;
+            if (!status.roms.empty() && sel >= (int)status.roms.size()) sel = (int)status.roms.size() - 1;
+            if (!status.roms.empty()) {
+                if (sel >= (int)(start + visible)) start = (size_t)sel - visible + 1;
+                if (sel < (int)start) start = (size_t)sel;
+                if (start + visible > status.roms.size()) start = status.roms.size() - visible;
+            }
+            snap.romsStart = start;
+            snap.romsVisible.clear();
+            snap.romsVisible.reserve(visible);
+            for (size_t i = 0; i < visible; ++i) {
+                snap.romsVisible.push_back(status.roms[start + i]);
+            }
+        } else if (snap.view == Status::View::DETAIL) {
+            int sel = status.selectedRomIndex;
+            if (sel < 0) sel = 0;
+            if (!status.roms.empty() && sel >= (int)status.roms.size()) sel = (int)status.roms.size() - 1;
+            if (sel >= 0 && sel < (int)status.roms.size()) {
+                snap.romsStart = (size_t)sel;
+                snap.romsVisible.clear();
+                snap.romsVisible.push_back(status.roms[(size_t)sel]);
+            }
+        }
+
+        if (snap.view == Status::View::QUEUE || snap.view == Status::View::DOWNLOADING) {
+            const size_t visible = status.downloadQueue.size() < 18 ? status.downloadQueue.size() : 18;
+            size_t start = 0;
+            int sel = status.selectedQueueIndex;
+            if (sel < 0) sel = 0;
+            if (!status.downloadQueue.empty() && sel >= (int)status.downloadQueue.size()) sel = (int)status.downloadQueue.size() - 1;
+            if (!status.downloadQueue.empty()) {
+                if (sel >= (int)(start + visible)) start = (size_t)sel - visible + 1;
+                if (sel < (int)start) start = (size_t)sel;
+                if (start + visible > status.downloadQueue.size()) start = status.downloadQueue.size() - visible;
+            }
+            snap.queueStart = start;
+            snap.queueVisible.clear();
+            snap.queueVisible.reserve(visible);
+            snap.queueTotalBytes = 0;
+            for (size_t i = 0; i < visible; ++i) {
+                snap.queueVisible.push_back(status.downloadQueue[start + i]);
+            }
+            // Total size is small enough to compute under lock; avoids copying the full queue.
+            for (const auto& q : status.downloadQueue) {
+                snap.queueTotalBytes += q.game.sizeBytes;
+            }
+        }
+
+        // Rebuild queue state lookup only when queue/history actually change.
+        if (snap.downloadQueueRevision != sQueueRev || snap.downloadHistoryRevision != sHistRev) {
+            rebuildQueueCopy = status.downloadQueue;
+            rebuildHistCopy = status.downloadHistory;
+            rebuildQueueRev = snap.downloadQueueRevision;
+            rebuildHistRev = snap.downloadHistoryRevision;
+            needRebuildQueueState = true;
         }
     }
+    if (needRebuildQueueState) {
+        std::unordered_map<std::string, romm::QueueState> tmp;
+        tmp.reserve(rebuildQueueCopy.size() + rebuildHistCopy.size());
+        for (const auto& qi : rebuildHistCopy) {
+            if (qi.state == romm::QueueState::Failed ||
+                qi.state == romm::QueueState::Completed ||
+                qi.state == romm::QueueState::Resumable ||
+                qi.state == romm::QueueState::Cancelled ||
+                qi.state == romm::QueueState::Finalizing) {
+                tmp[qi.game.id] = qi.state;
+            }
+        }
+        for (const auto& qi : rebuildQueueCopy) {
+            tmp[qi.game.id] = qi.state; // live queue overrides history
+        }
+        sQueueStateById.swap(tmp);
+        sQueueRev = rebuildQueueRev;
+        sHistRev = rebuildHistRev;
+    }
+
+    // Completion checks are filesystem-expensive; cache per-ROM results on demand for visible rows only.
+    struct CompletedEntry {
+        bool completed{false};
+        std::chrono::steady_clock::time_point at{};
+    };
+    static std::unordered_map<std::string, CompletedEntry> completedCache;
+    static uint64_t completedCacheRevision = 0;
+    if (completedCacheRevision != snap.romsRevision) {
+        completedCache.clear();
+        completedCacheRevision = snap.romsRevision;
+    }
+    auto nowSteady = std::chrono::steady_clock::now();
+    auto completionKey = [](const romm::Game& g) -> std::string {
+        return !g.id.empty() ? g.id : g.fsName;
+    };
+    auto isCompletedOnDiskCached = [&](const romm::Game& g) -> bool {
+        std::string key = completionKey(g);
+        if (key.empty()) return false;
+        auto it = completedCache.find(key);
+        if (it != completedCache.end()) {
+            if (nowSteady - it->second.at < std::chrono::seconds(5)) {
+                return it->second.completed;
+            }
+        }
+        bool found = isGameCompletedOnDisk(g, config);
+        completedCache[key] = CompletedEntry{found, nowSteady};
+        return found;
+    };
 
     if (gViewTraceFrames > 0) {
         romm::logDebug("Render trace view=" + std::string(viewName(snap.view)) +
@@ -530,7 +638,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     const bool downloadsDone =
         snap.downloadCompleted ||
         (totalBytes > 0 && totalDone >= totalBytes &&
-         snap.downloadQueue.empty() && !snap.downloadWorkerRunning);
+         snap.queueCount == 0 && !snap.downloadWorkerRunning);
 
     // If we have a speed reading, prepend it to the right-hand status.
     std::vector<std::string> rightParts;
@@ -615,12 +723,16 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
 
     int selPlat = snap.selectedPlatformIndex;
     int selRom = snap.selectedRomIndex;
+    int selQueue = snap.selectedQueueIndex;
     if (selPlat < 0) selPlat = 0;
     if (selPlat >= (int)snap.platforms.size() && !snap.platforms.empty())
         selPlat = (int)snap.platforms.size() - 1;
     if (selRom < 0) selRom = 0;
-    if (selRom >= (int)snap.roms.size() && !snap.roms.empty())
-        selRom = (int)snap.roms.size() - 1;
+    if (snap.romsCount > 0 && selRom >= (int)snap.romsCount)
+        selRom = (int)snap.romsCount - 1;
+    if (selQueue < 0) selQueue = 0;
+    if (snap.queueCount > 0 && selQueue >= (int)snap.queueCount)
+        selQueue = (int)snap.queueCount - 1;
 
     auto sanitize = [](const std::string& s) {
         std::string out;
@@ -713,23 +825,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             }
         }
         header = "ROMS " + (platLabel.empty() ? "" : ("[" + platLabel + "] ")) +
-                 "count=" + std::to_string(snap.roms.size()) +
+                 "count=" + std::to_string(snap.romsCount) +
                  " sel=" + std::to_string(selRom);
         SDL_Color fg{255,255,255,255};
-        std::unordered_map<std::string, romm::QueueState> queueStateById;
-        queueStateById.reserve(snap.downloadQueue.size() + snap.downloadHistory.size());
-        for (const auto& qi : snap.downloadHistory) {
-            if (qi.state == romm::QueueState::Failed ||
-                qi.state == romm::QueueState::Completed ||
-                qi.state == romm::QueueState::Resumable ||
-                qi.state == romm::QueueState::Cancelled ||
-                qi.state == romm::QueueState::Finalizing) {
-                queueStateById[qi.game.id] = qi.state;
-            }
-        }
-        for (const auto& qi : snap.downloadQueue) {
-            queueStateById[qi.game.id] = qi.state; // live queue overrides history
-        }
         auto drawFilledCircle = [&](int cx, int cy, int r, SDL_Color c) {
             SDL_SetRenderDrawColor(renderer, c.r, c.g, c.b, c.a);
             for (int dy = -r; dy <= r; ++dy) {
@@ -792,21 +890,16 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
                     break;
             }
         };
-        size_t visible = snap.roms.size() < 18 ? snap.roms.size() : 18;
-        size_t start = 0;
-        if (!snap.roms.empty()) {
-            if (selRom >= (int)(start + visible)) start = selRom - visible + 1;
-            if (selRom < (int)start) start = selRom;
-            if (start + visible > snap.roms.size()) start = snap.roms.size() - visible;
-        }
+        const size_t visible = snap.romsVisible.size();
+        const size_t start = snap.romsStart;
         if (gRomsDebugFrames > 0) {
-            romm::logDebug("Render ROMS dbg: count=" + std::to_string(snap.roms.size()) +
+            romm::logDebug("Render ROMS dbg: count=" + std::to_string(snap.romsCount) +
                            " showing=" + std::to_string(visible) +
                            " start=" + std::to_string(start) +
                            " sel=" + std::to_string(selRom),
                            "UI");
-            if (!snap.roms.empty()) {
-                romm::logDebug(" ROM[0]=" + ellipsize(snap.roms[0].title, 60), "UI");
+            if (!snap.romsVisible.empty()) {
+                romm::logDebug(" ROM[v0]=" + ellipsize(snap.romsVisible[0].title, 60), "UI");
             }
             gRomsDebugFrames--;
         }
@@ -817,24 +910,18 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         SDL_Rect listBg{48, 64, 1040, listHeight};
         SDL_SetRenderDrawColor(renderer, 12, 90, 120, 180);
         SDL_RenderFillRect(renderer, &listBg);
-        if (snap.roms.empty()) {
+        if (snap.romsCount == 0) {
             drawText(renderer, 64, 96, "No ROMs found for this platform.", fg, 2);
         }
-        auto completionKey = [](const romm::Game& g) -> std::string {
-            return !g.id.empty() ? g.id : g.fsName;
-        };
-        auto isCompletedOnDisk = [&](const romm::Game& g) -> bool {
-            std::string key = completionKey(g);
-            if (key.empty()) return false;
-            auto it = completedCache.find(key);
-            return it != completedCache.end() && it->second;
-        };
-
-        if (selRom >= 0 && selRom < (int)snap.roms.size()) {
-            const auto& gsel = snap.roms[selRom];
-            if (isCompletedOnDisk(gsel)) {
+        if (selRom >= 0 && selRom < (int)snap.romsCount && !snap.romsVisible.empty()) {
+            size_t selOffset = 0;
+            if ((size_t)selRom >= start && (size_t)selRom < start + visible) {
+                selOffset = (size_t)selRom - start;
+            }
+            const auto& gsel = snap.romsVisible[selOffset];
+            if (isCompletedOnDiskCached(gsel)) {
                 selectedStateForFooter = romm::QueueState::Completed;
-            } else if (auto it = queueStateById.find(gsel.id); it != queueStateById.end()) {
+            } else if (auto it = sQueueStateById.find(gsel.id); it != sQueueStateById.end()) {
                 selectedStateForFooter = it->second;
             }
         }
@@ -846,26 +933,25 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             else
                 SDL_SetRenderDrawColor(renderer, 34, 90, 140, 200);
             SDL_RenderFillRect(renderer, &r);
-            if (idx < snap.roms.size()) {
-                // TODO(UI): switch long titles to a scrolling marquee instead of hard ellipsis.
-                drawText(renderer, r.x + 12, r.y + 4, ellipsizeTight(snap.roms[idx].title, 43.0), fg, 2);
-                std::string sz = humanSize(snap.roms[idx].sizeBytes);
-                drawText(renderer, r.x + 760, r.y + 4, sz, fg, 2);
-                std::optional<romm::QueueState> st;
-                if (auto it = queueStateById.find(snap.roms[idx].id); it != queueStateById.end()) {
-                    st = it->second;
-                }
-                if (isCompletedOnDisk(snap.roms[idx])) {
-                    st = romm::QueueState::Completed;
-                }
-                drawBadge(st, r.x + 930, r.y + 4);
+            const auto& g = snap.romsVisible[i];
+            // TODO(UI): switch long titles to a scrolling marquee instead of hard ellipsis.
+            drawText(renderer, r.x + 12, r.y + 4, ellipsizeTight(g.title, 43.0), fg, 2);
+            std::string sz = humanSize(g.sizeBytes);
+            drawText(renderer, r.x + 760, r.y + 4, sz, fg, 2);
+            std::optional<romm::QueueState> st;
+            if (auto it = sQueueStateById.find(g.id); it != sQueueStateById.end()) {
+                st = it->second;
             }
+            if (isCompletedOnDiskCached(g)) {
+                st = romm::QueueState::Completed;
+            }
+            drawBadge(st, r.x + 930, r.y + 4);
         }
     } else if (snap.view == Status::View::DETAIL) {
         header = "DETAIL";
         SDL_Color fg{255,255,255,255};
-        if (selRom >= 0 && selRom < (int)snap.roms.size()) {
-            const auto& g = snap.roms[selRom];
+        if (!snap.romsVisible.empty()) {
+            const auto& g = snap.romsVisible[0];
             header = "DETAIL [" + ellipsize(g.title, 22) + "]";
             SDL_Rect cover{70, 110, 240, 240};
             if (g.coverUrl.empty()) {
@@ -898,25 +984,19 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             drawText(renderer, info.x + 16, info.y + 56, "Size=" + humanSize(g.sizeBytes), fg, 2);
             drawText(renderer, info.x + 16, info.y + 96, "ID=" + ellipsize(g.id, 22), fg, 2);
             drawText(renderer, info.x + 16, info.y + 136, "FsName=" + ellipsize(g.fsName, 34), fg, 2);
-            std::string qCount = "Queue size=" + std::to_string(snap.downloadQueue.size());
+            std::string qCount = "Queue size=" + std::to_string(snap.queueCount);
             drawText(renderer, info.x + 16, info.y + 176, qCount, fg, 2);
             drawText(renderer, 80, 420, "A=Queue and open queue   B=Back   Y=Queue view", fg, 2);
         } else {
             drawText(renderer, 80, 120, "No ROM selected.", fg, 2);
         }
     } else if (snap.view == Status::View::QUEUE) {
-        uint64_t total = 0;
-        for (auto& q : snap.downloadQueue) total += q.game.sizeBytes;
-        header = "QUEUE items=" + std::to_string(snap.downloadQueue.size()) +
-                 " total=" + humanSize(total);
+        uint64_t total = snap.queueTotalBytes;
+        header = "QUEUE items=" + std::to_string(snap.queueCount) +
+                 " total=" + humanSize(snap.queueTotalBytes);
         SDL_Color fg{255,255,255,255};
-        size_t visible = snap.downloadQueue.size() < 18 ? snap.downloadQueue.size() : 18;
-        size_t start = 0;
-        if (!snap.downloadQueue.empty()) {
-            if (snap.selectedQueueIndex >= (int)(start + visible)) start = snap.selectedQueueIndex - visible + 1;
-            if (snap.selectedQueueIndex < (int)start) start = snap.selectedQueueIndex;
-            if (start + visible > snap.downloadQueue.size()) start = snap.downloadQueue.size() - visible;
-        }
+        size_t visible = snap.queueVisible.size();
+        size_t start = snap.queueStart;
         int listHeight = static_cast<int>(visible) * 26 + 60;
         int maxListHeight = 720 - 96 - 60;
         if (listHeight > maxListHeight) listHeight = maxListHeight;
@@ -925,20 +1005,20 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         SDL_SetRenderDrawColor(renderer, 90, 60, 150, 180);
         SDL_RenderFillRect(renderer, &listBg);
         drawText(renderer, 64, 70, "Total size: " + humanSize(total), fg, 2);
-        if (snap.downloadQueue.empty()) {
+        if (snap.queueCount == 0) {
             std::string msg = snap.downloadCompleted ? "All downloads complete." : "Queue empty. Press A in detail to add.";
             drawText(renderer, 64, 120, msg, fg, 2);
         }
         for (size_t i = 0; i < visible; ++i) {
             size_t idx = start + i;
             SDL_Rect r{ 64, 120 + static_cast<int>(i)*26, 1008, 22 };
-            if ((int)idx == snap.selectedQueueIndex)
+            if ((int)idx == selQueue)
                 SDL_SetRenderDrawColor(renderer, 150, 110, 230, 255);
             else
                 SDL_SetRenderDrawColor(renderer, 110, 70, 180, 200);
             SDL_RenderFillRect(renderer, &r);
-            if (idx < snap.downloadQueue.size()) {
-                const auto& q = snap.downloadQueue[idx];
+            if (i < snap.queueVisible.size()) {
+                const auto& q = snap.queueVisible[i];
                 drawText(renderer, r.x + 10, r.y + 4, ellipsize(q.game.title, 58), fg, 2);
                 uint64_t qSize = q.bundle.totalSize();
                 if (qSize == 0) qSize = q.game.sizeBytes;
@@ -1478,6 +1558,7 @@ int main(int argc, char** argv) {
                                   qi.bundle = bundle;
                                   qi.state = romm::QueueState::Pending;
                                   status.downloadQueue.push_back(std::move(qi));
+                                  status.downloadQueueRevision++;
                                   status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
                                   status.downloadCompleted = false; // new work pending, clear stale banner
                                   status.prevQueueView = Status::View::DETAIL;
@@ -1588,6 +1669,7 @@ int main(int argc, char** argv) {
                                         status.currentDownloadSize.store(firstSize);
                                         status.currentDownloadTitle = first.bundle.title.empty() ? first.game.title : first.bundle.title;
                                         status.downloadQueue[0].state = romm::QueueState::Downloading;
+                                        status.downloadQueueRevision++;
                                     }
                                 }
                                 romm::logLine("Starting downloads for queue size=" + std::to_string(status.downloadQueue.size()) +
