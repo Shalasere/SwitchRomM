@@ -11,3 +11,4 @@ romm-switch-client/tests/romm_tests.exe
 *.nacp
 *.elf
 *.map
+SwitchRomM.code-workspace

@@ -19,19 +19,78 @@ static void trim(std::string& s) {
     s = s.substr(i);
 }
 
+// Strip trailing inline comments for dotenv-style parsing.
+// Rules (pragmatic):
+// - Full-line comments are handled elsewhere (# or ; after trimming).
+// - For unquoted values: treat " #..." or " ;..." (comment delimiter preceded by whitespace) as a comment.
+//   This preserves values like "abc#123" (no whitespace).
+// - For quoted values: capture the quoted string and ignore any trailing " #..." / " ;...".
+static void stripInlineComment(std::string& val) {
+    trim(val);
+    if (val.empty()) return;
+
+    if (val.front() == '"') {
+        // Parse a simple quoted value with basic backslash escaping.
+        std::string out;
+        out.reserve(val.size());
+        bool escaped = false;
+        size_t i = 1;
+        for (; i < val.size(); ++i) {
+            char c = val[i];
+            if (escaped) {
+                out.push_back(c);
+                escaped = false;
+                continue;
+            }
+            if (c == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (c == '"') {
+                // End quote.
+                ++i;
+                break;
+            }
+            out.push_back(c);
+        }
+        val = out;
+        (void)i;
+        return;
+    }
+
+    // Unquoted: strip a comment marker if preceded by whitespace.
+    for (size_t i = 0; i < val.size(); ++i) {
+        char c = val[i];
+        if ((c == '#' || c == ';') && i > 0 && std::isspace(static_cast<unsigned char>(val[i - 1]))) {
+            size_t cut = i;
+            while (cut > 0 && std::isspace(static_cast<unsigned char>(val[cut - 1]))) cut--;
+            val = val.substr(0, cut);
+            trim(val);
+            return;
+        }
+    }
+}
+
 static bool parseEnvStream(std::istream& in, Config& outCfg) {
     std::string line;
     while (std::getline(in, line)) {
+        trim(line);
         if (line.empty()) continue;
+
+        // Allow common "export KEY=VALUE" style lines.
+        if (line.rfind("export ", 0) == 0) {
+            line = line.substr(7);
+            trim(line);
+            if (line.empty()) continue;
+        }
+
         if (line[0] == '#' || line[0] == ';') continue;
         auto pos = line.find('=');
         if (pos == std::string::npos) continue;
         std::string key = toLower(line.substr(0, pos));
         std::string val = line.substr(pos + 1);
         trim(key); trim(val);
-        if (!val.empty() && val.front() == '"' && val.back() == '"' && val.size() >= 2) {
-            val = val.substr(1, val.size() - 2);
-        }
+        stripInlineComment(val);
         if (key == "server_url") outCfg.serverUrl = val;
         else if (key == "api_token") outCfg.apiToken = val;
         else if (key == "username") outCfg.username = val;

@@ -26,4 +26,8 @@ bool parseGamesTest(const std::string& body,
                     const std::string& serverUrl,
                     std::vector<Game>& outGames,
                     std::string& err);
+
+bool parsePlatformsTest(const std::string& body,
+                        std::vector<Platform>& outPlatforms,
+                        std::string& err);
 } // namespace romm

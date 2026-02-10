@@ -68,3 +68,24 @@ TEST_CASE("parseEnvString normalizes booleans and log level") {
     REQUIRE(cfg.fat32Safe == true);
     REQUIRE(cfg.logLevel == "debug");
 }
+
+TEST_CASE("parseEnvString ignores comments (full-line and inline)") {
+    const std::string env =
+        "# full line comment\n"
+        "  ; also a comment with leading whitespace\n"
+        "export server_url=http://example.com   # trailing comment\n"
+        "download_dir=sdmc:/romm_cache/switch ; another trailing comment\n"
+        "password=abc#123\n"
+        "username=\"user;name\" # comment after quoted value\n"
+        "log_level=info\n";
+    romm::Config cfg;
+    std::string err;
+    bool ok = romm::parseEnvString(env, cfg, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(cfg.serverUrl == "http://example.com");
+    REQUIRE(cfg.downloadDir == "sdmc:/romm_cache/switch");
+    REQUIRE(cfg.password == "abc#123");          // no whitespace before '#', so keep it
+    REQUIRE(cfg.username == "user;name");        // ';' inside quotes is part of the value
+    REQUIRE(cfg.logLevel == "info");
+}

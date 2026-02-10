@@ -362,11 +362,15 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         Status::View view{Status::View::PLATFORMS};
         std::vector<romm::Platform> platforms;
         std::vector<romm::Game> roms;
+        uint64_t romsRevision{0};
         std::vector<romm::QueueItem> downloadQueue;
         std::vector<romm::QueueItem> downloadHistory;
         int selectedPlatformIndex{0};
         int selectedRomIndex{0};
         int selectedQueueIndex{0};
+        std::string currentPlatformId;
+        std::string currentPlatformSlug;
+        std::string currentPlatformName;
         Status::View prevQueueView{Status::View::PLATFORMS};
         bool downloadCompleted{false};
         bool downloadWorkerRunning{false};
@@ -375,7 +379,6 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         std::string currentDownloadTitle;
         int currentDownloadIndex{0};
         std::string lastError;
-        std::unordered_set<std::string> completedOnDisk;
         double lastSpeedMBps{0.0};
     } snap;
 
@@ -384,11 +387,15 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.view = status.currentView;
         snap.platforms = status.platforms;
         snap.roms = status.roms;
+        snap.romsRevision = status.romsRevision;
         snap.downloadQueue = status.downloadQueue;
         snap.downloadHistory = status.downloadHistory;
         snap.selectedPlatformIndex = status.selectedPlatformIndex;
         snap.selectedRomIndex = status.selectedRomIndex;
         snap.selectedQueueIndex = status.selectedQueueIndex;
+        snap.currentPlatformId = status.currentPlatformId;
+        snap.currentPlatformSlug = status.currentPlatformSlug;
+        snap.currentPlatformName = status.currentPlatformName;
         snap.prevQueueView = status.prevQueueView;
         snap.downloadCompleted = status.downloadCompleted;
         snap.downloadWorkerRunning = status.downloadWorkerRunning.load();
@@ -402,36 +409,19 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     // Populate on-disk completion set outside the status lock (uses config).
     // Cache results and rescan only when ROM list changes or on a timed interval to avoid per-frame disk IO.
     static std::unordered_map<std::string, bool> completedCache;
-    static std::string cacheKey;
+    static uint64_t cacheRevision = 0;
     static std::chrono::steady_clock::time_point lastScanSteady{};
 
-    std::string currentKey;
-    currentKey.reserve(snap.roms.size() * 8);
-    for (const auto& g : snap.roms) {
-        currentKey.append(g.id);
-        currentKey.push_back('|');
-        currentKey.append(g.fsName);
-        currentKey.push_back(';');
-    }
     auto nowSteady = std::chrono::steady_clock::now();
-    bool needScan = (currentKey != cacheKey) || (nowSteady - lastScanSteady > std::chrono::seconds(2));
+    bool needScan = (snap.romsRevision != cacheRevision) || (nowSteady - lastScanSteady > std::chrono::seconds(2));
     if (needScan) {
         completedCache.clear();
-        cacheKey = currentKey;
+        cacheRevision = snap.romsRevision;
         lastScanSteady = nowSteady;
         for (const auto& g : snap.roms) {
             std::string key = !g.id.empty() ? g.id : g.fsName;
             bool found = isGameCompletedOnDisk(g, config);
             if (!key.empty()) completedCache[key] = found;
-        }
-    }
-    for (const auto& g : snap.roms) {
-        std::string key = !g.id.empty() ? g.id : g.fsName;
-        if (!key.empty()) {
-            auto it = completedCache.find(key);
-            if (it != completedCache.end() && it->second) {
-                snap.completedOnDisk.insert(g.id);
-            }
         }
     }
 
@@ -686,6 +676,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     if (snap.view == Status::View::PLATFORMS) {
         header = "PLATFORMS count=" + std::to_string(snap.platforms.size()) +
                  " sel=" + std::to_string(selPlat);
+        if (selPlat >= 0 && selPlat < (int)snap.platforms.size()) {
+            const auto& p = snap.platforms[selPlat];
+            if (!p.slug.empty()) header += " slug=" + ellipsize(p.slug, 14);
+            else if (!p.id.empty()) header += " id=" + ellipsize(p.id, 10);
+        }
         SDL_Color fg{255,255,255,255};
         int listHeight = static_cast<int>(snap.platforms.size()) * 26 + 32;
         if (listHeight < 120) listHeight = 120;
@@ -702,9 +697,20 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             drawText(renderer, r.x + 14, r.y + 6, ellipsize(snap.platforms[i].name, 40), fg, 2);
         }
     } else if (snap.view == Status::View::ROMS) {
+        std::string platName = snap.currentPlatformName;
+        std::string platSlug = snap.currentPlatformSlug;
+        if (platName.empty() && selPlat >= 0 && selPlat < (int)snap.platforms.size()) {
+            platName = snap.platforms[selPlat].name;
+        }
+        if (platSlug.empty() && selPlat >= 0 && selPlat < (int)snap.platforms.size()) {
+            platSlug = snap.platforms[selPlat].slug;
+        }
         std::string platLabel;
-        if (selPlat >= 0 && selPlat < (int)snap.platforms.size()) {
-            platLabel = ellipsize(snap.platforms[selPlat].name, 18);
+        if (!platName.empty()) {
+            platLabel = ellipsize(platName, 18);
+            if (!platSlug.empty()) {
+                platLabel += ":" + ellipsize(platSlug, 12);
+            }
         }
         header = "ROMS " + (platLabel.empty() ? "" : ("[" + platLabel + "] ")) +
                  "count=" + std::to_string(snap.roms.size()) +
@@ -723,12 +729,6 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         }
         for (const auto& qi : snap.downloadQueue) {
             queueStateById[qi.game.id] = qi.state; // live queue overrides history
-        }
-        // Apply on-disk completion: if final file/folder exists, show as completed regardless of history.
-        for (const auto& g : snap.roms) {
-            if (snap.completedOnDisk.count(g.id)) {
-                queueStateById[g.id] = romm::QueueState::Completed;
-            }
         }
         auto drawFilledCircle = [&](int cx, int cy, int r, SDL_Color c) {
             SDL_SetRenderDrawColor(renderer, c.r, c.g, c.b, c.a);
@@ -820,8 +820,21 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         if (snap.roms.empty()) {
             drawText(renderer, 64, 96, "No ROMs found for this platform.", fg, 2);
         }
+        auto completionKey = [](const romm::Game& g) -> std::string {
+            return !g.id.empty() ? g.id : g.fsName;
+        };
+        auto isCompletedOnDisk = [&](const romm::Game& g) -> bool {
+            std::string key = completionKey(g);
+            if (key.empty()) return false;
+            auto it = completedCache.find(key);
+            return it != completedCache.end() && it->second;
+        };
+
         if (selRom >= 0 && selRom < (int)snap.roms.size()) {
-            if (auto it = queueStateById.find(snap.roms[selRom].id); it != queueStateById.end()) {
+            const auto& gsel = snap.roms[selRom];
+            if (isCompletedOnDisk(gsel)) {
+                selectedStateForFooter = romm::QueueState::Completed;
+            } else if (auto it = queueStateById.find(gsel.id); it != queueStateById.end()) {
                 selectedStateForFooter = it->second;
             }
         }
@@ -841,6 +854,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
                 std::optional<romm::QueueState> st;
                 if (auto it = queueStateById.find(snap.roms[idx].id); it != queueStateById.end()) {
                     st = it->second;
+                }
+                if (isCompletedOnDisk(snap.roms[idx])) {
+                    st = romm::QueueState::Completed;
                 }
                 drawBadge(st, r.x + 930, r.y + 4);
             }
@@ -947,6 +963,79 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         header = "DOWNLOADING sel=" + std::to_string(snap.currentDownloadIndex);
     } else if (snap.view == Status::View::ERROR) {
         header = "ERROR";
+        SDL_Color fg{255,255,255,255};
+        SDL_Color sub{255,200,200,255};
+        SDL_Rect box{64, 96, 1280 - 128, 720 - 96 - 64 - 48};
+        SDL_SetRenderDrawColor(renderer, 60, 0, 0, 220);
+        SDL_RenderFillRect(renderer, &box);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 90);
+        SDL_RenderDrawRect(renderer, &box);
+
+        auto wrapLines = [](const std::string& s, size_t maxChars) -> std::vector<std::string> {
+            std::vector<std::string> out;
+            std::string cur;
+            cur.reserve(maxChars + 8);
+
+            auto flush = [&]() {
+                if (!cur.empty()) out.push_back(cur);
+                cur.clear();
+            };
+
+            size_t i = 0;
+            while (i < s.size()) {
+                // Respect explicit newlines.
+                if (s[i] == '\n') {
+                    flush();
+                    ++i;
+                    continue;
+                }
+                // Skip repeated whitespace (but not newlines).
+                if (std::isspace(static_cast<unsigned char>(s[i]))) {
+                    ++i;
+                    continue;
+                }
+                // Read a word token.
+                size_t j = i;
+                while (j < s.size() && s[j] != '\n' && !std::isspace(static_cast<unsigned char>(s[j]))) ++j;
+                std::string word = s.substr(i, j - i);
+                i = j;
+
+                if (cur.empty()) {
+                    // If the token itself is too long, hard-wrap it.
+                    while (word.size() > maxChars) {
+                        out.push_back(word.substr(0, maxChars));
+                        word.erase(0, maxChars);
+                    }
+                    cur = word;
+                } else if (cur.size() + 1 + word.size() <= maxChars) {
+                    cur.push_back(' ');
+                    cur += word;
+                } else {
+                    flush();
+                    while (word.size() > maxChars) {
+                        out.push_back(word.substr(0, maxChars));
+                        word.erase(0, maxChars);
+                    }
+                    cur = word;
+                }
+            }
+            flush();
+            return out;
+        };
+
+        std::string reason = snap.lastError.empty() ? "Unknown error." : snap.lastError;
+        drawText(renderer, box.x + 16, box.y + 16, "Reason:", fg, 2);
+
+        auto lines = wrapLines(reason, 78);
+        int y = box.y + 46;
+        for (size_t li = 0; li < lines.size() && li < 12; ++li) {
+            drawText(renderer, box.x + 16, y, lines[li], sub, 2);
+            y += 22;
+        }
+
+        int hintY = box.y + box.h - 78;
+        drawText(renderer, box.x + 16, hintY, "Check log: sdmc:/switch/romm_switch_client/log.txt", fg, 2);
+        drawText(renderer, box.x + 16, hintY + 26, "Press B or Plus to exit.", fg, 2);
     }
 
     switch (snap.view) {
@@ -966,6 +1055,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             break;
         case Status::View::DOWNLOADING:
             controls = "B=back Plus=exit";
+            break;
+        case Status::View::ERROR:
+            controls = "B=exit Plus=exit";
             break;
         default:
             controls = "Plus=exit";
@@ -1264,18 +1356,67 @@ int main(int argc, char** argv) {
                         }
                         romm::logLine("Fetching ROMs for platform id=" + pid);
                         std::string err;
-                        if (romm::fetchGamesForPlatform(config, pid, status, err)) {
-                            std::lock_guard<std::mutex> lock(status.mutex);
+                            if (romm::fetchGamesForPlatform(config, pid, status, err)) {
+                                std::lock_guard<std::mutex> lock(status.mutex);
                             // Propagate platform slug from the selected platform (authoritative).
                             std::string selSlug;
+                            std::string selName;
                             if (sel >= 0 && sel < (int)status.platforms.size()) {
                                 selSlug = status.platforms[sel].slug;
+                                selName = status.platforms[sel].name;
                             }
-                            if (!selSlug.empty()) {
-                                for (auto& r : status.roms) r.platformSlug = selSlug;
+                            // Some server versions may ignore platform_id filter and return all ROMs.
+                            // If the payload includes per-ROM platform metadata, filter client-side as a guardrail.
+                            if (!pid.empty()) {
+                                bool anyDifferentId = false;
+                                bool anyHasId = false;
+                                for (const auto& r : status.roms) {
+                                    if (!r.platformId.empty()) {
+                                        anyHasId = true;
+                                        if (r.platformId != pid) { anyDifferentId = true; break; }
+                                    }
+                                }
+                                if (anyHasId && anyDifferentId) {
+                                    size_t before = status.roms.size();
+                                    status.roms.erase(std::remove_if(status.roms.begin(), status.roms.end(),
+                                        [&](const romm::Game& r) {
+                                            return !r.platformId.empty() && r.platformId != pid;
+                                        }),
+                                        status.roms.end());
+                                    romm::logLine("Client-side filtered ROMs by platform_id: " +
+                                                  std::to_string(before) + " -> " + std::to_string(status.roms.size()));
+                                }
                             }
-                            resetNav();
-                            status.currentView = Status::View::ROMS;
+                                if (!selSlug.empty()) {
+                                bool anyDifferentSlug = false;
+                                bool anyHasSlug = false;
+                                for (const auto& r : status.roms) {
+                                    if (!r.platformSlug.empty()) {
+                                        anyHasSlug = true;
+                                        if (r.platformSlug != selSlug) { anyDifferentSlug = true; break; }
+                                    }
+                                }
+                                if (anyHasSlug && anyDifferentSlug) {
+                                    size_t before = status.roms.size();
+                                    status.roms.erase(std::remove_if(status.roms.begin(), status.roms.end(),
+                                        [&](const romm::Game& r) {
+                                            return !r.platformSlug.empty() && r.platformSlug != selSlug;
+                                        }),
+                                        status.roms.end());
+                                    romm::logLine("Client-side filtered ROMs by platform_slug: " +
+                                                  std::to_string(before) + " -> " + std::to_string(status.roms.size()));
+                                }
+                                // Only fill missing slugs; don't overwrite per-ROM metadata.
+                                    for (auto& r : status.roms) {
+                                        if (r.platformSlug.empty()) r.platformSlug = selSlug;
+                                    }
+                                }
+                                status.romsRevision++;
+                                status.currentPlatformId = pid;
+                                status.currentPlatformSlug = selSlug;
+                                status.currentPlatformName = selName;
+                                resetNav();
+                                status.currentView = Status::View::ROMS;
                             status.selectedRomIndex = 0;
                             gViewTraceFrames = 8;
                             romm::logLine("Fetched ROMs count=" + std::to_string(status.roms.size()) +
@@ -1331,6 +1472,7 @@ int main(int argc, char** argv) {
                               {
                                   std::lock_guard<std::mutex> lock(status.mutex);
                                   status.roms[sel] = enriched;
+                                  status.romsRevision++;
                                   romm::QueueItem qi;
                                   qi.game = enriched;
                                   qi.bundle = bundle;

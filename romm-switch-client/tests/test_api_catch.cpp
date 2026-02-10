@@ -154,3 +154,41 @@ TEST_CASE("parseGames preserves absolute cover_url and encodes spaces") {
     REQUIRE(games.size() == 1);
     REQUIRE(games[0].coverUrl == "http://remote/img%20path.png?x=1%202");
 }
+
+TEST_CASE("parsePlatforms preserves numeric ids without decimal suffix") {
+    const std::string body = R"([{
+        "id": 2,
+        "display_name": "Nintendo Switch",
+        "slug": "switch",
+        "rom_count": 123
+    }])";
+    std::vector<romm::Platform> plats;
+    std::string err;
+    bool ok = romm::parsePlatformsTest(body, plats, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(plats.size() == 1);
+    REQUIRE(plats[0].id == "2");
+    REQUIRE(plats[0].slug == "switch");
+    REQUIRE(plats[0].romCount == 123);
+}
+
+TEST_CASE("parseGames preserves numeric ids without decimal suffix") {
+    const std::string body = R"([{
+        "id": 19,
+        "name": "Numeric Id Game",
+        "platform_id": 2,
+        "platform_slug": "switch",
+        "fs_size_bytes": 10,
+        "fs_name": "a.xci"
+    }])";
+    std::vector<romm::Game> games;
+    std::string err;
+    bool ok = romm::parseGamesTest(body, "2", "http://example.com", games, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(games.size() == 1);
+    REQUIRE(games[0].id == "19");
+    REQUIRE(games[0].platformId == "2");
+    REQUIRE(games[0].platformSlug == "switch");
+}

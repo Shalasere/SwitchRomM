@@ -37,12 +37,17 @@ struct Status {
     // Data loaded from API
     std::vector<Platform> platforms;
     std::vector<Game> roms;
+    uint64_t romsRevision{0}; // bump when `roms` changes to let UI caches avoid O(N) per-frame rebuilds
     PlatformPrefs platformPrefs;
 
     // Selection indices for views
     int selectedPlatformIndex{0};
     int selectedRomIndex{0};
     int selectedQueueIndex{0};
+    // Selected platform identity (used to keep UI and behavior correlated even if indices drift).
+    std::string currentPlatformId;
+    std::string currentPlatformSlug;
+    std::string currentPlatformName;
     std::vector<View> navStack; // simple stack for PLATFORMS -> ROMS -> DETAIL navigation
     View prevQueueView{View::ROMS}; // where to return when leaving queue
 

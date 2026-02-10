@@ -20,6 +20,7 @@
 #include <cctype>
 #include <functional>
 #include <cerrno>
+#include <cmath>
 #ifndef UNIT_TEST
 #include <sys/socket.h>
 #include <netdb.h>
@@ -538,7 +539,20 @@ static bool httpGetJsonWithRetry(const std::string& url,
 
 static std::string valToString(const mini::Value& v) {
     if (v.type == mini::Value::Type::String) return v.str;
-    if (v.type == mini::Value::Type::Number) return std::to_string(v.number);
+    if (v.type == mini::Value::Type::Number) {
+        // JSON parsers commonly store integers as doubles; avoid "2.000000" IDs, which can break API queries.
+        const double n = v.number;
+        if (std::isfinite(n)) {
+            const double r = std::round(n);
+            if (std::fabs(n - r) < 1e-9 && std::fabs(r) <= 9e15) {
+                return std::to_string(static_cast<int64_t>(r));
+            }
+        }
+        // Fallback: preserve value with more precision than std::to_string (which rounds to 6 decimals).
+        std::ostringstream oss;
+        oss << std::setprecision(17) << n;
+        return oss.str();
+    }
     return {};
 }
 
@@ -680,8 +694,22 @@ static bool parseGames(const std::string& body,
         if (auto it = o.find("fs_name"); it != o.end() && it->second.type == mini::Value::Type::String)
             g.fsName = stripLeadingSlash(it->second.str);
 
-        if (auto it = o.find("platform_slug"); it != o.end() && it->second.type == mini::Value::Type::String)
+        if (auto it = o.find("platform_id"); it != o.end()) {
+            g.platformId = valToString(it->second);
+        }
+        if (auto it = o.find("platform_slug"); it != o.end() && it->second.type == mini::Value::Type::String) {
             g.platformSlug = it->second.str;
+        }
+        if (auto it = o.find("platform"); it != o.end() && it->second.type == mini::Value::Type::Object) {
+            const auto& po = it->second.object;
+            if (g.platformId.empty()) {
+                if (auto pid = po.find("id"); pid != po.end()) g.platformId = valToString(pid->second);
+            }
+            if (g.platformSlug.empty()) {
+                if (auto pslug = po.find("slug"); pslug != po.end() && pslug->second.type == mini::Value::Type::String)
+                    g.platformSlug = pslug->second.str;
+            }
+        }
 
         if (auto it = o.find("path_cover_small"); it != o.end() && it->second.type == mini::Value::Type::String)
             g.coverUrl = absolutizeUrl(it->second.str);
@@ -693,7 +721,8 @@ static bool parseGames(const std::string& body,
                 g.coverUrl = absolutizeUrl(cov->second.str);
         }
 
-        g.platformId = platformId;
+        // If the list API doesn't include per-ROM platform metadata, fall back to the selected platform.
+        if (g.platformId.empty()) g.platformId = platformId;
 
         if (!g.id.empty()) {
             if (!g.title.empty())
@@ -728,6 +757,16 @@ bool parseGamesTest(const std::string& body,
     outGames = st.roms;
     return ok;
 }
+
+bool parsePlatformsTest(const std::string& body,
+                        std::vector<Platform>& outPlatforms,
+                        std::string& err)
+{
+    Status st;
+    bool ok = parsePlatforms(body, st, err);
+    outPlatforms = st.platforms;
+    return ok;
+}
 #endif
 
 bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError) {
@@ -759,6 +798,10 @@ bool fetchGamesForPlatform(const Config& cfg,
                            Status& status,
                            std::string& outError)
 {
+    if (platformId.empty()) {
+        outError = "Missing platform id.";
+        return false;
+    }
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
         auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
@@ -767,7 +810,7 @@ bool fetchGamesForPlatform(const Config& cfg,
     HttpResponse resp;
     std::string err;
     std::string url = cfg.serverUrl +
-                      "/api/roms?platform_id=" + platformId +
+                      "/api/roms?platform_id=" + romm::util::urlEncode(platformId) +
                       "&order_by=name&order_dir=asc&limit=10000";
 
     if (!httpGetJsonWithRetry(url, auth, cfg.httpTimeoutSeconds, resp, err)) {
