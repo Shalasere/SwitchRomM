@@ -1,13 +1,10 @@
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 #include "romm/config.hpp"
+#include "romm/job_manager.hpp"
 
 namespace romm {
 
@@ -48,15 +45,10 @@ public:
     std::optional<CoverResult> poll();
 
 private:
-    void workerLoop();
+    CoverResult runJob(const CoverJob& job);
 
-    std::thread worker_;
-    std::atomic<bool> stop_{false};
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::optional<CoverJob> job_;
-    std::optional<CoverResult> result_;
     FetchFn fetch_{nullptr};
+    LatestJobWorker<CoverJob, CoverResult> worker_;
 };
 
 } // namespace romm

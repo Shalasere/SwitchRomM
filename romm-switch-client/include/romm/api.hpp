@@ -1,6 +1,7 @@
 #pragma once
 
 #include "romm/config.hpp"
+#include "romm/errors.hpp"
 #include "romm/status.hpp"
 #include <string>
 #include <functional>
@@ -15,10 +16,10 @@ struct HttpResponse {
 };
 
 // HTTP/JSON API client (http only; no redirects/chunked streaming).
-bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError);
-bool fetchGamesForPlatform(const Config& cfg, const std::string& platformId, Status& status, std::string& outError);
-bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData, std::string& outError);
-bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError);
+bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError, ErrorInfo* outInfo = nullptr);
+bool fetchGamesForPlatform(const Config& cfg, const std::string& platformId, Status& status, std::string& outError, ErrorInfo* outInfo = nullptr);
+bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData, std::string& outError, ErrorInfo* outInfo = nullptr);
+bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError, ErrorInfo* outInfo = nullptr);
 // Shared URL parser (http:// only).
 bool parseHttpUrl(const std::string& url,
                   std::string& host,

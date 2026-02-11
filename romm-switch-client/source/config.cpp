@@ -7,6 +7,23 @@
 
 namespace romm {
 
+namespace {
+void setConfigError(std::string& outError,
+                    ErrorInfo* outInfo,
+                    const std::string& detail,
+                    ErrorCode code,
+                    const char* userMessage) {
+    outError = detail;
+    if (!outInfo) return;
+    outInfo->category = ErrorCategory::Config;
+    outInfo->code = code;
+    outInfo->httpStatus = 0;
+    outInfo->retryable = false;
+    outInfo->userMessage = userMessage;
+    outInfo->detail = detail;
+}
+}
+
 static std::string toLower(std::string s) {
     for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
@@ -163,7 +180,8 @@ static bool parseJson(const std::string& path, Config& outCfg, std::string& outE
     return true;
 }
 
-bool loadConfig(Config& outCfg, std::string& outError) {
+bool loadConfig(Config& outCfg, std::string& outError, ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
     const std::string envPath = "sdmc:/switch/romm_switch_client/.env";
     const std::string jsonPath = "sdmc:/switch/romm_switch_client/config.json";
 
@@ -171,18 +189,31 @@ bool loadConfig(Config& outCfg, std::string& outError) {
     bool jsonTried = parseJson(jsonPath, outCfg, outError);
 
     if (!envTried && !jsonTried) {
-        outError = "Missing config: place .env at sdmc:/switch/romm_switch_client/.env";
+        setConfigError(outError, outInfo,
+                       "Missing config: place .env at sdmc:/switch/romm_switch_client/.env",
+                       ErrorCode::ConfigMissing,
+                       "Configuration file is missing.");
         return false;
     }
 
     if (outCfg.serverUrl.empty() || outCfg.downloadDir.empty()) {
-        if (outError.empty()) outError = "Config missing server_url or download_dir.";
+        if (outError.empty()) {
+            setConfigError(outError, outInfo,
+                           "Config missing server_url or download_dir.",
+                           ErrorCode::MissingRequiredField,
+                           "Required config field is missing.");
+        } else if (outInfo) {
+            *outInfo = classifyError(outError, ErrorCategory::Config);
+        }
         return false;
     }
 
     // Enforce http-only for now (TLS not implemented).
     if (outCfg.serverUrl.rfind("https://", 0) == 0) {
-        outError = "https:// not supported; use http:// or a local TLS terminator.";
+        setConfigError(outError, outInfo,
+                       "https:// not supported; use http:// or a local TLS terminator.",
+                       ErrorCode::ConfigUnsupported,
+                       "HTTPS is not supported in this build.");
         return false;
     }
 
@@ -190,22 +221,30 @@ bool loadConfig(Config& outCfg, std::string& outError) {
 }
 
 #ifdef UNIT_TEST
-bool parseEnvString(const std::string& contents, Config& outCfg, std::string& outError) {
+bool parseEnvString(const std::string& contents, Config& outCfg, std::string& outError, ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
     outCfg = Config{};
     // Force required fields to be explicitly provided in tests.
     outCfg.downloadDir.clear();
     std::istringstream iss(contents);
     if (!parseEnvStream(iss, outCfg)) {
-        outError = "Failed to parse env string";
+        setConfigError(outError, outInfo, "Failed to parse env string",
+                       ErrorCode::ConfigInvalid,
+                       "Configuration format is invalid.");
         return false;
     }
     // mimic normal flow: basic validation
     if (outCfg.serverUrl.empty() || outCfg.downloadDir.empty()) {
-        outError = "Config missing server_url or download_dir.";
+        setConfigError(outError, outInfo, "Config missing server_url or download_dir.",
+                       ErrorCode::MissingRequiredField,
+                       "Required config field is missing.");
         return false;
     }
     if (outCfg.serverUrl.rfind("https://", 0) == 0) {
-        outError = "https:// not supported; use http:// or a local TLS terminator.";
+        setConfigError(outError, outInfo,
+                       "https:// not supported; use http:// or a local TLS terminator.",
+                       ErrorCode::ConfigUnsupported,
+                       "HTTPS is not supported in this build.");
         return false;
     }
     return true;

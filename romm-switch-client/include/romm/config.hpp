@@ -1,5 +1,6 @@
 #pragma once
 
+#include "romm/errors.hpp"
 #include <string>
 
 namespace romm {
@@ -30,11 +31,11 @@ struct Config {
     std::string platformPrefsPathRomfs{"romfs:/platform_prefs.json"};
 };
 
-bool loadConfig(Config& outCfg, std::string& outError);
+bool loadConfig(Config& outCfg, std::string& outError, ErrorInfo* outInfo = nullptr);
 
 #ifdef UNIT_TEST
 // Test helper: parse .env-style content from an in-memory string.
-bool parseEnvString(const std::string& contents, Config& outCfg, std::string& outError);
+bool parseEnvString(const std::string& contents, Config& outCfg, std::string& outError, ErrorInfo* outInfo = nullptr);
 #endif
 
 } // namespace romm

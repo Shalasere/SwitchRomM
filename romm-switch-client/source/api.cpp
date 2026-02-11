@@ -34,6 +34,14 @@ namespace {
 constexpr size_t kApiRecvBuf = 8192;
 constexpr int64_t kRetryDelayFastNs = 250'000'000LL; // 250ms
 constexpr int64_t kRetryDelaySlowNs = 1'000'000'000LL; // 1s
+
+void setApiError(std::string& outError,
+                 ErrorInfo* outInfo,
+                 const std::string& detail,
+                 ErrorCategory hint) {
+    outError = detail;
+    if (outInfo) *outInfo = classifyError(detail, hint);
+}
 }
 
 bool parseHttpUrl(const std::string& url,
@@ -769,7 +777,8 @@ bool parsePlatformsTest(const std::string& body,
 }
 #endif
 
-bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError) {
+bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError, ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
         auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
@@ -780,12 +789,12 @@ bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError) {
     std::string url = cfg.serverUrl + "/api/platforms";
 
     if (!httpGetJsonWithRetry(url, auth, cfg.httpTimeoutSeconds, resp, err)) {
-        outError = err;
+        setApiError(outError, outInfo, err, ErrorCategory::Network);
         return false;
     }
 
     if (!parsePlatforms(resp.body, status, err)) {
-        outError = err;
+        setApiError(outError, outInfo, err, ErrorCategory::Parse);
         return false;
     }
 
@@ -796,10 +805,12 @@ bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError) {
 bool fetchGamesForPlatform(const Config& cfg,
                            const std::string& platformId,
                            Status& status,
-                           std::string& outError)
+                           std::string& outError,
+                           ErrorInfo* outInfo)
 {
+    if (outInfo) *outInfo = ErrorInfo{};
     if (platformId.empty()) {
-        outError = "Missing platform id.";
+        setApiError(outError, outInfo, "Missing platform id.", ErrorCategory::Data);
         return false;
     }
     std::string auth;
@@ -814,14 +825,14 @@ bool fetchGamesForPlatform(const Config& cfg,
                       "&order_by=name&order_dir=asc&limit=10000";
 
     if (!httpGetJsonWithRetry(url, auth, cfg.httpTimeoutSeconds, resp, err)) {
-        outError = err;
+        setApiError(outError, outInfo, err, ErrorCategory::Network);
         return false;
     }
 
     if (!parseGames(resp.body, platformId, status, cfg.serverUrl, err)) {
         romm::logLine("ROMs response (first 256 bytes): " +
                       resp.body.substr(0, resp.body.size() > 256 ? 256 : resp.body.size()));
-        outError = err;
+        setApiError(outError, outInfo, err, ErrorCategory::Parse);
         return false;
     }
 
@@ -830,9 +841,10 @@ bool fetchGamesForPlatform(const Config& cfg,
     return true;
 }
 
-bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
+bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError, ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
     if (g.id.empty()) {
-        outError = "Game missing id; cannot fetch files.";
+        setApiError(outError, outInfo, "Game missing id; cannot fetch files.", ErrorCategory::Data);
         return false;
     }
 
@@ -846,13 +858,13 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
     std::string url = cfg.serverUrl + "/api/roms/" + g.id;
 
     if (!httpGetJsonWithRetry(url, auth, cfg.httpTimeoutSeconds, resp, err)) {
-        outError = err;
+        setApiError(outError, outInfo, err, ErrorCategory::Network);
         return false;
     }
 
     mini::Object obj;
     if (!mini::parse(resp.body, obj)) {
-        outError = "Failed to parse DetailedRom JSON";
+        setApiError(outError, outInfo, "Failed to parse DetailedRom JSON", ErrorCategory::Parse);
         return false;
     }
 
@@ -896,7 +908,7 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
 
     auto itf = obj.find("files");
     if (itf == obj.end() || itf->second.type != mini::Value::Type::Array) {
-        outError = "DetailedRom has no files array";
+        setApiError(outError, outInfo, "DetailedRom has no files array", ErrorCategory::Data);
         return false;
     }
 
@@ -1003,7 +1015,7 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
     }
 
     if (g.files.empty()) {
-        outError = "No valid files for ROM.";
+        setApiError(outError, outInfo, "No valid files for ROM.", ErrorCategory::Data);
         return false;
     }
 
@@ -1021,7 +1033,8 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError) {
     return true;
 }
 
-bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData, std::string& outError) {
+bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData, std::string& outError, ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
     std::string auth;
     if (!cfg.username.empty() || !cfg.password.empty()) {
         auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
@@ -1032,11 +1045,13 @@ bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData
     headers.emplace_back("Accept", "*/*");
     if (!auth.empty()) headers.emplace_back("Authorization", "Basic " + auth);
     if (!httpRequest("GET", url, headers, cfg.httpTimeoutSeconds, resp, err)) {
-        outError = err;
+        setApiError(outError, outInfo, err, ErrorCategory::Network);
         return false;
     }
     if (resp.statusCode < 200 || resp.statusCode >= 300) {
-        outError = "HTTP " + std::to_string(resp.statusCode) + (resp.statusText.empty() ? "" : (" " + resp.statusText));
+        setApiError(outError, outInfo,
+                    "HTTP " + std::to_string(resp.statusCode) + (resp.statusText.empty() ? "" : (" " + resp.statusText)),
+                    ErrorCategory::Http);
         return false;
     }
     outData.swap(resp.body);

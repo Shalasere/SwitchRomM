@@ -1,6 +1,7 @@
 #pragma once
 
 #include "romm/models.hpp"
+#include "romm/errors.hpp"
 #include "romm/platform_prefs.hpp"
 #include "romm/planner.hpp"
 #include <atomic>
@@ -80,6 +81,7 @@ struct Status {
     uint64_t romFetchGeneration{0}; // increments to cancel/ignore stale ROM fetches
 
     std::string lastError;
+    ErrorInfo lastErrorInfo{};
 };
 
 // Helper to run a callable while holding the status mutex, returning its result.
