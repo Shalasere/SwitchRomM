@@ -498,8 +498,47 @@ bool httpRequestStreamMock(const std::string& rawResponse,
 }
 #endif
 
+static std::string headerValue(const std::string& headersRaw, const std::string& wantedLower) {
+    std::istringstream hs(headersRaw);
+    std::string line;
+    while (std::getline(hs, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (key != wantedLower) continue;
+        std::string val = line.substr(colon + 1);
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+        return val;
+    }
+    return {};
+}
+
+static bool shouldRetryHttpStatus(int status) {
+    return status == 408 || status == 425 || status == 429 || (status >= 500 && status <= 599);
+}
+
+static std::string buildHttpFailure(const HttpResponse& resp) {
+    std::string err = "HTTP " + std::to_string(resp.statusCode) +
+                      (resp.statusText.empty() ? "" : (" " + resp.statusText));
+    if (resp.statusCode >= 300 && resp.statusCode < 400) {
+        std::string location = headerValue(resp.headersRaw, "location");
+        if (!location.empty()) {
+            err += " redirect to " + location +
+                   " (redirects disabled; auth is not forwarded cross-host)";
+        } else {
+            err += " redirect (redirects disabled; auth is not forwarded cross-host)";
+        }
+    }
+    if (!resp.body.empty()) {
+        err += " body: " + resp.body.substr(0, resp.body.size() > 256 ? 256 : resp.body.size());
+    }
+    return err;
+}
+
 // Simple retry wrapper for JSON GET requests.
-// Retries on transport errors/timeouts, not on HTTP 4xx.
+// Retries on transport errors/timeouts and retryable HTTP statuses (408/425/429/5xx).
 static bool httpGetJsonWithRetry(const std::string& url,
                                  const std::string& authBasic,
                                  int timeoutSec,
@@ -508,6 +547,7 @@ static bool httpGetJsonWithRetry(const std::string& url,
 {
     const int maxAttempts = 3;
     std::string lastErr;
+    bool hadHttpResponse = false;
 
     std::vector<std::pair<std::string,std::string>> headers;
     headers.emplace_back("Accept", "application/json");
@@ -519,17 +559,19 @@ static bool httpGetJsonWithRetry(const std::string& url,
         HttpResponse r;
         std::string e;
         if (httpRequest("GET", url, headers, timeoutSec, r, e)) {
-            // Got a response, even if it's 4xx/5xx
+            hadHttpResponse = true;
             resp = std::move(r);
             if (resp.statusCode >= 200 && resp.statusCode < 300) {
                 return true;
             }
-            // Non-2xx: don't retry, bubble up error and snippet.
-            err = "HTTP " + std::to_string(resp.statusCode) +
-                  (resp.statusText.empty() ? "" : (" " + resp.statusText));
-            if (!resp.body.empty()) {
-                err += " body: " + resp.body.substr(0, resp.body.size() > 256 ? 256 : resp.body.size());
+
+            lastErr = buildHttpFailure(resp);
+            if (shouldRetryHttpStatus(resp.statusCode) && attempt < maxAttempts) {
+                int64_t delayNs = (attempt == 1) ? kRetryDelayFastNs : kRetryDelaySlowNs;
+                svcSleepThread(delayNs);
+                continue;
             }
+            err = lastErr;
             return false;
         }
 
@@ -541,7 +583,11 @@ static bool httpGetJsonWithRetry(const std::string& url,
         }
     }
 
-    err = "HTTP request failed after retries: " + lastErr;
+    if (hadHttpResponse) {
+        err = lastErr;
+    } else {
+        err = "HTTP request failed after retries: " + lastErr;
+    }
     return false;
 }
 
@@ -564,18 +610,9 @@ static std::string valToString(const mini::Value& v) {
     return {};
 }
 
-static std::string sanitizeAscii(const std::string& s, size_t maxlen = 64) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c >= 32 && c < 127)
-            out.push_back(static_cast<char>(c));
-        else
-            out.push_back('?');
-        if (out.size() >= maxlen) break;
-    }
-    if (out.size() < s.size()) out.append("...");
-    return out;
+static std::string previewText(const std::string& s, size_t maxlen = 64) {
+    if (s.size() <= maxlen) return s;
+    return s.substr(0, maxlen) + "...";
 }
 
 static bool parsePlatforms(const std::string& body, Status& status, std::string& err) {
@@ -732,19 +769,15 @@ static bool parseGames(const std::string& body,
         // If the list API doesn't include per-ROM platform metadata, fall back to the selected platform.
         if (g.platformId.empty()) g.platformId = platformId;
 
-        if (!g.id.empty()) {
-            if (!g.title.empty())
-                g.title = sanitizeAscii(g.title, 80);
-            status.roms.push_back(g);
-        }
+        if (!g.id.empty()) status.roms.push_back(g);
     }
 
     status.romsReady = true;
 
     if (!status.roms.empty()) {
-        std::string first  = sanitizeAscii(status.roms[0].title);
-        std::string second = status.roms.size() > 1 ? sanitizeAscii(status.roms[1].title) : "";
-        std::string third  = status.roms.size() > 2 ? sanitizeAscii(status.roms[2].title) : "";
+        std::string first  = previewText(status.roms[0].title);
+        std::string second = status.roms.size() > 1 ? previewText(status.roms[1].title) : "";
+        std::string third  = status.roms.size() > 2 ? previewText(status.roms[2].title) : "";
         logLine("Parsed ROMs: " + std::to_string(status.roms.size()) + " first=" + first);
         if (!second.empty()) logLine(" second=" + second);
         if (!third.empty())  logLine(" third=" + third);

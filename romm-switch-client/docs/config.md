@@ -22,3 +22,4 @@
 - Downloads: `<DOWNLOAD_DIR>/<Title or fsName>_<id>.<ext>` (single file, ID-suffixed for collisions) or `<DOWNLOAD_DIR>/<Title or fsName>_<id>.<ext>/00 01 ...` (multi-part DBI layout).
 - Temps: `<DOWNLOAD_DIR>/temp/<safe-12>.tmp/*.part` and `manifest.json` (safe to delete after failures/stops).
 - Log: `sdmc:/switch/romm_switch_client/log.txt`.
+- Queue snapshot: `sdmc:/switch/romm_switch_client/queue_state.json` (pending/running queue items restored on restart; completed items are skipped).

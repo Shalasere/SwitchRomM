@@ -192,3 +192,21 @@ TEST_CASE("parseGames preserves numeric ids without decimal suffix") {
     REQUIRE(games[0].platformId == "2");
     REQUIRE(games[0].platformSlug == "switch");
 }
+
+TEST_CASE("parseGames preserves UTF-8 titles in model data") {
+    const std::string body = u8R"([{
+        "id": "501",
+        "name": "Pokémon — Ōkami édition",
+        "platform_id": "2",
+        "platform_slug": "switch",
+        "fs_size_bytes": 10,
+        "fs_name": "utf8.xci"
+    }])";
+    std::vector<romm::Game> games;
+    std::string err;
+    bool ok = romm::parseGamesTest(body, "2", "http://example.com", games, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(games.size() == 1);
+    REQUIRE(games[0].title == u8"Pokémon — Ōkami édition");
+}

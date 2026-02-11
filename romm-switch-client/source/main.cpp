@@ -44,6 +44,7 @@ extern "C" void stbi_image_free(void *retval_from_stbi_load);
 #include "romm/planner.hpp"
 #include "romm/platform_prefs.hpp"
 #include "romm/queue_policy.hpp"
+#include "romm/queue_store.hpp"
 #include "romm/speed_test.hpp"
 
 using romm::Status;
@@ -206,6 +207,119 @@ static bool decodeUtf8(const std::string& s, size_t& i, uint32_t& cp) {
     return true;
 }
 
+// Fold common Latin-1/Latin-Extended codepoints to ASCII so list/search remain usable
+// even when the bitmap glyph set does not include those codepoints.
+static char foldCodepointToAscii(uint32_t cp) {
+    switch (cp) {
+        // Whitespace and punctuation
+        case 0x00A0: return ' ';
+        case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014: case 0x2015: case 0x2212: return '-';
+        case 0x2018: case 0x2019: case 0x201A: case 0x2032: return '\'';
+        case 0x201C: case 0x201D: case 0x201E: case 0x2033: return '"';
+        case 0x2026: return '.';
+        // Special letters and ligatures
+        case 0x00C6: case 0x01E2: case 0x01FC: return 'A';
+        case 0x00E6: case 0x01E3: case 0x01FD: return 'a';
+        case 0x0152: return 'O';
+        case 0x0153: return 'o';
+        case 0x00DF: return 's';
+        case 0x00DE: return 'T';
+        case 0x00FE: return 't';
+        case 0x00D0: return 'D';
+        case 0x00F0: return 'd';
+        // A/a
+        case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5:
+        case 0x0100: case 0x0102: case 0x0104: case 0x01CD: case 0x01DE: case 0x01E0:
+            return 'A';
+        case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5:
+        case 0x0101: case 0x0103: case 0x0105: case 0x01CE: case 0x01DF: case 0x01E1:
+            return 'a';
+        // C/c
+        case 0x00C7: case 0x0106: case 0x0108: case 0x010A: case 0x010C: return 'C';
+        case 0x00E7: case 0x0107: case 0x0109: case 0x010B: case 0x010D: return 'c';
+        // D/d
+        case 0x010E: case 0x0110: return 'D';
+        case 0x010F: case 0x0111: return 'd';
+        // E/e
+        case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB: case 0x0112: case 0x0114:
+        case 0x0116: case 0x0118: case 0x011A:
+            return 'E';
+        case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB: case 0x0113: case 0x0115:
+        case 0x0117: case 0x0119: case 0x011B:
+            return 'e';
+        // G/g
+        case 0x011C: case 0x011E: case 0x0120: case 0x0122: return 'G';
+        case 0x011D: case 0x011F: case 0x0121: case 0x0123: return 'g';
+        // I/i
+        case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF: case 0x0128: case 0x012A:
+        case 0x012C: case 0x012E: case 0x0130:
+            return 'I';
+        case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF: case 0x0129: case 0x012B:
+        case 0x012D: case 0x012F: case 0x0131:
+            return 'i';
+        // N/n
+        case 0x00D1: case 0x0143: case 0x0145: case 0x0147: return 'N';
+        case 0x00F1: case 0x0144: case 0x0146: case 0x0148: return 'n';
+        // O/o
+        case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6: case 0x00D8:
+        case 0x014C: case 0x014E: case 0x0150:
+            return 'O';
+        case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6: case 0x00F8:
+        case 0x014D: case 0x014F: case 0x0151:
+            return 'o';
+        // R/r
+        case 0x0154: case 0x0156: case 0x0158: return 'R';
+        case 0x0155: case 0x0157: case 0x0159: return 'r';
+        // S/s
+        case 0x015A: case 0x015C: case 0x015E: case 0x0160: return 'S';
+        case 0x015B: case 0x015D: case 0x015F: case 0x0161: case 0x017F: return 's';
+        // T/t
+        case 0x0162: case 0x0164: case 0x0166: return 'T';
+        case 0x0163: case 0x0165: case 0x0167: return 't';
+        // U/u
+        case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC: case 0x0168: case 0x016A:
+        case 0x016C: case 0x016E: case 0x0170: case 0x0172:
+            return 'U';
+        case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC: case 0x0169: case 0x016B:
+        case 0x016D: case 0x016F: case 0x0171: case 0x0173:
+            return 'u';
+        // Y/y
+        case 0x00DD: case 0x0178: return 'Y';
+        case 0x00FD: case 0x00FF: return 'y';
+        // Z/z
+        case 0x0179: case 0x017B: case 0x017D: return 'Z';
+        case 0x017A: case 0x017C: case 0x017E: return 'z';
+        default:
+            break;
+    }
+    return 0;
+}
+
+static std::string foldUtf8ToAscii(const std::string& in, bool replaceUnknown) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size();) {
+        uint32_t cp = 0;
+        if (!decodeUtf8(in, i, cp)) break;
+        if (cp < 0x80) {
+            char c = static_cast<char>(cp);
+            out.push_back((c >= 32 && c < 127) ? c : (replaceUnknown ? '?' : ' '));
+            continue;
+        }
+        if (cp >= 0x0300 && cp <= 0x036F) {
+            // Ignore standalone combining marks.
+            continue;
+        }
+        char mapped = foldCodepointToAscii(cp);
+        if (mapped != 0) {
+            out.push_back(mapped);
+        } else if (replaceUnknown) {
+            out.push_back('?');
+        }
+    }
+    return out;
+}
+
 static bool loadHd44780Font() {
     FILE* f = fopen("romfs:/HD44780_font.txt", "rb");
     if (!f) return false;
@@ -268,12 +382,25 @@ static std::string humanSize(uint64_t bytes) {
 static std::string normalizeSearchText(const std::string& in) {
     std::string out;
     out.reserve(in.size());
-    for (unsigned char ch : in) {
+    for (size_t i = 0; i < in.size();) {
+        uint32_t cp = 0;
+        if (!decodeUtf8(in, i, cp)) break;
+
+        char mapped = 0;
+        if (cp < 0x80) {
+            mapped = static_cast<char>(cp);
+        } else if (cp >= 0x0300 && cp <= 0x036F) {
+            continue; // combining mark
+        } else {
+            mapped = foldCodepointToAscii(cp);
+        }
+        if (mapped == 0) continue;
+        unsigned char ch = static_cast<unsigned char>(mapped);
         if (ch >= 'A' && ch <= 'Z') {
             out.push_back(static_cast<char>(ch - 'A' + 'a'));
         } else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
             out.push_back(static_cast<char>(ch));
-        } else if (std::isspace(ch)) {
+        } else if (std::isspace(ch) || ch == '-' || ch == '_' || ch == '/') {
             if (out.empty() || out.back() == ' ') continue;
             out.push_back(' ');
         }
@@ -361,9 +488,9 @@ static void drawText(SDL_Renderer* r, int x, int y, const std::string& txt, SDL_
     const int spacing = scale;     // tight spacing between glyphs
     int cursor = x + inset;
     // Normalize UTF-8 to our glyph set:
-    // - map U+014C/U+014D (Ō/ō) to marker 0x01
-    // - map "O"+combining macron (U+0304) and "o"+combining macron to marker 0x01
-    // - replace any other non-ASCII with '?'
+    // - preserve Ō/ō via marker 0x01
+    // - fold common accented Latin chars to ASCII
+    // - replace unknown codepoints with '?'
     std::string norm;
     norm.reserve(txt.size());
     for (size_t i = 0; i < txt.size();) {
@@ -393,9 +520,16 @@ static void drawText(SDL_Renderer* r, int x, int y, const std::string& txt, SDL_
 
         if (cp < 0x80) {
             norm.push_back(static_cast<char>(cp));
-        } else {
-            norm.push_back('?');
+            continue;
         }
+
+        if (cp >= 0x0300 && cp <= 0x036F) {
+            // Unattached combining mark.
+            continue;
+        }
+
+        char mapped = foldCodepointToAscii(cp);
+        norm.push_back(mapped != 0 ? mapped : '?');
     }
     for (char c : norm) {
         const Glyph& g = glyphFor(c);
@@ -872,30 +1006,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         selQueue = (int)snap.queueCount - 1;
 
     auto sanitize = [](const std::string& s) {
-        std::string out;
-        out.reserve(s.size());
-        for (size_t i = 0; i < s.size(); ++i) {
-            unsigned char c = static_cast<unsigned char>(s[i]);
-            if (c == 0xC5 && i + 1 < s.size()) {
-                unsigned char c2 = static_cast<unsigned char>(s[i + 1]);
-                if (c2 == 0x8C) { // Ō
-                    out.push_back('O');
-                    ++i;
-                    continue;
-                }
-                if (c2 == 0x8D) { // ō
-                    out.push_back('o');
-                    ++i;
-                    continue;
-                }
-            }
-            if (c >= 32 && c < 127) {
-                out.push_back(static_cast<char>(c));
-            } else {
-                out.push_back('?');
-            }
-        }
-        return out;
+        return foldUtf8ToAscii(s, true);
     };
 
     auto ellipsize = [&](const std::string& s, size_t maxlen) {
@@ -1746,6 +1857,13 @@ int main(int argc, char** argv) {
         romm::logLine("=== END DIAGNOSTICS SUMMARY ===");
     };
 
+    auto persistQueueState = [&]() {
+        std::string qerr;
+        if (!romm::saveQueueState(status, qerr)) {
+            romm::logLine("Queue state save warning: " + qerr);
+        }
+    };
+
     auto submitRomFetch = [&](PendingRomFetch req, const char* busyWhat) {
         {
             std::lock_guard<std::mutex> lock(status.mutex);
@@ -1880,6 +1998,12 @@ int main(int argc, char** argv) {
         if (!romm::loadLocalManifests(status, config, histErr) && !histErr.empty()) {
             romm::logLine("Manifest load warning: " + histErr);
         }
+        std::string queueErr;
+        if (!romm::loadQueueState(status, config, queueErr) && !queueErr.empty()) {
+            romm::logLine("Queue state load warning: " + queueErr);
+        } else {
+            persistQueueState();
+        }
         std::string err;
         romm::ErrorInfo errInfo;
         if (!romm::fetchPlatforms(config, status, err, &errInfo)) {
@@ -2011,6 +2135,23 @@ int main(int argc, char** argv) {
             uint64_t already = status.totalDownloadedBytes.load();
             status.totalDownloadBytes.store(already + remaining);
         };
+
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            if (!status.workerEvents.empty()) {
+                for (const auto& ev : status.workerEvents) {
+                    if (ev.type == romm::WorkerEventType::DownloadFailureState) {
+                        status.lastDownloadFailed.store(ev.failed);
+                        status.lastDownloadError = ev.message;
+                    } else if (ev.type == romm::WorkerEventType::DownloadCompletion) {
+                        status.downloadCompleted = true;
+                    }
+                }
+                status.workerEvents.clear();
+                status.workerEventsRevision++;
+            }
+        }
+
         SDL_Event e;
         // Handle input events until a view change occurs (then render the new view before more input)
         while (!viewChangedThisFrame && SDL_PollEvent(&e)) {
@@ -2190,6 +2331,7 @@ int main(int argc, char** argv) {
                                   status.currentView = Status::View::QUEUE;
                               }
                               recomputeTotals();
+                              persistQueueState();
                               romm::logLine("Queued ROM: " + enriched.title +
                                             " | Queue size=" + std::to_string(status.downloadQueue.size()));
                               gViewTraceFrames = 8;
@@ -2416,6 +2558,7 @@ int main(int argc, char** argv) {
 exit_app:
     romm::logLine("Exiting main loop. running=" + std::to_string(running));
     romm::stopDownloadWorker();
+    persistQueueState();
     if (speedTestThread.joinable()) {
         speedTestThread.join();
     }
