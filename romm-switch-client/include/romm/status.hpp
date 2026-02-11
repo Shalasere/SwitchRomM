@@ -13,6 +13,8 @@
 namespace romm {
 
 enum class QueueState { Pending, Downloading, Finalizing, Completed, Resumable, Failed, Cancelled };
+enum class RomFilter { All, Queued, Resumable, Failed, Completed, NotQueued };
+enum class RomSort { TitleAsc, TitleDesc, SizeDesc, SizeAsc };
 
 struct QueueItem {
     Game game;
@@ -33,12 +35,18 @@ struct Status {
     bool validCredentials{false};
 
     // Current UI/view state
-    enum class View { PLATFORMS, ROMS, DETAIL, QUEUE, ERROR, DOWNLOADING } currentView{View::PLATFORMS};
+    enum class View { PLATFORMS, ROMS, DETAIL, QUEUE, ERROR, DOWNLOADING, DIAGNOSTICS } currentView{View::PLATFORMS};
 
     // Data loaded from API
     std::vector<Platform> platforms;
-    std::vector<Game> roms;
+    std::vector<Game> roms;      // active (filtered/sorted) list used by UI
+    std::vector<Game> romsAll;   // master list fetched from server for indexing
     uint64_t romsRevision{0}; // bump when `roms` changes to let UI caches avoid O(N) per-frame rebuilds
+    uint64_t romsAllRevision{0};
+    std::string romSearchQuery;
+    RomFilter romFilter{RomFilter::All};
+    RomSort romSort{RomSort::TitleAsc};
+    uint64_t romListOptionsRevision{0};
     PlatformPrefs platformPrefs;
 
     // Selection indices for views
@@ -51,6 +59,7 @@ struct Status {
     std::string currentPlatformName;
     std::vector<View> navStack; // simple stack for PLATFORMS -> ROMS -> DETAIL navigation
     View prevQueueView{View::ROMS}; // where to return when leaving queue
+    View prevDiagnosticsView{View::PLATFORMS}; // where to return when leaving diagnostics
 
     // Download queue and progress
     std::vector<QueueItem> downloadQueue;
@@ -82,6 +91,14 @@ struct Status {
 
     std::string lastError;
     ErrorInfo lastErrorInfo{};
+
+    // Diagnostics probe state.
+    bool diagnosticsServerReachableKnown{false};
+    bool diagnosticsServerReachable{false};
+    bool diagnosticsProbeInFlight{false};
+    uint64_t diagnosticsProbeGeneration{0};
+    uint32_t diagnosticsLastProbeMs{0};
+    std::string diagnosticsLastProbeDetail;
 };
 
 // Helper to run a callable while holding the status mutex, returning its result.

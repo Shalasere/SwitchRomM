@@ -11,6 +11,8 @@ enum class Action {
     Left,
     Right,
     Select,
+    OpenSearch,
+    OpenDiagnostics,
     OpenQueue,
     Back,
     StartDownload,

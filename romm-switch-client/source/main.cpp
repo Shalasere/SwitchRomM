@@ -22,6 +22,7 @@
 #include <mutex>
 #include <thread>
 #include <iomanip>
+#include <cctype>
 #include "stb_image.h"
 // Fallback declarations in case the minimal stb header wasn't visible for some reason
 extern "C" unsigned char *stbi_load_from_memory(const unsigned char *buffer, int len, int *x, int *y, int *channels_in_file, int desired_channels);
@@ -95,6 +96,7 @@ static const char* viewName(Status::View v) {
         case Status::View::QUEUE: return "QUEUE";
         case Status::View::DOWNLOADING: return "DOWNLOADING";
         case Status::View::ERROR: return "ERROR";
+        case Status::View::DIAGNOSTICS: return "DIAGNOSTICS";
         default: return "UNKNOWN";
     }
 }
@@ -263,6 +265,62 @@ static std::string humanSize(uint64_t bytes) {
     return std::string(buf);
 }
 
+static std::string normalizeSearchText(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char ch : in) {
+        if (ch >= 'A' && ch <= 'Z') {
+            out.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+            out.push_back(static_cast<char>(ch));
+        } else if (std::isspace(ch)) {
+            if (out.empty() || out.back() == ' ') continue;
+            out.push_back(' ');
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+static const char* romFilterLabel(romm::RomFilter f) {
+    switch (f) {
+        case romm::RomFilter::All: return "All";
+        case romm::RomFilter::Queued: return "Queued";
+        case romm::RomFilter::Resumable: return "Resumable";
+        case romm::RomFilter::Failed: return "Failed";
+        case romm::RomFilter::Completed: return "Completed";
+        case romm::RomFilter::NotQueued: return "NotQueued";
+        default: return "All";
+    }
+}
+
+static const char* romSortLabel(romm::RomSort s) {
+    switch (s) {
+        case romm::RomSort::TitleAsc: return "Title A-Z";
+        case romm::RomSort::TitleDesc: return "Title Z-A";
+        case romm::RomSort::SizeDesc: return "Size High-Low";
+        case romm::RomSort::SizeAsc: return "Size Low-High";
+        default: return "Title A-Z";
+    }
+}
+
+static bool promptSearchQuery(std::string& query) {
+    SwkbdConfig kbd;
+    if (R_FAILED(swkbdCreate(&kbd, 0))) {
+        return false;
+    }
+    swkbdConfigMakePresetDefault(&kbd);
+    swkbdConfigSetHeaderText(&kbd, "ROM Search");
+    swkbdConfigSetGuideText(&kbd, "Enter title text (blank clears filter)");
+    swkbdConfigSetInitialText(&kbd, query.c_str());
+    char buf[256] = {};
+    Result rc = swkbdShow(&kbd, buf, sizeof(buf));
+    swkbdClose(&kbd);
+    if (R_FAILED(rc)) return false;
+    query = buf;
+    return true;
+}
+
 static const Glyph& glyphFor(char c) {
     // Custom markers first.
     if (c == '\x01') return kOMacron; // Ō/ō marker
@@ -356,7 +414,7 @@ static void drawText(SDL_Renderer* r, int x, int y, const std::string& txt, SDL_
 }
 
 // Render the current view (header/footer + body) based on shared Status state.
-// Views: PLATFORMS, ROMS, DETAIL, QUEUE, DOWNLOADING, ERROR.
+// Views: PLATFORMS, ROMS, DETAIL, QUEUE, DOWNLOADING, ERROR, DIAGNOSTICS.
 static void renderStatus(SDL_Renderer* renderer, const Status& status, const Config& config) {
     if (!renderer) return;
 
@@ -373,13 +431,18 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         uint64_t queueTotalBytes{0};
         uint64_t downloadQueueRevision{0};
         uint64_t downloadHistoryRevision{0};
+        uint64_t historyCount{0};
         int selectedPlatformIndex{0};
         int selectedRomIndex{0};
         int selectedQueueIndex{0};
         std::string currentPlatformId;
         std::string currentPlatformSlug;
         std::string currentPlatformName;
+        std::string romSearchQuery;
+        romm::RomFilter romFilter{romm::RomFilter::All};
+        romm::RomSort romSort{romm::RomSort::TitleAsc};
         Status::View prevQueueView{Status::View::PLATFORMS};
+        Status::View prevDiagnosticsView{Status::View::PLATFORMS};
         bool downloadCompleted{false};
         bool downloadWorkerRunning{false};
         bool lastDownloadFailed{false};
@@ -392,6 +455,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         std::string lastError;
         romm::ErrorInfo lastErrorInfo{};
         double lastSpeedMBps{0.0};
+        bool diagnosticsServerReachableKnown{false};
+        bool diagnosticsServerReachable{false};
+        bool diagnosticsProbeInFlight{false};
+        uint32_t diagnosticsLastProbeMs{0};
+        std::string diagnosticsLastProbeDetail;
     } snap;
 
     static std::unordered_map<std::string, romm::QueueState> sQueueStateById;
@@ -412,13 +480,18 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.queueCount = status.downloadQueue.size();
         snap.downloadQueueRevision = status.downloadQueueRevision;
         snap.downloadHistoryRevision = status.downloadHistoryRevision;
+        snap.historyCount = status.downloadHistory.size();
         snap.selectedPlatformIndex = status.selectedPlatformIndex;
         snap.selectedRomIndex = status.selectedRomIndex;
         snap.selectedQueueIndex = status.selectedQueueIndex;
         snap.currentPlatformId = status.currentPlatformId;
         snap.currentPlatformSlug = status.currentPlatformSlug;
         snap.currentPlatformName = status.currentPlatformName;
+        snap.romSearchQuery = status.romSearchQuery;
+        snap.romFilter = status.romFilter;
+        snap.romSort = status.romSort;
         snap.prevQueueView = status.prevQueueView;
+        snap.prevDiagnosticsView = status.prevDiagnosticsView;
         snap.downloadCompleted = status.downloadCompleted;
         snap.downloadWorkerRunning = status.downloadWorkerRunning.load();
         snap.lastDownloadFailed = status.lastDownloadFailed.load();
@@ -431,6 +504,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.lastError = status.lastError;
         snap.lastErrorInfo = status.lastErrorInfo;
         snap.lastSpeedMBps = status.lastSpeedMBps;
+        snap.diagnosticsServerReachableKnown = status.diagnosticsServerReachableKnown;
+        snap.diagnosticsServerReachable = status.diagnosticsServerReachable;
+        snap.diagnosticsProbeInFlight = status.diagnosticsProbeInFlight;
+        snap.diagnosticsLastProbeMs = status.diagnosticsLastProbeMs;
+        snap.diagnosticsLastProbeDetail = status.diagnosticsLastProbeDetail;
 
         // Copy only the visible slice for large lists to avoid per-frame O(N) copies.
         if (snap.view == Status::View::ROMS) {
@@ -559,6 +637,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             case Status::View::QUEUE: romm::logLine("View: QUEUE"); gRomsDebugFrames = 2; break;
             case Status::View::DOWNLOADING: romm::logLine("View: DOWNLOADING"); break;
             case Status::View::ERROR: romm::logLine("View: ERROR"); break;
+            case Status::View::DIAGNOSTICS: romm::logLine("View: DIAGNOSTICS"); break;
             default: break;
         }
         gLastLoggedView = snap.view;
@@ -591,6 +670,10 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         case Status::View::ERROR:
             SDL_SetRenderDrawColor(renderer, 90, 0, 0, 255);
             headerBar = {150, 20, 20, 255};
+            break;
+        case Status::View::DIAGNOSTICS:
+            SDL_SetRenderDrawColor(renderer, 30, 70, 40, 255);
+            headerBar = {40, 120, 70, 255};
             break;
     }
     SDL_RenderClear(renderer);
@@ -842,6 +925,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         }
         header = "ROMS " + (platLabel.empty() ? "" : ("[" + platLabel + "] ")) +
                  "Count: " + std::to_string(snap.romsCount);
+        header += "  Filter: " + std::string(romFilterLabel(snap.romFilter));
+        header += "  Sort: " + std::string(romSortLabel(snap.romSort));
+        if (!snap.romSearchQuery.empty()) {
+            header += "  Search: " + ellipsize(snap.romSearchQuery, 12);
+        }
         SDL_Color fg{255,255,255,255};
         auto drawFilledCircle = [&](int cx, int cy, int r, SDL_Color c) {
             SDL_SetRenderDrawColor(renderer, c.r, c.g, c.b, c.a);
@@ -1060,6 +1148,58 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         }
     } else if (snap.view == Status::View::DOWNLOADING) {
         header = "DOWNLOADING";
+    } else if (snap.view == Status::View::DIAGNOSTICS) {
+        header = "DIAGNOSTICS";
+        SDL_Color fg{255,255,255,255};
+        SDL_Color sub{210,240,220,255};
+        SDL_Rect box{64, 96, 1280 - 128, 720 - 96 - 64 - 48};
+        SDL_SetRenderDrawColor(renderer, 10, 60, 28, 220);
+        SDL_RenderFillRect(renderer, &box);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 90);
+        SDL_RenderDrawRect(renderer, &box);
+
+        uint64_t freeBytes = romm::getFreeSpace(config.downloadDir);
+        std::string reach = "Unknown";
+        if (snap.diagnosticsProbeInFlight) {
+            reach = "Checking...";
+        } else if (snap.diagnosticsServerReachableKnown) {
+            reach = snap.diagnosticsServerReachable ? "Reachable" : "Unreachable";
+        }
+
+        int y = box.y + 18;
+        drawText(renderer, box.x + 16, y, "Config", fg, 2); y += 26;
+        drawText(renderer, box.x + 16, y, "Server: " + ellipsize(config.serverUrl, 58), sub, 2); y += 24;
+        drawText(renderer, box.x + 16, y, "DownloadDir: " + ellipsize(config.downloadDir, 50), sub, 2); y += 24;
+        drawText(renderer, box.x + 16, y,
+                 "Timeout: " + std::to_string(config.httpTimeoutSeconds) +
+                 "s  FAT32: " + std::string(config.fat32Safe ? "true" : "false") +
+                 "  Log: " + config.logLevel,
+                 sub, 2); y += 30;
+
+        drawText(renderer, box.x + 16, y, "Health", fg, 2); y += 26;
+        drawText(renderer, box.x + 16, y, "Server: " + reach, sub, 2); y += 24;
+        if (!snap.diagnosticsLastProbeDetail.empty()) {
+            drawText(renderer, box.x + 16, y, "Probe: " + ellipsize(snap.diagnosticsLastProbeDetail, 62), sub, 2); y += 24;
+        } else {
+            drawText(renderer, box.x + 16, y, "Probe: (none yet)", sub, 2); y += 24;
+        }
+        drawText(renderer, box.x + 16, y, "SD Free: " + humanSize(freeBytes), sub, 2); y += 30;
+
+        drawText(renderer, box.x + 16, y, "Queue", fg, 2); y += 26;
+        drawText(renderer, box.x + 16, y,
+                 "Active: " + std::to_string(snap.queueCount) +
+                 "  History: " + std::to_string(snap.historyCount) +
+                 "  Downloading: " + std::string(snap.downloadWorkerRunning ? "yes" : "no"),
+                 sub, 2); y += 30;
+
+        drawText(renderer, box.x + 16, y, "Last Error", fg, 2); y += 26;
+        std::string errHead = std::string(romm::errorCategoryLabel(snap.lastErrorInfo.category)) +
+                              " / " + romm::errorCodeLabel(snap.lastErrorInfo.code);
+        drawText(renderer, box.x + 16, y, errHead, sub, 2); y += 24;
+        drawText(renderer, box.x + 16, y, ellipsize(snap.lastError.empty() ? "(none)" : snap.lastError, 64), sub, 2); y += 24;
+        drawText(renderer, box.x + 16, box.y + box.h - 52,
+                 "A=export summary to log  B=back  R=refresh probe",
+                 fg, 2);
     } else if (snap.view == Status::View::ERROR) {
         header = "ERROR";
         SDL_Color fg{255,255,255,255};
@@ -1151,10 +1291,10 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
 
     switch (snap.view) {
         case Status::View::PLATFORMS:
-            controls = "A=open platform B=back Y=queue Plus=exit D-Pad=scroll hold";
+            controls = "A=open platform B=back Y=queue R=diagnostics Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::ROMS:
-            controls = "A=details B=back Y=queue Plus=exit D-Pad=scroll hold";
+            controls = "A=details B=back Y=queue Minus=search DPad L/R=filter/sort";
             break;
         case Status::View::DETAIL:
             controls = "A=queue+open B=back Y=queue Plus=exit";
@@ -1169,6 +1309,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             break;
         case Status::View::ERROR:
             controls = "B=exit Plus=exit";
+            break;
+        case Status::View::DIAGNOSTICS:
+            controls = "A=export summary B=back R=refresh Plus=exit";
             break;
         default:
             controls = "Plus=exit";
@@ -1289,10 +1432,24 @@ int main(int argc, char** argv) {
         std::string error;
         romm::ErrorInfo errorInfo{};
     };
+    struct DiagProbeReq {
+        uint64_t generation{0};
+    };
+    struct DiagProbeResult {
+        uint64_t generation{0};
+        bool ok{false};
+        std::string detail;
+        romm::ErrorInfo errorInfo{};
+    };
     romm::LatestJobWorker<PendingRomFetch, RomFetchResult> romFetchJobs;
+    romm::LatestJobWorker<DiagProbeReq, DiagProbeResult> diagProbeJobs;
     std::string cfgError;
     romm::ErrorInfo cfgErrInfo;
     bool running = true;
+    uint64_t appliedRomsAllRev = 0;
+    uint64_t appliedRomsOptionsRev = 0;
+    uint64_t appliedQueueRevForRoms = 0;
+    uint64_t appliedHistRevForRoms = 0;
     ScrollHold scrollHold;
     auto resetNav = [&]() { status.navStack.clear(); };
 
@@ -1365,6 +1522,187 @@ int main(int argc, char** argv) {
         return out;
     };
 
+    auto runDiagProbe = [&]() -> DiagProbeResult {
+        DiagProbeResult out;
+        std::string body;
+        std::string err;
+        romm::ErrorInfo info;
+        const std::string url = config.serverUrl + "/api/platforms?limit=1";
+        if (!romm::fetchBinary(config, url, body, err, &info)) {
+            out.ok = false;
+            out.detail = err;
+            out.errorInfo = info;
+            return out;
+        }
+        out.ok = true;
+        out.detail = "HTTP OK";
+        return out;
+    };
+
+    auto filterNeedsState = [](romm::RomFilter f) {
+        return f != romm::RomFilter::All;
+    };
+
+    // Rebuild `status.roms` from `status.romsAll` using cached normalized titles.
+    // Must be called with `status.mutex` held.
+    auto rebuildVisibleRomsLocked = [&](bool resetSelection) {
+        static uint64_t sIndexBuiltFor = 0;
+        static std::vector<std::string> sNormalizedTitles;
+        static uint64_t sCompletionCacheBuiltFor = 0;
+        static std::unordered_map<std::string, bool> sCompletionById;
+
+        if (sIndexBuiltFor != status.romsAllRevision || sNormalizedTitles.size() != status.romsAll.size()) {
+            sNormalizedTitles.clear();
+            sNormalizedTitles.reserve(status.romsAll.size());
+            for (const auto& g : status.romsAll) {
+                sNormalizedTitles.push_back(normalizeSearchText(g.title));
+            }
+            sIndexBuiltFor = status.romsAllRevision;
+        }
+        if (sCompletionCacheBuiltFor != status.romsAllRevision) {
+            sCompletionById.clear();
+            sCompletionCacheBuiltFor = status.romsAllRevision;
+        }
+
+        std::unordered_map<std::string, romm::QueueState> stateById;
+        stateById.reserve(status.downloadQueue.size() + status.downloadHistory.size());
+        for (const auto& qi : status.downloadHistory) {
+            if (!qi.game.id.empty()) stateById[qi.game.id] = qi.state;
+        }
+        for (const auto& qi : status.downloadQueue) {
+            if (!qi.game.id.empty()) stateById[qi.game.id] = qi.state;
+        }
+
+        auto isCompletedCached = [&](const romm::Game& g) -> bool {
+            if (g.id.empty()) return false;
+            auto it = sCompletionById.find(g.id);
+            if (it != sCompletionById.end()) return it->second;
+            bool v = romm::isGameCompletedOnDisk(g, config);
+            sCompletionById[g.id] = v;
+            return v;
+        };
+
+        auto matchesFilter = [&](const romm::Game& g) -> bool {
+            auto it = g.id.empty() ? stateById.end() : stateById.find(g.id);
+            std::optional<romm::QueueState> st;
+            if (it != stateById.end()) st = it->second;
+            switch (status.romFilter) {
+                case romm::RomFilter::All:
+                    return true;
+                case romm::RomFilter::Queued:
+                    return st.has_value() &&
+                           (*st == romm::QueueState::Pending ||
+                            *st == romm::QueueState::Downloading ||
+                            *st == romm::QueueState::Finalizing);
+                case romm::RomFilter::Resumable:
+                    return st.has_value() && *st == romm::QueueState::Resumable;
+                case romm::RomFilter::Failed:
+                    return st.has_value() && *st == romm::QueueState::Failed;
+                case romm::RomFilter::Completed:
+                    return (st.has_value() && *st == romm::QueueState::Completed) || isCompletedCached(g);
+                case romm::RomFilter::NotQueued:
+                    return !st.has_value() && !isCompletedCached(g);
+                default:
+                    return true;
+            }
+        };
+
+        std::vector<size_t> indices;
+        indices.reserve(status.romsAll.size());
+        std::string searchNorm = normalizeSearchText(status.romSearchQuery);
+        for (size_t i = 0; i < status.romsAll.size(); ++i) {
+            if (!searchNorm.empty()) {
+                if (i >= sNormalizedTitles.size() || sNormalizedTitles[i].find(searchNorm) == std::string::npos) {
+                    continue;
+                }
+            }
+            if (!matchesFilter(status.romsAll[i])) continue;
+            indices.push_back(i);
+        }
+
+        auto cmpTitleAsc = [&](size_t a, size_t b) {
+            const std::string& ta = (a < sNormalizedTitles.size()) ? sNormalizedTitles[a] : status.romsAll[a].title;
+            const std::string& tb = (b < sNormalizedTitles.size()) ? sNormalizedTitles[b] : status.romsAll[b].title;
+            if (ta != tb) return ta < tb;
+            return status.romsAll[a].id < status.romsAll[b].id;
+        };
+
+        switch (status.romSort) {
+            case romm::RomSort::TitleAsc:
+                std::sort(indices.begin(), indices.end(), cmpTitleAsc);
+                break;
+            case romm::RomSort::TitleDesc:
+                std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return cmpTitleAsc(b, a); });
+                break;
+            case romm::RomSort::SizeDesc:
+                std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+                    if (status.romsAll[a].sizeBytes != status.romsAll[b].sizeBytes) {
+                        return status.romsAll[a].sizeBytes > status.romsAll[b].sizeBytes;
+                    }
+                    return cmpTitleAsc(a, b);
+                });
+                break;
+            case romm::RomSort::SizeAsc:
+                std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+                    if (status.romsAll[a].sizeBytes != status.romsAll[b].sizeBytes) {
+                        return status.romsAll[a].sizeBytes < status.romsAll[b].sizeBytes;
+                    }
+                    return cmpTitleAsc(a, b);
+                });
+                break;
+        }
+
+        std::vector<romm::Game> rebuilt;
+        rebuilt.reserve(indices.size());
+        for (size_t idx : indices) rebuilt.push_back(status.romsAll[idx]);
+        status.roms = std::move(rebuilt);
+        status.romsRevision++;
+
+        if (resetSelection) {
+            status.selectedRomIndex = 0;
+        } else if (status.selectedRomIndex >= (int)status.roms.size()) {
+            status.selectedRomIndex = status.roms.empty() ? 0 : (int)status.roms.size() - 1;
+        } else if (status.selectedRomIndex < 0) {
+            status.selectedRomIndex = 0;
+        }
+    };
+
+    auto exportDiagnosticsSummary = [&]() {
+        std::vector<std::string> lines;
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            lines.push_back("Diagnostics Summary");
+            lines.push_back("View=" + std::string(viewName(status.currentView)));
+            lines.push_back("ServerURL=" + config.serverUrl);
+            lines.push_back("DownloadDir=" + config.downloadDir);
+            lines.push_back("TimeoutSec=" + std::to_string(config.httpTimeoutSeconds));
+            lines.push_back(std::string("Fat32Safe=") + (config.fat32Safe ? "true" : "false"));
+            lines.push_back("LogLevel=" + config.logLevel);
+            lines.push_back("CurrentPlatformSlug=" + status.currentPlatformSlug);
+            lines.push_back("ROMsVisible=" + std::to_string(status.roms.size()) +
+                            " ROMsAll=" + std::to_string(status.romsAll.size()));
+            lines.push_back("ROMFilter=" + std::string(romFilterLabel(status.romFilter)) +
+                            " Sort=" + std::string(romSortLabel(status.romSort)) +
+                            " Search=" + status.romSearchQuery);
+            lines.push_back("Queue=" + std::to_string(status.downloadQueue.size()) +
+                            " History=" + std::to_string(status.downloadHistory.size()) +
+                            " WorkerRunning=" + std::string(status.downloadWorkerRunning.load() ? "yes" : "no"));
+            lines.push_back("ServerReachableKnown=" + std::string(status.diagnosticsServerReachableKnown ? "yes" : "no") +
+                            " Reachable=" + std::string(status.diagnosticsServerReachable ? "yes" : "no") +
+                            " ProbeInFlight=" + std::string(status.diagnosticsProbeInFlight ? "yes" : "no"));
+            if (!status.diagnosticsLastProbeDetail.empty()) {
+                lines.push_back("ProbeDetail=" + status.diagnosticsLastProbeDetail);
+            }
+            lines.push_back("LastErrorType=" + std::string(romm::errorCategoryLabel(status.lastErrorInfo.category)) +
+                            "/" + romm::errorCodeLabel(status.lastErrorInfo.code));
+            if (!status.lastError.empty()) lines.push_back("LastErrorDetail=" + status.lastError);
+            lines.push_back("SD_Free=" + humanSize(romm::getFreeSpace(config.downloadDir)));
+        }
+        romm::logLine("=== BEGIN DIAGNOSTICS SUMMARY ===");
+        for (const auto& l : lines) romm::logLine(l);
+        romm::logLine("=== END DIAGNOSTICS SUMMARY ===");
+    };
+
     auto submitRomFetch = [&](PendingRomFetch req, const char* busyWhat) {
         {
             std::lock_guard<std::mutex> lock(status.mutex);
@@ -1379,7 +1717,25 @@ int main(int argc, char** argv) {
         romFetchJobs.submit(req);
     };
 
+    auto submitDiagnosticsProbe = [&]() {
+        DiagProbeReq req{};
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.diagnosticsProbeGeneration++;
+            req.generation = status.diagnosticsProbeGeneration;
+            status.diagnosticsProbeInFlight = true;
+            status.diagnosticsLastProbeMs = SDL_GetTicks();
+            status.diagnosticsLastProbeDetail.clear();
+        }
+        diagProbeJobs.submit(req);
+    };
+
     romFetchJobs.start(runRomFetch);
+    diagProbeJobs.start([&](const DiagProbeReq& req) -> DiagProbeResult {
+        DiagProbeResult out = runDiagProbe();
+        out.generation = req.generation;
+        return out;
+    });
 
     // Use positional button codes on Switch (A=bottom, B=right, X=left, Y=top).
     // We keep the UI text in Nintendo labels, but map input based on what SDL actually reports.
@@ -1529,12 +1885,12 @@ int main(int argc, char** argv) {
                 } else {
                     finalCount = done->games.size();
                     if (!done->games.empty()) firstTitle = done->games[0].title;
-                    status.roms = std::move(done->games);
-                    status.romsRevision++;
+                    status.romsAll = std::move(done->games);
+                    status.romsAllRevision++;
+                    rebuildVisibleRomsLocked(true);
                     status.currentPlatformId = done->req.pid;
                     status.currentPlatformSlug = done->req.slug;
                     status.currentPlatformName = done->req.name;
-                    status.selectedRomIndex = 0;
                     status.navStack.clear();
                     status.currentView = Status::View::ROMS;
                     status.netBusy.store(false);
@@ -1549,6 +1905,37 @@ int main(int argc, char** argv) {
                 romm::logLine("Fetched ROMs count=" + std::to_string(finalCount) +
                               (firstTitle.empty() ? "" : " first=" + firstTitle));
             }
+        }
+        if (auto probe = diagProbeJobs.pollResult()) {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            if (probe->generation == status.diagnosticsProbeGeneration) {
+                status.diagnosticsProbeInFlight = false;
+                status.diagnosticsServerReachableKnown = true;
+                status.diagnosticsServerReachable = probe->ok;
+                status.diagnosticsLastProbeMs = SDL_GetTicks();
+                status.diagnosticsLastProbeDetail = probe->ok
+                    ? probe->detail
+                    : probe->detail + " (" + romm::errorCodeLabel(probe->errorInfo.code) + ")";
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            bool needRebuild = false;
+            if (status.romsAllRevision != appliedRomsAllRev ||
+                status.romListOptionsRevision != appliedRomsOptionsRev) {
+                needRebuild = true;
+            } else if (filterNeedsState(status.romFilter) &&
+                       (status.downloadQueueRevision != appliedQueueRevForRoms ||
+                        status.downloadHistoryRevision != appliedHistRevForRoms)) {
+                needRebuild = true;
+            }
+            if (needRebuild) {
+                rebuildVisibleRomsLocked(false);
+            }
+            appliedRomsAllRev = status.romsAllRevision;
+            appliedRomsOptionsRev = status.romListOptionsRevision;
+            appliedQueueRevForRoms = status.downloadQueueRevision;
+            appliedHistRevForRoms = status.downloadHistoryRevision;
         }
         processCoverResult(renderer);
         bool viewChangedThisFrame = false;
@@ -1605,6 +1992,48 @@ int main(int argc, char** argv) {
                     scrollHold.nextMs = SDL_GetTicks() + 240;
                     scrollHold.repeats = 0;
                     break;
+                case romm::Action::Left: {
+                    bool changed = false;
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        if (status.currentView == Status::View::ROMS) {
+                            switch (status.romFilter) {
+                                case romm::RomFilter::All: status.romFilter = romm::RomFilter::Queued; break;
+                                case romm::RomFilter::Queued: status.romFilter = romm::RomFilter::Resumable; break;
+                                case romm::RomFilter::Resumable: status.romFilter = romm::RomFilter::Failed; break;
+                                case romm::RomFilter::Failed: status.romFilter = romm::RomFilter::Completed; break;
+                                case romm::RomFilter::Completed: status.romFilter = romm::RomFilter::NotQueued; break;
+                                case romm::RomFilter::NotQueued: status.romFilter = romm::RomFilter::All; break;
+                            }
+                            status.romListOptionsRevision++;
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
+                        romm::logLine(std::string("ROM filter -> ") + romFilterLabel(status.romFilter));
+                    }
+                    break;
+                }
+                case romm::Action::Right: {
+                    bool changed = false;
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        if (status.currentView == Status::View::ROMS) {
+                            switch (status.romSort) {
+                                case romm::RomSort::TitleAsc: status.romSort = romm::RomSort::TitleDesc; break;
+                                case romm::RomSort::TitleDesc: status.romSort = romm::RomSort::SizeDesc; break;
+                                case romm::RomSort::SizeDesc: status.romSort = romm::RomSort::SizeAsc; break;
+                                case romm::RomSort::SizeAsc: status.romSort = romm::RomSort::TitleAsc; break;
+                            }
+                            status.romListOptionsRevision++;
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
+                        romm::logLine(std::string("ROM sort -> ") + romSortLabel(status.romSort));
+                    }
+                    break;
+                }
                 case romm::Action::Select: {
                     // A/Select: context-sensitive (fetch ROMs, open detail, or enqueue)
                     Status::View currentView;
@@ -1692,14 +2121,26 @@ int main(int argc, char** argv) {
                               }
                               {
                                   std::lock_guard<std::mutex> lock(status.mutex);
-                                  status.roms[sel] = enriched;
-                                  status.romsRevision++;
+                                  if (sel >= 0 && sel < (int)status.roms.size()) {
+                                      status.roms[sel] = enriched;
+                                  }
+                                  for (auto& mg : status.romsAll) {
+                                      if (mg.id == enriched.id) {
+                                          mg = enriched;
+                                          break;
+                                      }
+                                  }
                                   romm::QueueItem qi;
                                   qi.game = enriched;
                                   qi.bundle = bundle;
                                   qi.state = romm::QueueState::Pending;
                                   status.downloadQueue.push_back(std::move(qi));
                                   status.downloadQueueRevision++;
+                                  if (filterNeedsState(status.romFilter)) {
+                                      rebuildVisibleRomsLocked(false);
+                                  } else {
+                                      status.romsRevision++;
+                                  }
                                   status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
                                   status.downloadCompleted = false; // new work pending, clear stale banner
                                   status.prevQueueView = Status::View::DETAIL;
@@ -1711,7 +2152,48 @@ int main(int argc, char** argv) {
                               gViewTraceFrames = 8;
                               viewChangedThisFrame = true;
                           }
+                    } else if (currentView == Status::View::DIAGNOSTICS) {
+                        exportDiagnosticsSummary();
+                        if (!diagProbeJobs.busy()) submitDiagnosticsProbe();
                     }
+                    break;
+                }
+                case romm::Action::OpenSearch: {
+                    std::string curQuery;
+                    bool inRoms = false;
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        inRoms = (status.currentView == Status::View::ROMS);
+                        curQuery = status.romSearchQuery;
+                    }
+                    if (!inRoms) break;
+                    std::string next = curQuery;
+                    if (promptSearchQuery(next)) {
+                        next = normalizeSearchText(next);
+                        if (next != curQuery) {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            status.romSearchQuery = next;
+                            status.romListOptionsRevision++;
+                            status.selectedRomIndex = 0;
+                            romm::logLine("ROM search updated: " + (next.empty() ? std::string("<cleared>") : next));
+                        }
+                    }
+                    break;
+                }
+                case romm::Action::OpenDiagnostics: {
+                    bool shouldProbe = false;
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        if (status.currentView == Status::View::PLATFORMS) {
+                            status.prevDiagnosticsView = status.currentView;
+                            status.currentView = Status::View::DIAGNOSTICS;
+                            viewChangedThisFrame = true;
+                            shouldProbe = !status.diagnosticsProbeInFlight;
+                        } else if (status.currentView == Status::View::DIAGNOSTICS) {
+                            shouldProbe = !status.diagnosticsProbeInFlight;
+                        } // Ignore from all other views.
+                    }
+                    if (shouldProbe) submitDiagnosticsProbe();
                     break;
                 }
                 case romm::Action::Back: {
@@ -1758,6 +2240,11 @@ int main(int argc, char** argv) {
                             viewChangedThisFrame = true;
                         } else if (cur == Status::View::PLATFORMS) {
                             romm::logLine("Back on PLATFORMS ignored.");
+                        } else if (cur == Status::View::DIAGNOSTICS) {
+                            status.currentView = status.prevDiagnosticsView;
+                            gViewTraceFrames = 8;
+                            romm::logLine(std::string("Back from DIAGNOSTICS to ") + viewName(status.currentView) + ".");
+                            viewChangedThisFrame = true;
                         } else if (cur == Status::View::ERROR) {
                             running = false;
                         }
@@ -1890,6 +2377,7 @@ exit_app:
         speedTestThread.join();
     }
     romFetchJobs.stop();
+    diagProbeJobs.stop();
     // Restore default sleep/dim behavior on exit.
     appletSetMediaPlaybackState(false);
     appletSetAutoSleepDisabled(false);
