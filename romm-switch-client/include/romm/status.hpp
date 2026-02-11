@@ -67,6 +67,7 @@ struct Status {
     uint64_t downloadQueueRevision{0};   // bump when queue contents or states change
     uint64_t downloadHistoryRevision{0}; // bump when history changes
     std::atomic<size_t> currentDownloadIndex{0};
+    std::atomic<size_t> currentDownloadFileCount{0};
     std::atomic<uint64_t> currentDownloadSize{0};
     std::atomic<uint64_t> currentDownloadedBytes{0};
     std::atomic<uint64_t> totalDownloadBytes{0};

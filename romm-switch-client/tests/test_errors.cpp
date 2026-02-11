@@ -23,3 +23,17 @@ TEST_CASE("classifyError maps missing required config") {
     REQUIRE(info.code == romm::ErrorCode::MissingRequiredField);
     REQUIRE_FALSE(info.retryable);
 }
+
+TEST_CASE("classifyError maps unsupported config schema version") {
+    romm::ErrorInfo info = romm::classifyError("Unsupported config schema_version 999; max supported is 1.", romm::ErrorCategory::Config);
+    REQUIRE(info.category == romm::ErrorCategory::Config);
+    REQUIRE(info.code == romm::ErrorCode::ConfigUnsupported);
+    REQUIRE_FALSE(info.retryable);
+}
+
+TEST_CASE("classifyError maps free-space failures") {
+    romm::ErrorInfo info = romm::classifyError("Not enough free space (need 100 bytes + margin, have 1)", romm::ErrorCategory::Filesystem);
+    REQUIRE(info.category == romm::ErrorCategory::Filesystem);
+    REQUIRE(info.code == romm::ErrorCode::InvalidData);
+    REQUIRE_FALSE(info.retryable);
+}

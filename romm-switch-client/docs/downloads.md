@@ -10,11 +10,12 @@
 - File selection: fetch `/api/roms/{id}`, pick best `.xci/.nsp` from `files[]`, build `/api/roms/{id}/content/<fs_name>?file_ids=<id>`. No hidden-folder zips.
 
 ### HUD / badges
-- Shows Current and Overall progress. When all files are finalized, HUD switches to "Downloads complete".
+- Shows Current and Overall progress. Multi-file bundles show file progress (`N/M`). When all files are finalized, HUD switches to "Downloads complete".
 - Badges per ROM: hollow (not queued), grey (queued), white (downloading), green (completed on disk), orange (resumable), red (failed).
 - On startup, manifests in `temp/` load as Resumable (so you can retry), and final files on disk mark as Completed.
 - Failures show a red "Failed: ." line. Short reads trigger a retry; if Range isn't supported that retry restarts the current ROM.
 - Adding items while downloading recalculates overall bytes immediately; the overall % can dip when you enqueue mid-run (queue is not locked).
+- Queue view surfaces a retained "Recent failures" summary even when active queue items are empty.
 
 ### Logging (see `logging.md`)
 - Info: start/finish per ROM, finalize path, queue actions, failures.
@@ -29,6 +30,7 @@
 - Temp folders remain on failure/stop; safe to delete manually from `<download_dir>/temp/`.
 - On restart, the app reuses complete parts and a single partial part using `manifest.json` (size-only validation today). Resume is enforced to contiguous parts only; any gap invalidates later parts. If Range is unavailable, the ROM restarts from zero.
 - Preflight logs HTTP status; on tiny Content-Length or 404 we refresh metadata once, then fail fast.
+- Free-space is checked up front and re-checked when rotating to each part file; failures are surfaced to UI/error diagnostics.
 - Finalize logs the SD error string; single-part finalize falls back to copy-on-write if a rename fails.
 - Slow WAN links: timeouts are bounded by `http_timeout_seconds` (also applied as stall detection during stream). Increase cautiously; too low can abort on jitter, too high can hang on dead links.
 

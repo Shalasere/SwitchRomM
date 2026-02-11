@@ -449,6 +449,13 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         std::string lastDownloadError;
         std::string currentDownloadTitle;
         int currentDownloadIndex{0};
+        int currentDownloadFileCount{0};
+        uint64_t totalDownloadBytes{0};
+        uint64_t totalDownloadedBytes{0};
+        uint64_t currentDownloadSize{0};
+        uint64_t currentDownloadedBytes{0};
+        uint64_t failedHistoryCount{0};
+        std::vector<romm::QueueItem> recentFailed;
         bool netBusy{false};
         uint32_t netBusySinceMs{0};
         std::string netBusyWhat;
@@ -498,6 +505,11 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.lastDownloadError = status.lastDownloadError;
         snap.currentDownloadTitle = status.currentDownloadTitle;
         snap.currentDownloadIndex = status.currentDownloadIndex.load();
+        snap.currentDownloadFileCount = static_cast<int>(status.currentDownloadFileCount.load());
+        snap.totalDownloadBytes = status.totalDownloadBytes.load();
+        snap.totalDownloadedBytes = status.totalDownloadedBytes.load();
+        snap.currentDownloadSize = status.currentDownloadSize.load();
+        snap.currentDownloadedBytes = status.currentDownloadedBytes.load();
         snap.netBusy = status.netBusy.load();
         snap.netBusySinceMs = status.netBusySinceMs.load();
         snap.netBusyWhat = status.netBusyWhat;
@@ -571,6 +583,17 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             rebuildHistRev = snap.downloadHistoryRevision;
             needRebuildQueueState = true;
         }
+
+        constexpr size_t kRecentFailedMax = 3;
+        snap.recentFailed.clear();
+        for (auto it = status.downloadHistory.rbegin(); it != status.downloadHistory.rend(); ++it) {
+            if (it->state != romm::QueueState::Failed && it->state != romm::QueueState::Cancelled) continue;
+            snap.failedHistoryCount++;
+            if (snap.recentFailed.size() < kRecentFailedMax) {
+                snap.recentFailed.push_back(*it);
+            }
+        }
+        std::reverse(snap.recentFailed.begin(), snap.recentFailed.end());
     }
     if (needRebuildQueueState) {
         std::unordered_map<std::string, romm::QueueState> tmp;
@@ -737,10 +760,10 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         }
     }
 
-    uint64_t totalBytes = status.totalDownloadBytes.load();
-    uint64_t totalDoneRaw = status.totalDownloadedBytes.load();
-    uint64_t curBytes = status.currentDownloadSize.load();
-    uint64_t curDone = status.currentDownloadedBytes.load();
+    uint64_t totalBytes = snap.totalDownloadBytes;
+    uint64_t totalDoneRaw = snap.totalDownloadedBytes;
+    uint64_t curBytes = snap.currentDownloadSize;
+    uint64_t curDone = snap.currentDownloadedBytes;
     uint64_t totalDone = (curDone > totalDoneRaw) ? curDone : totalDoneRaw;
     const bool downloadsDone =
         snap.downloadCompleted ||
@@ -786,7 +809,14 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
             SDL_RenderDrawRect(renderer, &outline);
             int pctInt = static_cast<int>(pctTotal * 100.0f);
-            drawText(renderer, outline.x, outline.y - 28, "Downloading " + snap.currentDownloadTitle, fg, 2);
+            std::string titleLine = "Downloading " + snap.currentDownloadTitle;
+            if (snap.currentDownloadFileCount > 1) {
+                int fileIdx = snap.currentDownloadIndex + 1;
+                if (fileIdx < 1) fileIdx = 1;
+                if (fileIdx > snap.currentDownloadFileCount) fileIdx = snap.currentDownloadFileCount;
+                titleLine += "  (" + std::to_string(fileIdx) + "/" + std::to_string(snap.currentDownloadFileCount) + ")";
+            }
+            drawText(renderer, outline.x, outline.y - 28, titleLine, fg, 2);
             if (curBytes > 0) {
                 int pctCurInt = static_cast<int>(pctCurrent * 100.0f);
                 drawText(renderer, outline.x, outline.y + 50,
@@ -817,10 +847,10 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         }
     } else if (snap.view == Status::View::DOWNLOADING) {
         SDL_Color fg{255,255,255,255};
-        bool resuming = (status.currentDownloadedBytes.load() > 0);
+        bool resuming = (snap.currentDownloadedBytes > 0);
         drawText(renderer, (1280/2) - 120, 720/2 - 40, resuming ? "Resuming download..." : "Connecting...", fg, 2);
         std::string line2 = resuming
-            ? ("Already have " + humanSize(status.currentDownloadedBytes.load()) + " on disk")
+            ? ("Already have " + humanSize(snap.currentDownloadedBytes) + " on disk")
             : "Waiting for data...";
         drawText(renderer, (1280/2) - 120, 720/2 + 0, line2, fg, 2);
         if (snap.lastDownloadFailed) {
@@ -1101,6 +1131,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         uint64_t total = snap.queueTotalBytes;
         header = "QUEUE  Items: " + std::to_string(snap.queueCount) +
                  "  Total: " + humanSize(snap.queueTotalBytes);
+        if (snap.failedHistoryCount > 0) {
+            header += "  Failed: " + std::to_string(snap.failedHistoryCount);
+        }
         SDL_Color fg{255,255,255,255};
         size_t visible = snap.queueVisible.size();
         size_t start = snap.queueStart;
@@ -1115,6 +1148,16 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         if (snap.queueCount == 0) {
             std::string msg = snap.downloadCompleted ? "All downloads complete." : "Queue empty. Press A in detail to add.";
             drawText(renderer, 64, 120, msg, fg, 2);
+            int failY = 152;
+            if (!snap.recentFailed.empty()) {
+                drawText(renderer, 64, failY, "Recent failures:", SDL_Color{255,210,210,255}, 2);
+                failY += 24;
+                for (const auto& q : snap.recentFailed) {
+                    std::string detail = ellipsize(q.game.title + (q.error.empty() ? "" : (": " + q.error)), 62);
+                    drawText(renderer, 64, failY, detail, SDL_Color{255,160,160,255}, 2);
+                    failY += 24;
+                }
+            }
         }
         for (size_t i = 0; i < visible; ++i) {
             size_t idx = start + i;

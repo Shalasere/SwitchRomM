@@ -134,6 +134,9 @@ inline ErrorInfo classifyError(const std::string& detail, ErrorCategory hint = E
         set(ErrorCategory::Config, ErrorCode::ConfigInvalid, "Configuration format is invalid.", false);
     } else if (l.find("missing server_url") != std::string::npos || l.find("missing platform id") != std::string::npos) {
         set(hint == ErrorCategory::None ? ErrorCategory::Config : hint, ErrorCode::MissingRequiredField, "Required setting or field is missing.", false);
+    } else if (l.find("unsupported config schema_version") != std::string::npos ||
+               l.find("no migration available for config schema_version") != std::string::npos) {
+        set(ErrorCategory::Config, ErrorCode::ConfigUnsupported, "Configuration file version is not supported.", false);
     } else if (l.find("https:// not supported") != std::string::npos || l.find("tls not implemented") != std::string::npos ||
                l.find("not supported") != std::string::npos || l.find("chunked transfer not supported") != std::string::npos) {
         set(ErrorCategory::Unsupported, ErrorCode::UnsupportedFeature, "This feature is not supported yet.", false);
@@ -156,6 +159,8 @@ inline ErrorInfo classifyError(const std::string& detail, ErrorCategory hint = E
         set(ErrorCategory::Network, ErrorCode::TransportFailure, "Network transport failed.", true);
     } else if (l.find("parse") != std::string::npos || l.find("malformed") != std::string::npos || l.find("json") != std::string::npos) {
         set(ErrorCategory::Parse, ErrorCode::ParseFailure, "Received malformed data.", false);
+    } else if (l.find("not enough free space") != std::string::npos) {
+        set(ErrorCategory::Filesystem, ErrorCode::InvalidData, "Not enough free space on storage.", false);
     } else if (l.find("write failed") != std::string::npos || l.find("open part failed") != std::string::npos ||
                l.find("seek failed") != std::string::npos) {
         set(ErrorCategory::Filesystem, ErrorCode::InvalidData, "Failed to write to storage.", true);

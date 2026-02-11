@@ -84,11 +84,26 @@ static void removeEmptyParents(std::filesystem::path p, const std::filesystem::p
 }
 
 // Check (best effort) if there is enough free space at path for neededBytes + margin.
-static bool ensureFreeSpace(const std::string& path, uint64_t neededBytes) {
+static bool queryFreeSpace(const std::string& path, uint64_t& outFreeBytes) {
     struct statvfs vfs{};
-    if (statvfs(path.c_str(), &vfs) != 0) return true; // best effort
-    uint64_t freeBytes = static_cast<uint64_t>(vfs.f_bavail) * static_cast<uint64_t>(vfs.f_frsize);
+    if (statvfs(path.c_str(), &vfs) != 0) return false;
+    outFreeBytes = static_cast<uint64_t>(vfs.f_bavail) * static_cast<uint64_t>(vfs.f_frsize);
+    return true;
+}
+
+static bool ensureFreeSpace(const std::string& path, uint64_t neededBytes, uint64_t* outFreeBytes = nullptr) {
+    uint64_t freeBytes = 0;
+    if (!queryFreeSpace(path, freeBytes)) return true; // best effort
+    if (outFreeBytes) *outFreeBytes = freeBytes;
     return freeBytes >= neededBytes + kFreeSpaceMarginBytes;
+}
+
+static void setDownloadFailureState(Status& status, bool failed, const std::string& message) {
+    withStatusLock(status, [&]() {
+        status.lastDownloadFailed.store(failed);
+        status.lastDownloadError = message;
+        return 0;
+    });
 }
 
 // Sanitize a string for filesystem use; strip disallowed chars and optionally shorten later.
@@ -490,6 +505,16 @@ static bool streamDownload(const std::string& url,
             uint64_t space = partSize - partOff;
             size_t toWrite = static_cast<size_t>(std::min<uint64_t>(space, remaining));
             if (currentPart != static_cast<int>(partIdx)) {
+                uint64_t received = (globalOffset >= startOffset) ? (globalOffset - startOffset) : 0;
+                uint64_t remainingBytes = (expectedBody > received) ? (expectedBody - received) : 0;
+                uint64_t freeBytes = 0;
+                if (!ensureFreeSpace(tmpDir, remainingBytes, &freeBytes)) {
+                    err = "Not enough free space (need " + std::to_string(remainingBytes) +
+                          " bytes + margin, have " + std::to_string(freeBytes) + ")";
+                    logLine("Free-space recheck failed in stream: " + err);
+                    closePart();
+                    return false;
+                }
                 closePart();
                 std::string partName = (partIdx < 10 ? "0" : "") + std::to_string(partIdx);
                 std::string partPath = tmpDir + "/" + partName + ".part";
@@ -763,21 +788,18 @@ static bool downloadOneFile(Game g, const DownloadFileSpec* spec, Status& status
     ensureDirectory(tempRoot);
 
     // free space check for full ROM upfront (best effort)
-    if (!ensureFreeSpace(baseDir, g.sizeBytes)) {
-        logLine("Not enough free space for " + g.title);
-        {
-            std::lock_guard<std::mutex> lock(status.mutex);
-            status.lastDownloadError = "Not enough free space";
-        }
+    uint64_t freeBytes = 0;
+    if (!ensureFreeSpace(baseDir, g.sizeBytes, &freeBytes)) {
+        std::string msg = "Not enough free space (need " + std::to_string(g.sizeBytes) +
+                          " bytes + margin, have " + std::to_string(freeBytes) + ")";
+        logLine(msg + " for " + g.title);
+        setDownloadFailureState(status, true, msg);
         return false;
     }
 
     if (g.downloadUrl.empty()) {
         logLine("No download URL for " + g.title);
-        {
-            std::lock_guard<std::mutex> lock(status.mutex);
-            status.lastDownloadError = "No download URL";
-        }
+        setDownloadFailureState(status, true, "No download URL");
         return false;
     }
 
@@ -797,10 +819,7 @@ static bool downloadOneFile(Game g, const DownloadFileSpec* spec, Status& status
     uint64_t originalSize = g.sizeBytes;
     if (!preflight(g.downloadUrl, auth, cfg.httpTimeoutSeconds, pf)) {
         logLine("Preflight failed for " + g.title + " (HEAD/Range probe). Aborting download.");
-        {
-            std::lock_guard<std::mutex> lock(status.mutex);
-            status.lastDownloadError = "Preflight failed";
-        }
+        setDownloadFailureState(status, true, "Preflight failed");
         // Persist a manifest with failure reason so restart shows the failure.
         Manifest failManifest = buildManifestFor(g, g.sizeBytes, partSizeFor(cfg, g.sizeBytes));
         failManifest.failureReason = "Preflight failed (HEAD/Range)";
@@ -1051,10 +1070,7 @@ static bool downloadOneFile(Game g, const DownloadFileSpec* spec, Status& status
     }
     if (!okStream) {
         std::string errCopy = err.empty() ? "Download failed" : err;
-        {
-            std::lock_guard<std::mutex> lock(status.mutex);
-            status.lastDownloadError = errCopy;
-        }
+        setDownloadFailureState(status, true, errCopy);
         logLine("Download failed: " + errCopy);
         return false;
     }
@@ -1098,8 +1114,7 @@ static bool downloadOneFile(Game g, const DownloadFileSpec* spec, Status& status
     logLine("Finalize: moving temp to " + finalPath.string());
     bool okFinal = finalizeParts(tmpDir, finalPath.string());
     if (!okFinal) {
-        std::lock_guard<std::mutex> lock(status.mutex);
-        status.lastDownloadError = "Finalize failed";
+        setDownloadFailureState(status, true, "Finalize failed");
         return false;
     }
     // Clean up temp root for this fileId now that finalize succeeded.
@@ -1114,6 +1129,7 @@ static bool downloadOneFile(Game g, const DownloadFileSpec* spec, Status& status
         status.currentDownloadedBytes.store(totalSize);
         status.totalDownloadedBytes.store(status.totalDownloadedBytes.load()); // unchanged, already includes current
         status.lastDownloadError.clear();
+        status.lastDownloadFailed.store(false);
     }
     logLine("Download complete: " + g.title);
     return true;
@@ -1140,6 +1156,7 @@ static bool downloadBundle(const DownloadBundle& bundle, Status& status, const C
         logLine("Bundle has no files; falling back to single file from game metadata");
         return false;
     }
+    status.currentDownloadFileCount.store(b.files.size());
     bool ok = true;
     for (size_t i = 0; i < b.files.size(); ++i) {
         const auto& f = b.files[i];
@@ -1182,6 +1199,7 @@ static void workerLoop() {
         for (auto& q : st->downloadQueue) q.state = QueueState::Pending;
         st->downloadQueueRevision++;
     }
+    st->currentDownloadFileCount.store(0);
     logLine("Worker start, total bytes=" + std::to_string(st->totalDownloadBytes.load()));
     while (true) {
         QueueItem next;
@@ -1202,6 +1220,7 @@ static void workerLoop() {
                 st->currentDownloadTitle = next.bundle.title.empty() ? next.game.title : next.bundle.title;
                 st->currentDownloadSize.store(bundleSize);
                 st->currentDownloadedBytes.store(0);
+                st->currentDownloadFileCount.store(next.bundle.files.empty() ? 1 : next.bundle.files.size());
                 st->downloadQueue.front().state = QueueState::Downloading;
                 st->downloadQueueRevision++;
             }
@@ -1209,7 +1228,16 @@ static void workerLoop() {
             bool wasStopped = gCtx.stopRequested.load();
             logLine(std::string("Download failed or stopped for ") + next.game.title +
                     (wasStopped ? " (stop requested)" : ""));
-            st->lastDownloadFailed.store(!wasStopped);
+            if (wasStopped) {
+                setDownloadFailureState(*st, false, "Cancelled");
+            } else {
+                std::string errCopy;
+                {
+                    std::lock_guard<std::mutex> lock(st->mutex);
+                    errCopy = st->lastDownloadError.empty() ? "Download failed" : st->lastDownloadError;
+                }
+                setDownloadFailureState(*st, true, errCopy);
+            }
             {
                 std::lock_guard<std::mutex> lock(st->mutex);
                 if (!st->downloadQueue.empty()) {
@@ -1247,6 +1275,7 @@ static void workerLoop() {
         }
     }
     st->downloadWorkerRunning.store(false);
+    st->currentDownloadFileCount.store(0);
     {
         std::lock_guard<std::mutex> lock(st->mutex);
         if (st->downloadQueue.empty() && !gCtx.stopRequested.load() && !st->lastDownloadFailed.load()) {
