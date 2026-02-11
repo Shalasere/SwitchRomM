@@ -89,3 +89,76 @@ TEST_CASE("parseEnvString ignores comments (full-line and inline)") {
     REQUIRE(cfg.username == "user;name");        // ';' inside quotes is part of the value
     REQUIRE(cfg.logLevel == "info");
 }
+
+TEST_CASE("parseJsonString parses canonical schema v1") {
+    const std::string json =
+        "{"
+        "\"schema_version\":1,"
+        "\"server_url\":\"http://example.com\","
+        "\"download_dir\":\"sdmc:/romm_cache/switch\","
+        "\"log_level\":\"DeBuG\","
+        "\"http_timeout_seconds\":17"
+        "}";
+    romm::Config cfg;
+    std::string err;
+    bool ok = romm::parseJsonString(json, cfg, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(cfg.schemaVersion == 1);
+    REQUIRE(cfg.serverUrl == "http://example.com");
+    REQUIRE(cfg.downloadDir == "sdmc:/romm_cache/switch");
+    REQUIRE(cfg.logLevel == "debug");
+    REQUIRE(cfg.httpTimeoutSeconds == 17);
+}
+
+TEST_CASE("parseJsonString migrates legacy keys when schema is missing") {
+    const std::string json =
+        "{"
+        "\"SERVER_URL\":\"http://example.com\","
+        "\"DOWNLOAD_DIR\":\"sdmc:/romm_cache/switch\","
+        "\"LOG_LEVEL\":\"INFO\""
+        "}";
+    romm::Config cfg;
+    std::string err;
+    bool ok = romm::parseJsonString(json, cfg, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(cfg.schemaVersion == 1);
+    REQUIRE(cfg.serverUrl == "http://example.com");
+    REQUIRE(cfg.downloadDir == "sdmc:/romm_cache/switch");
+    REQUIRE(cfg.logLevel == "info");
+}
+
+TEST_CASE("parseJsonString migrates legacy alias fields") {
+    const std::string json =
+        "{"
+        "\"serverUrl\":\"http://example.com\","
+        "\"download_path\":\"sdmc:/romm_cache/switch\","
+        "\"platform_id\":\"switch\","
+        "\"timeout_seconds\":42"
+        "}";
+    romm::Config cfg;
+    std::string err;
+    bool ok = romm::parseJsonString(json, cfg, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(cfg.schemaVersion == 1);
+    REQUIRE(cfg.serverUrl == "http://example.com");
+    REQUIRE(cfg.downloadDir == "sdmc:/romm_cache/switch");
+    REQUIRE(cfg.platform == "switch");
+    REQUIRE(cfg.httpTimeoutSeconds == 42);
+}
+
+TEST_CASE("parseJsonString rejects unsupported schema version") {
+    const std::string json =
+        "{"
+        "\"schema_version\":999,"
+        "\"server_url\":\"http://example.com\","
+        "\"download_dir\":\"sdmc:/romm_cache/switch\""
+        "}";
+    romm::Config cfg;
+    std::string err;
+    bool ok = romm::parseJsonString(json, cfg, err);
+    REQUIRE_FALSE(ok);
+    REQUIRE(err.find("Unsupported config schema_version") != std::string::npos);
+}

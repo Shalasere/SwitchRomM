@@ -48,7 +48,7 @@ FAT32_SAFE=true
 LOG_LEVEL=info          # debug|info|warn|error
 SPEED_TEST_URL=         # optional; URL to fetch ~40MB (Range) to estimate throughput; leave blank to skip
 ```
-`config.json` is also read and currently overrides `.env` on the same keys (load order is .env then config.json).
+`config.json` is also read and currently overrides `.env` on the same keys (load order is .env then config.json). JSON supports `schema_version` (current `1`), and legacy keys are migrated in-memory when possible.
 
 ### Docs
 - `docs/config.md` - config keys, defaults, SD paths.

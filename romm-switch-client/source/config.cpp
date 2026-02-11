@@ -133,15 +133,95 @@ static bool parseEnv(const std::string& path, Config& outCfg) {
     return parseEnvStream(f, outCfg);
 }
 
-static bool parseJson(const std::string& path, Config& outCfg, std::string& outError) {
-    std::ifstream file(path, std::ios::in | std::ios::binary);
-    if (!file) return false;
-    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    mini::Object obj;
-    if (!mini::parse(content, obj)) {
-        outError = "Invalid config JSON.";
-        return true; // file found but bad
+constexpr int kConfigSchemaLegacy = 0;
+constexpr int kConfigSchemaCurrent = 1;
+
+static void aliasKeyIfMissing(mini::Object& obj, const char* from, const char* to) {
+    auto fromIt = obj.find(from);
+    if (fromIt == obj.end()) return;
+    if (obj.find(to) != obj.end()) return;
+    obj[to] = fromIt->second;
+}
+
+static void migrateSchema0To1(mini::Object& obj) {
+    // Support older/alternate key styles while converging on snake_case JSON keys.
+    aliasKeyIfMissing(obj, "SERVER_URL", "server_url");
+    aliasKeyIfMissing(obj, "API_TOKEN", "api_token");
+    aliasKeyIfMissing(obj, "USERNAME", "username");
+    aliasKeyIfMissing(obj, "PASSWORD", "password");
+    aliasKeyIfMissing(obj, "PLATFORM", "platform");
+    aliasKeyIfMissing(obj, "DOWNLOAD_DIR", "download_dir");
+    aliasKeyIfMissing(obj, "HTTP_TIMEOUT_SECONDS", "http_timeout_seconds");
+    aliasKeyIfMissing(obj, "FAT32_SAFE", "fat32_safe");
+    aliasKeyIfMissing(obj, "LOG_LEVEL", "log_level");
+    aliasKeyIfMissing(obj, "SPEED_TEST_URL", "speed_test_url");
+    aliasKeyIfMissing(obj, "PLATFORM_PREFS_MODE", "platform_prefs_mode");
+    aliasKeyIfMissing(obj, "PLATFORM_PREFS_SD", "platform_prefs_sd");
+    aliasKeyIfMissing(obj, "PLATFORM_PREFS_ROMFS", "platform_prefs_romfs");
+
+    aliasKeyIfMissing(obj, "serverUrl", "server_url");
+    aliasKeyIfMissing(obj, "apiToken", "api_token");
+    aliasKeyIfMissing(obj, "downloadDir", "download_dir");
+    aliasKeyIfMissing(obj, "httpTimeoutSeconds", "http_timeout_seconds");
+    aliasKeyIfMissing(obj, "fat32Safe", "fat32_safe");
+    aliasKeyIfMissing(obj, "logLevel", "log_level");
+    aliasKeyIfMissing(obj, "speedTestUrl", "speed_test_url");
+    aliasKeyIfMissing(obj, "platformPrefsMode", "platform_prefs_mode");
+    aliasKeyIfMissing(obj, "platformPrefsSd", "platform_prefs_sd");
+    aliasKeyIfMissing(obj, "platformPrefsRomfs", "platform_prefs_romfs");
+
+    aliasKeyIfMissing(obj, "platform_id", "platform");
+    aliasKeyIfMissing(obj, "download_path", "download_dir");
+    aliasKeyIfMissing(obj, "timeout_seconds", "http_timeout_seconds");
+    aliasKeyIfMissing(obj, "fat32_split", "fat32_safe");
+}
+
+static bool readSchemaVersion(const mini::Object& obj, int& outVersion, std::string& outError) {
+    outVersion = kConfigSchemaLegacy; // missing schema_version implies legacy schema.
+    auto it = obj.find("schema_version");
+    if (it == obj.end()) return true;
+    if (it->second.type != mini::Value::Type::Number) {
+        outError = "Invalid config JSON: schema_version must be a number.";
+        return false;
     }
+    if (it->second.number < 0) {
+        outError = "Invalid config JSON: schema_version must be non-negative.";
+        return false;
+    }
+    outVersion = static_cast<int>(it->second.number);
+    return true;
+}
+
+static bool migrateSchema(mini::Object& obj, int& schemaVersion, std::string& outError) {
+    if (schemaVersion > kConfigSchemaCurrent) {
+        outError = "Unsupported config schema_version " + std::to_string(schemaVersion) +
+                   "; max supported is " + std::to_string(kConfigSchemaCurrent) + ".";
+        return false;
+    }
+
+    while (schemaVersion < kConfigSchemaCurrent) {
+        if (schemaVersion == 0) {
+            migrateSchema0To1(obj);
+            schemaVersion = 1;
+            continue;
+        }
+        outError = "No migration available for config schema_version " + std::to_string(schemaVersion) + ".";
+        return false;
+    }
+    return true;
+}
+
+static bool parseJsonObject(mini::Object& obj, Config& outCfg, std::string& outError) {
+    int schemaVersion = kConfigSchemaLegacy;
+    if (!readSchemaVersion(obj, schemaVersion, outError)) {
+        return false;
+    }
+    if (!migrateSchema(obj, schemaVersion, outError)) {
+        return false;
+    }
+
+    outCfg.schemaVersion = schemaVersion;
+
     auto getStr = [&](const char* key, std::string& out) {
         auto it = obj.find(key);
         if (it != obj.end() && it->second.type == mini::Value::Type::String) {
@@ -180,8 +260,24 @@ static bool parseJson(const std::string& path, Config& outCfg, std::string& outE
     return true;
 }
 
+static bool parseJson(const std::string& path, Config& outCfg, std::string& outError) {
+    std::ifstream file(path, std::ios::in | std::ios::binary);
+    if (!file) return false;
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    mini::Object obj;
+    if (!mini::parse(content, obj)) {
+        outError = "Invalid config JSON.";
+        return true; // file found but bad
+    }
+    if (!parseJsonObject(obj, outCfg, outError)) {
+        return true; // file found but invalid/incompatible
+    }
+    return true;
+}
+
 bool loadConfig(Config& outCfg, std::string& outError, ErrorInfo* outInfo) {
     if (outInfo) *outInfo = ErrorInfo{};
+    outError.clear();
     const std::string envPath = "sdmc:/switch/romm_switch_client/.env";
     const std::string jsonPath = "sdmc:/switch/romm_switch_client/config.json";
 
@@ -217,12 +313,14 @@ bool loadConfig(Config& outCfg, std::string& outError, ErrorInfo* outInfo) {
         return false;
     }
 
+    outError.clear();
     return true;
 }
 
 #ifdef UNIT_TEST
 bool parseEnvString(const std::string& contents, Config& outCfg, std::string& outError, ErrorInfo* outInfo) {
     if (outInfo) *outInfo = ErrorInfo{};
+    outError.clear();
     outCfg = Config{};
     // Force required fields to be explicitly provided in tests.
     outCfg.downloadDir.clear();
@@ -234,6 +332,40 @@ bool parseEnvString(const std::string& contents, Config& outCfg, std::string& ou
         return false;
     }
     // mimic normal flow: basic validation
+    if (outCfg.serverUrl.empty() || outCfg.downloadDir.empty()) {
+        setConfigError(outError, outInfo, "Config missing server_url or download_dir.",
+                       ErrorCode::MissingRequiredField,
+                       "Required config field is missing.");
+        return false;
+    }
+    if (outCfg.serverUrl.rfind("https://", 0) == 0) {
+        setConfigError(outError, outInfo,
+                       "https:// not supported; use http:// or a local TLS terminator.",
+                       ErrorCode::ConfigUnsupported,
+                       "HTTPS is not supported in this build.");
+        return false;
+    }
+    return true;
+}
+
+bool parseJsonString(const std::string& contents, Config& outCfg, std::string& outError, ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
+    outError.clear();
+    outCfg = Config{};
+    // Force required fields to be explicitly provided in tests.
+    outCfg.downloadDir.clear();
+
+    mini::Object obj;
+    if (!mini::parse(contents, obj)) {
+        setConfigError(outError, outInfo, "Invalid config JSON.",
+                       ErrorCode::ConfigInvalid,
+                       "Configuration format is invalid.");
+        return false;
+    }
+    if (!parseJsonObject(obj, outCfg, outError)) {
+        if (outInfo) *outInfo = classifyError(outError, ErrorCategory::Config);
+        return false;
+    }
     if (outCfg.serverUrl.empty() || outCfg.downloadDir.empty()) {
         setConfigError(outError, outInfo, "Config missing server_url or download_dir.",
                        ErrorCode::MissingRequiredField,

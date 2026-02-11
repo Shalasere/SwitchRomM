@@ -6,6 +6,8 @@
 namespace romm {
 
 struct Config {
+    // Parsed config schema version (JSON); .env paths default to current behavior.
+    int schemaVersion{1};
     // Base RomM server URL (http only)
     std::string serverUrl;
     // Optional token (currently unused)
@@ -36,6 +38,8 @@ bool loadConfig(Config& outCfg, std::string& outError, ErrorInfo* outInfo = null
 #ifdef UNIT_TEST
 // Test helper: parse .env-style content from an in-memory string.
 bool parseEnvString(const std::string& contents, Config& outCfg, std::string& outError, ErrorInfo* outInfo = nullptr);
+// Test helper: parse config.json-style content from an in-memory string.
+bool parseJsonString(const std::string& contents, Config& outCfg, std::string& outError, ErrorInfo* outInfo = nullptr);
 #endif
 
 } // namespace romm
