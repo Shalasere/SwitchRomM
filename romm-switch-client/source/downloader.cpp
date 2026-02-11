@@ -6,6 +6,7 @@
 #include "romm/raii.hpp"
 #include "romm/http_common.hpp"
 #include "romm/manifest.hpp"
+#include "romm/queue_store.hpp"
 #include "romm/speed_test.hpp"
 #include <switch.h>
 #include <sys/socket.h>
@@ -45,9 +46,21 @@ struct DownloadContext {
     std::atomic<bool> stopRequested{false};
     Status* status{nullptr};
     Config cfg;
+    std::atomic<int> activeSocketFd{-1};
 };
 
 DownloadContext gCtx; // global download context shared with worker
+
+struct ActiveSocketScope {
+    int fd{-1};
+    explicit ActiveSocketScope(int sfd) : fd(sfd) {
+        gCtx.activeSocketFd.store(sfd, std::memory_order_release);
+    }
+    ~ActiveSocketScope() {
+        int expected = fd;
+        (void)gCtx.activeSocketFd.compare_exchange_strong(expected, -1, std::memory_order_acq_rel);
+    }
+};
 
 static void recomputeTotals(Status& st) {
     uint64_t remaining = 0;
@@ -104,6 +117,7 @@ static void setDownloadFailureState(Status& status, bool failed, const std::stri
         status.lastDownloadError = message;
         return 0;
     });
+    postWorkerEvent(status, WorkerEvent{WorkerEventType::DownloadFailureState, failed, message});
 }
 
 // Sanitize a string for filesystem use; strip disallowed chars and optionally shorten later.
@@ -226,6 +240,7 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
         if (ret != 0 || !res) { if (res) freeaddrinfo(res); return false; }
         romm::UniqueFd sock(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
         if (!sock) { freeaddrinfo(res); return false; }
+        ActiveSocketScope active(sock.fd);
         if (timeoutSec > 0) {
             struct timeval tv{}; tv.tv_sec = timeoutSec;
             setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -324,6 +339,12 @@ static bool streamDownload(const std::string& url,
                            Status& status,
                            const Config& cfg,
                            std::string& err) {
+    int timeoutSec = cfg.httpTimeoutSeconds > 0 ? cfg.httpTimeoutSeconds : 10;
+    if (timeoutSec > 30) timeoutSec = 30;
+    // Keep socket recv timeout short so stop requests are observed quickly.
+    int ioTickSec = timeoutSec;
+    if (ioTickSec > 1) ioTickSec = 1;
+
     std::string host, portStr, path, perr;
     if (!romm::parseHttpUrl(url, host, portStr, path, perr)) { err = perr; return false; }
 
@@ -335,8 +356,9 @@ static bool streamDownload(const std::string& url,
     if (ret != 0 || !res) { if (res) freeaddrinfo(res); err = "DNS failed"; return false; }
     romm::UniqueFd sock(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
     if (!sock) { freeaddrinfo(res); err = "Socket failed"; return false; }
-    if (cfg.httpTimeoutSeconds > 0) {
-        struct timeval tv{}; tv.tv_sec = cfg.httpTimeoutSeconds;
+    ActiveSocketScope active(sock.fd);
+    if (ioTickSec > 0) {
+        struct timeval tv{}; tv.tv_sec = ioTickSec;
         setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
@@ -374,17 +396,29 @@ static bool streamDownload(const std::string& url,
     bool probeLogged = false;
     auto transferStart = std::chrono::steady_clock::now();
     // Use a bounded stall timeout to avoid hanging forever on dead sockets.
-    int timeoutSec = cfg.httpTimeoutSeconds > 0 ? cfg.httpTimeoutSeconds : 10;
-    if (timeoutSec > 30) timeoutSec = 30;
     auto stallTimeout = std::chrono::seconds(timeoutSec);
     auto headerStart = std::chrono::steady_clock::now();
     logLine("Stream start: url=" + url + " range=" + (useRange ? "true" : "false") +
             " start=" + std::to_string(startOffset) + " expect=" + std::to_string(expectedBody));
     while (!headersDone) {
         ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            err = (n == 0) ? "No HTTP headers received" :
-                  ((errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" : (std::string("Recv failed: ") + std::strerror(errno)));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (gCtx.stopRequested.load()) { err = "Stopped"; return false; }
+                auto now = std::chrono::steady_clock::now();
+                if (now - headerStart > stallTimeout) {
+                    err = "Header timeout";
+                    logLine("Stream header timeout url=" + url);
+                    return false;
+                }
+                continue;
+            }
+            err = std::string("Recv failed: ") + std::strerror(errno);
+            logLine("Stream header error: " + err);
+            return false;
+        }
+        if (n == 0) {
+            err = "No HTTP headers received";
             logLine("Stream header error: " + err);
             return false;
         }
@@ -575,7 +609,13 @@ static bool streamDownload(const std::string& url,
             if (n == 0) {
                 err = "Short read";
             } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                err = "Recv timed out";
+                if (gCtx.stopRequested.load()) { err = "Stopped"; break; }
+                auto now = std::chrono::steady_clock::now();
+                if (now - lastData > stallTimeout) {
+                    err = "Timed out waiting for data";
+                    break;
+                }
+                continue;
             } else {
                 err = std::string("Recv failed: ") + std::strerror(errno);
             }
@@ -1186,8 +1226,6 @@ static void workerLoop() {
     st->downloadWorkerRunning.store(true);
     {
         std::lock_guard<std::mutex> lock(st->mutex);
-        st->lastDownloadFailed.store(false);
-        st->lastDownloadError.clear();
         st->downloadCompleted = false;
         st->totalDownloadBytes.store(0);
         st->totalDownloadedBytes.store(0);
@@ -1199,6 +1237,7 @@ static void workerLoop() {
         for (auto& q : st->downloadQueue) q.state = QueueState::Pending;
         st->downloadQueueRevision++;
     }
+    setDownloadFailureState(*st, false, "");
     st->currentDownloadFileCount.store(0);
     logLine("Worker start, total bytes=" + std::to_string(st->totalDownloadBytes.load()));
     while (true) {
@@ -1206,8 +1245,6 @@ static void workerLoop() {
             {
                 std::lock_guard<std::mutex> lock(st->mutex);
                 if (st->downloadQueue.empty() || gCtx.stopRequested.load()) break;
-                st->lastDownloadFailed.store(false);
-                st->lastDownloadError.clear();
                 st->currentDownloadIndex.store(0);
                 next = st->downloadQueue.front(); // copy
                 if (next.bundle.files.empty()) {
@@ -1224,12 +1261,13 @@ static void workerLoop() {
                 st->downloadQueue.front().state = QueueState::Downloading;
                 st->downloadQueueRevision++;
             }
+        setDownloadFailureState(*st, false, "");
         if (!downloadBundle(next.bundle, *st, cfg)) {
             bool wasStopped = gCtx.stopRequested.load();
             logLine(std::string("Download failed or stopped for ") + next.game.title +
                     (wasStopped ? " (stop requested)" : ""));
             if (wasStopped) {
-                setDownloadFailureState(*st, false, "Cancelled");
+                setDownloadFailureState(*st, false, "");
             } else {
                 std::string errCopy;
                 {
@@ -1238,17 +1276,16 @@ static void workerLoop() {
                 }
                 setDownloadFailureState(*st, true, errCopy);
             }
+            bool queueChanged = false;
             {
                 std::lock_guard<std::mutex> lock(st->mutex);
                 if (!st->downloadQueue.empty()) {
                     if (wasStopped) {
-                        // Mark as cancelled so UI distinguishes from never-started Pending.
-                        st->downloadQueue.front().state = QueueState::Cancelled;
-                        st->downloadQueue.front().error = "Cancelled";
-                        st->downloadHistory.push_back(st->downloadQueue.front());
-                        st->downloadQueue.erase(st->downloadQueue.begin());
+                        // Preserve interrupted item in active queue so restart/next run can resume.
+                        st->downloadQueue.front().state = QueueState::Resumable;
+                        st->downloadQueue.front().error = "Interrupted";
                         st->downloadQueueRevision++;
-                        st->downloadHistoryRevision++;
+                        queueChanged = true;
                     } else {
                         st->downloadQueue.front().state = QueueState::Failed;
                         st->downloadQueue.front().error = st->lastDownloadError;
@@ -1256,12 +1293,20 @@ static void workerLoop() {
                         st->downloadQueue.erase(st->downloadQueue.begin());
                         st->downloadQueueRevision++;
                         st->downloadHistoryRevision++;
+                        queueChanged = true;
                     }
                 }
                 recomputeTotals(*st);
             }
+            if (queueChanged) {
+                std::string qerr;
+                if (!saveQueueState(*st, qerr) && !qerr.empty()) {
+                    logLine("Queue state save warning: " + qerr);
+                }
+            }
             continue;
         }
+        bool queueChanged = false;
         {
             std::lock_guard<std::mutex> lock(st->mutex);
             if (!st->downloadQueue.empty()) {
@@ -1270,18 +1315,29 @@ static void workerLoop() {
                 st->downloadQueue.erase(st->downloadQueue.begin());
                 st->downloadQueueRevision++;
                 st->downloadHistoryRevision++;
+                queueChanged = true;
             }
             recomputeTotals(*st);
+        }
+        if (queueChanged) {
+            std::string qerr;
+            if (!saveQueueState(*st, qerr) && !qerr.empty()) {
+                logLine("Queue state save warning: " + qerr);
+            }
         }
     }
     st->downloadWorkerRunning.store(false);
     st->currentDownloadFileCount.store(0);
+    bool postCompletion = false;
     {
         std::lock_guard<std::mutex> lock(st->mutex);
         if (st->downloadQueue.empty() && !gCtx.stopRequested.load() && !st->lastDownloadFailed.load()) {
-            st->downloadCompleted = true;
-            logLine("All downloads complete.");
+            postCompletion = true;
         }
+    }
+    if (postCompletion) {
+        postWorkerEvent(*st, WorkerEvent{WorkerEventType::DownloadCompletion, false, ""});
+        logLine("All downloads complete.");
     }
     logLine("Worker done.");
 }
@@ -1389,6 +1445,10 @@ void startDownloadWorker(Status& status, const Config& cfg) {
 
 void stopDownloadWorker() {
     gCtx.stopRequested.store(true);
+    int activeFd = gCtx.activeSocketFd.load(std::memory_order_acquire);
+    if (activeFd >= 0) {
+        ::shutdown(activeFd, SHUT_RDWR);
+    }
     if (gCtx.worker.joinable()) {
         gCtx.worker.join();
     }

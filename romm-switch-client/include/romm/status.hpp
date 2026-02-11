@@ -15,6 +15,7 @@ namespace romm {
 enum class QueueState { Pending, Downloading, Finalizing, Completed, Resumable, Failed, Cancelled };
 enum class RomFilter { All, Queued, Resumable, Failed, Completed, NotQueued };
 enum class RomSort { TitleAsc, TitleDesc, SizeDesc, SizeAsc };
+enum class WorkerEventType { DownloadFailureState, DownloadCompletion };
 
 struct QueueItem {
     Game game;
@@ -25,6 +26,12 @@ struct QueueItem {
     QueueItem() = default;
     QueueItem(const Game& g, QueueState s, const std::string& errStr = std::string())
         : game(g), state(s), error(errStr) {}
+};
+
+struct WorkerEvent {
+    WorkerEventType type{WorkerEventType::DownloadFailureState};
+    bool failed{false};
+    std::string message;
 };
 
 struct Status {
@@ -93,6 +100,10 @@ struct Status {
     std::string lastError;
     ErrorInfo lastErrorInfo{};
 
+    // Worker -> UI event channel for UI-facing status fields.
+    std::vector<WorkerEvent> workerEvents;
+    uint64_t workerEventsRevision{0};
+
     // Diagnostics probe state.
     bool diagnosticsServerReachableKnown{false};
     bool diagnosticsServerReachable{false};
@@ -108,6 +119,12 @@ template <typename F>
 auto withStatusLock(Status& st, F&& fn) -> decltype(fn()) {
     std::lock_guard<std::mutex> lock(st.mutex);
     return fn();
+}
+
+inline void postWorkerEvent(Status& st, WorkerEvent ev) {
+    std::lock_guard<std::mutex> lock(st.mutex);
+    st.workerEvents.push_back(std::move(ev));
+    st.workerEventsRevision++;
 }
 
 } // namespace romm

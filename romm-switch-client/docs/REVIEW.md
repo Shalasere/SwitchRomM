@@ -1,7 +1,7 @@
 # RomM Switch Client - Technical Review
 
 Quick review of the C++17/libnx/SDL2 codebase: architecture, flows, risks, and pointers for contributors.  
-Last updated: 2026-02-11 (controls positional: A=Back/B=Select/Y=Queue/X=Start, Minus=Search, R=Diagnostics gate; revision-keyed ROM search/filter/sort index; diagnostics view/export; config schema_version migration support for JSON; per-file download HUD progress and queue failure retention summary; free-space recheck on part rotation; resume contiguity enforced; title_id folders; chunked fail-fast; redirect logged with Location; speed test optional; FAT32 splitting toggle).
+Last updated: 2026-02-11 (controls positional: A=Back/B=Select/Y=Queue/X=Start, Minus=Search, R=Diagnostics gate; revision-keyed ROM search/filter/sort index; diagnostics view/export; config schema_version migration support for JSON; per-file download HUD progress and queue failure retention summary; queue snapshot restore across restarts; worker->UI status event channel; UTF-8 title preservation with ASCII folding at render/search; free-space recheck on part rotation; resume contiguity enforced; title_id folders; chunked fail-fast; redirect logged with Location; speed test optional; FAT32 splitting toggle).
 
 ## Architecture snapshot
 - **Entry/UI**: `source/main.cpp` - SDL init, config load, API fetch, input handling, view transitions, rendering.
@@ -33,7 +33,7 @@ Severity: [H]=High, [M]=Medium, [L]=Low. File refs approximate.
 - [M] Config/auth (`include/romm/config.hpp`, `source/api.cpp`): Only Basic auth; `apiToken` unused; assumes `http://`. **Fix**: support token header, validate scheme/port; surface auth errors.
 - [L] Logging volume/threading: Debug-only heartbeats/file listings; rotation and mutexed sink are in place. Further tuning is optional (reduce sinks or verbosity).
 - [L] Structure/style (`source/main.cpp`): Large renderStatus and input switch mix concerns. **Fix**: split per-view render functions/controllers; wrap sockets/files in RAII.
-- [L] Data/UI fidelity: Model titles are sanitized to ASCII on parse (UTF-8 lost); cover loader is latest-only (drops queued covers). **Fix**: keep UTF-8 in model and sanitize at render; document latest-wins cover loader or add queue; add redirect follow/IPv6/trailer handling if needed. SPD speed test runs once at startup if URL set; optional.
+- [L] Data/UI fidelity: UTF-8 model title preservation now lands in model and folds at render/search; non-Latin scripts still fall back to `?` with the current bitmap glyph set. Cover loader remains latest-only (drops queued covers). **Fix**: add broader glyph coverage or optional TTF fallback; document latest-wins cover loader or add queue; add redirect follow/IPv6/trailer handling if needed. SPD speed test runs once at startup if URL set; optional.
 
 ## File notes
 - `source/main.cpp`: SDL lifecycle; config/API fetch; input loop maps Action -> state; revision-keyed ROM indexing (search/filter/sort) and diagnostics probe/export; renderStatus draws all views; download view shows global+per-file progress/failure; queue view shows completion and retained recent failures.

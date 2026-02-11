@@ -14,8 +14,10 @@ CXXFLAGS ?= -std=c++17 -Wall -Wextra -I../include -I../tests/include -DUNIT_TEST
 TARGET := romm_tests
 SOURCES := ../source/api.cpp \
            ../source/config.cpp \
+           ../source/filesystem.cpp \
            ../source/manifest.cpp \
            ../source/http_common.cpp \
+           ../source/queue_store.cpp \
            ../source/cover_loader.cpp \
            ../source/stb_image_impl.cpp \
            ../tests/downloader_stubs.cpp \
@@ -34,6 +36,7 @@ SOURCES := ../source/api.cpp \
            test_queue_policy.cpp \
            test_manifest_scan.cpp \
            test_worker_reap.cpp \
+           test_queue_store.cpp \
            logger_stub.cpp
 
 all: $(TARGET)

@@ -3,6 +3,7 @@
 ### How it works
 - One streaming HTTP GET per ROM. We stop at Content-Length. If preflight sees `Accept-Ranges: bytes`, we resume partial data (including one partial part); otherwise the ROM restarts. **HTTP only; no TLS.** Use on trusted LAN or put TLS in front of RomM.
 - Chunked transfer is not supported for streaming downloads; servers/proxies must send Content-Length. Redirects are not followed.
+- Redirect failures now include the `Location` target and explicitly note that auth is not forwarded across hosts.
 - Client-side split into FAT32/DBI parts: `0xFFFF0000` (00, 01, 02 ...) inside a temp dir when `fat32_safe=true`. If `fat32_safe=false`, the ROM stays as a single part. Each temp dir has a `manifest.json` with expected part sizes and which parts/partials are complete.
 - Temps live under `<download_dir>/temp/<safe-12>_<id>.tmp/00.part`. After full download:
   - **Single-part**: rename/copy `00.part` to `<download_dir>/<Title or fsName>_<id>.<ext>` (ID-suffixed to avoid collisions); temp folder and manifest removed.
@@ -16,6 +17,7 @@
 - Failures show a red "Failed: ." line. Short reads trigger a retry; if Range isn't supported that retry restarts the current ROM.
 - Adding items while downloading recalculates overall bytes immediately; the overall % can dip when you enqueue mid-run (queue is not locked).
 - Queue view surfaces a retained "Recent failures" summary even when active queue items are empty.
+- Queue state is persisted to `sdmc:/switch/romm_switch_client/queue_state.json` so pending items survive restarts (deduped against completed-on-disk entries).
 
 ### Logging (see `logging.md`)
 - Info: start/finish per ROM, finalize path, queue actions, failures.
