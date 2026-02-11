@@ -60,8 +60,12 @@ SPEED_TEST_URL=         # optional; URL to fetch ~40MB (Range) to estimate throu
 - D-Pad: navigate lists
 - B (bottom): Back
 - A (right): Select / confirm
-- X (top): Queue view / add to queue
-- Y (left): Start downloads (from queue)
+- Y (left): Queue view / add to queue
+- X (top): Start downloads (from queue)
+- D-Pad Left/Right (ROMS view): cycle filter/sort
+- Minus (ROMS view): text search
+- R (PLATFORMS view): open diagnostics
+- R (DIAGNOSTICS view): refresh reachability probe
 - Plus/Start: Quit
 Mappings are fixed in `source/input.cpp` (positional codes); UI hints match.
 
@@ -73,8 +77,10 @@ Mappings are fixed in `source/input.cpp` (positional codes); UI hints match.
 - Temp manifests load into history as Resumable ("Resume available") and do not auto-queue; 404/tiny preflight triggers one metadata refresh, then fails fast.
 
 ### Current client features
-- SDL2 UI (1280x720): platforms -> ROMs -> detail, queue, downloading, error.
+- SDL2 UI (1280x720): platforms -> ROMs -> detail, queue, downloading, diagnostics, error.
 - RomM API: lists platforms/ROMs, fetches per-ROM files[]; bundles respect relative paths; per-ROM folder naming `title_id`.
+- ROM list tooling: revision-keyed in-memory index for search/filter/sort without full per-frame scans.
+- Diagnostics screen: config summary, server reachability probe, SD free space, queue/history stats, last error, and exportable log summary.
 - Downloads: FAT32/DBI splits when enabled, Range resume with contiguity enforcement, temp isolation under `<download_dir>/temp/<platform>/<rom>/<file>/...`, archive bit set for multi-part.
 - Networking: HTTP only (no TLS); run on trusted LAN or put TLS in front of RomM. Redirects are not followed (Location logged).
 - Logging: leveled (`LOG_LEVEL`); debug is noisy.

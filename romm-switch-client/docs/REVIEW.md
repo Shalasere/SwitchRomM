@@ -1,22 +1,23 @@
 # RomM Switch Client - Technical Review
 
 Quick review of the C++17/libnx/SDL2 codebase: architecture, flows, risks, and pointers for contributors.  
-Last updated: 2025-12-22 (controls positional: A=Back/B=Select/Y=Queue/X=Start; resume contiguity enforced; title_id folders; chunked fail-fast; redirect logged with Location; speed test optional; FAT32 splitting toggle).
+Last updated: 2026-02-11 (controls positional: A=Back/B=Select/Y=Queue/X=Start, Minus=Search, R=Diagnostics gate; revision-keyed ROM search/filter/sort index; diagnostics view/export; resume contiguity enforced; title_id folders; chunked fail-fast; redirect logged with Location; speed test optional; FAT32 splitting toggle).
 
 ## Architecture snapshot
 - **Entry/UI**: `source/main.cpp` - SDL init, config load, API fetch, input handling, view transitions, rendering.
 - **State**: `include/romm/status.hpp` (UI/download state), `include/romm/models.hpp` (Platform/Game), `include/romm/config.hpp` (server/auth/download_dir/fat32_safe). Config keys in `docs/config.md`.
-- **Input**: `source/input.cpp` - SDL controller mapping reversed (A=Back, B=Select, Y=Queue, X=Start Downloads, Plus=Quit; positional mode) with debounce; raw JOY ignored. Controls in `docs/controls.md`.
+- **Input**: `source/input.cpp` - SDL controller mapping reversed (A=Back, B=Select, Y=Queue, X=Start Downloads, Minus=Search, R=Diagnostics, Plus=Quit; positional mode) with debounce; raw JOY ignored. Controls in `docs/controls.md`.
 - **Data/API**: `source/api.cpp` - minimal HTTP (HTTP-only, Basic auth), JSON via `mini/json.hpp`; fetches `/api/roms/{id}`, ingests full files[]; builds download URLs via `file_ids`; Range preflight; cover URLs now fully encoded/absolutized; redirects logged with Location but not followed.
 - **Covers**: cover_url parsed/absolutized; loader is latest-wins (single-slot) by design.
 - **Downloader**: `source/downloader.cpp` - background worker; FAT32 parts (0xFFFF0000) when `fat32_safe=true`, otherwise single-part; temp dirs under `<download_dir>/temp/<platform>/<rom>/<file>/...`; skips complete parts, deletes partials; single-part rename/copy fallback; multi-part archive bit; per-ROM folder `title_id`; resume keeps counters aligned; bundle_best selects best dir group; avoid tokens supported via platform prefs; per-file relative paths honored.
 
 ## Logic flows (per view)
-- **PLATFORMS**: Select (A) fetches ROMs; Back (B) ignored; Y opens QUEUE (prevQueueView=PLATFORMS); Plus quits.
-- **ROMS**: Select (A) -> DETAIL; Back (B) -> PLATFORMS; Y -> QUEUE (prevQueueView=ROMS); D-pad scroll with acceleration.
+- **PLATFORMS**: Select (A) fetches ROMs; Back (B) ignored; Y opens QUEUE (prevQueueView=PLATFORMS); R opens DIAGNOSTICS; Plus quits.
+- **ROMS**: Select (A) -> DETAIL; Back (B) -> PLATFORMS; Y -> QUEUE (prevQueueView=ROMS); Minus opens search keyboard; D-pad Left/Right cycles filter/sort; D-pad Up/Down scroll with acceleration.
 - **DETAIL**: Shows ROM metadata; Select (A) enqueues and switches to QUEUE; Back (B) -> ROMS; Y -> QUEUE (prevQueueView=DETAIL).
 - **QUEUE**: Lists queued ROMs; X starts downloads -> DOWNLOADING; Back returns to prevQueueView; Plus quits; empty shows "Queue empty." or "All downloads complete."
 - **DOWNLOADING**: Shows global progress, percent/bytes/MBps; SPD header when speed test url is set; "Connecting..." when no data yet; failure text if lastDownloadFailed; B -> QUEUE; Plus quits (stops worker).
+- **DIAGNOSTICS**: Shows config summary, server reachability probe, SD free space, queue/history stats, and last error; Select (A) exports a support summary to log; R refreshes probe; Back (B) returns to previous view. Launch is intentionally gated to PLATFORMS.
 - **ERROR**: Set on API failure; Quit exits.
 
 ## Issues (bugs/risks)
@@ -35,8 +36,8 @@ Severity: [H]=High, [M]=Medium, [L]=Low. File refs approximate.
 - [L] Data/UI fidelity: Model titles are sanitized to ASCII on parse (UTF-8 lost); cover loader is latest-only (drops queued covers). **Fix**: keep UTF-8 in model and sanitize at render; document latest-wins cover loader or add queue; add redirect follow/IPv6/trailer handling if needed. SPD speed test runs once at startup if URL set; optional.
 
 ## File notes
-- `source/main.cpp`: SDL lifecycle; config/API fetch; input loop maps Action -> state; view transitions; renderStatus draws all views; download view shows global progress/failure; queue view shows completion when empty after success.
-- `source/input.cpp`: Controller mapping with debounce; ignores JOY events. SDL controls reversed A=Back, B=Select, Y=Queue view/add, X=Start Download, Plus=Quit (UI footers match mapping).
+- `source/main.cpp`: SDL lifecycle; config/API fetch; input loop maps Action -> state; revision-keyed ROM indexing (search/filter/sort) and diagnostics probe/export; renderStatus draws all views; download view shows global progress/failure; queue view shows completion when empty after success.
+- `source/input.cpp`: Controller mapping with debounce; ignores JOY events. SDL controls reversed A=Back, B=Select, Y=Queue view/add, X=Start Download, Minus=Search, R=Diagnostics, Plus=Quit (UI footers match mapping).
 - `source/api.cpp`: Minimal HTTP (no TLS), Basic auth; parses platforms/ROMs; fetches DetailedRom files[]; builds download URLs via `file_ids`; cover/download URLs encoded/absolutized; redirects logged but not followed.
 - `source/downloader.cpp`: Background worker; parts at 0xFFFF0000 when `fat32_safe=true`, otherwise single-part; temp dir under `<download_dir>/temp/<platform>/<rom>/<file>/...`; skips complete parts; sequential per bundle; queue items removed on completion/failure; finalize renames `.part` to `00/01/...` and moves temp dir to `title_id` folder; sets concatenation/archive bit for multi-part; single-part rename has copy fallback; limited retries/backoff; HTTP-only, no TLS/redirects/chunked streaming.
 
