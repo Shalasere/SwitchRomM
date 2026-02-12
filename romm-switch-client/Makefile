@@ -28,7 +28,7 @@ ROMFS       := romfs
 
 APP_TITLE   := RomM Switch Client
 APP_AUTHOR  := Shalasere
-APP_VERSION := 0.2.0
+APP_VERSION := 0.2.6
 ICON        := assets/icon.jpg
 
 #---------------------------------------------------------------------------------
