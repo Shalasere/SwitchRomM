@@ -7,6 +7,7 @@ romm-switch-client/targetlog.txt
 romm-switch-client/Makefile
 romm-switch-client/tests/romm_tests
 romm-switch-client/tests/romm_tests.exe
+romm-switch-client/logs/
 *.nro
 *.nacp
 *.elf
