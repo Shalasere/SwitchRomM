@@ -853,8 +853,13 @@ bool fetchGamesForPlatform(const Config& cfg,
 
     HttpResponse resp;
     std::string err;
+    // Include both modern and legacy platform filters for cross-version server compatibility.
+    std::string encodedPlatformId = romm::util::urlEncode(platformId);
     std::string url = cfg.serverUrl +
-                      "/api/roms?platform_id=" + romm::util::urlEncode(platformId) +
+                      "/api/roms?platform_ids=" + encodedPlatformId +
+                      "&platform_id=" + encodedPlatformId +
+                      "&with_char_index=false" +
+                      "&with_filter_values=false" +
                       "&order_by=name&order_dir=asc&limit=10000";
 
     if (!httpGetJsonWithRetry(url, auth, cfg.httpTimeoutSeconds, resp, err)) {

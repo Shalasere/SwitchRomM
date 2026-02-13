@@ -1571,8 +1571,18 @@ int main(int argc, char** argv) {
     SDL_Renderer* renderer = nullptr;
     SDL_GameController* pad = nullptr;
     int numJoy = 0;
+    constexpr uint32_t kPlatformRomsCacheTtlMs = 2 * 60 * 1000; // 2 minutes
+    constexpr size_t kPlatformRomsCacheMaxEntries = 2;
     Config config;
     Status status;
+    struct CachedPlatformRoms {
+        std::vector<romm::Game> games;
+        std::string slug;
+        std::string name;
+        uint32_t fetchedAtMs{0};
+    };
+    std::unordered_map<std::string, CachedPlatformRoms> platformRomsCache;
+    uint32_t currentPlatformFetchedAtMs = 0;
     struct PendingRomFetch {
         std::string pid;
         std::string slug;
@@ -1606,6 +1616,16 @@ int main(int argc, char** argv) {
     uint64_t appliedHistRevForRoms = 0;
     ScrollHold scrollHold;
     auto resetNav = [&]() { status.navStack.clear(); };
+
+    auto prunePlatformCache = [&]() {
+        while (platformRomsCache.size() > kPlatformRomsCacheMaxEntries) {
+            auto oldest = platformRomsCache.begin();
+            for (auto it = platformRomsCache.begin(); it != platformRomsCache.end(); ++it) {
+                if (it->second.fetchedAtMs < oldest->second.fetchedAtMs) oldest = it;
+            }
+            platformRomsCache.erase(oldest);
+        }
+    };
 
     // Background ROM fetch logic: main thread submits requests and applies results via poll.
     auto runRomFetch = [&](const PendingRomFetch& req) -> RomFetchResult {
@@ -2052,12 +2072,25 @@ int main(int argc, char** argv) {
                 } else {
                     finalCount = done->games.size();
                     if (!done->games.empty()) firstTitle = done->games[0].title;
+                    uint32_t nowMs = SDL_GetTicks();
+                    if (!status.currentPlatformId.empty() &&
+                        status.currentPlatformId != done->req.pid &&
+                        !status.romsAll.empty()) {
+                        CachedPlatformRoms keep;
+                        keep.games = std::move(status.romsAll);
+                        keep.slug = status.currentPlatformSlug;
+                        keep.name = status.currentPlatformName;
+                        keep.fetchedAtMs = currentPlatformFetchedAtMs;
+                        platformRomsCache[status.currentPlatformId] = std::move(keep);
+                        prunePlatformCache();
+                    }
                     status.romsAll = std::move(done->games);
                     status.romsAllRevision++;
                     rebuildVisibleRomsLocked(true);
                     status.currentPlatformId = done->req.pid;
                     status.currentPlatformSlug = done->req.slug;
                     status.currentPlatformName = done->req.name;
+                    currentPlatformFetchedAtMs = nowMs;
                     status.navStack.clear();
                     status.currentView = Status::View::ROMS;
                     status.netBusy.store(false);
@@ -2249,6 +2282,52 @@ int main(int argc, char** argv) {
                                 selSlug = status.platforms[sel].slug;
                                 selName = status.platforms[sel].name;
                             }
+                        }
+                        bool usedCache = false;
+                        if (!romFetchJobs.busy()) {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            uint32_t nowMs = SDL_GetTicks();
+                            if (status.currentPlatformId == pid && !status.romsAll.empty() &&
+                                (nowMs - currentPlatformFetchedAtMs) <= kPlatformRomsCacheTtlMs) {
+                                status.currentView = Status::View::ROMS;
+                                status.navStack.clear();
+                                usedCache = true;
+                            } else {
+                                auto hit = platformRomsCache.find(pid);
+                                if (hit != platformRomsCache.end()) {
+                                    if ((nowMs - hit->second.fetchedAtMs) <= kPlatformRomsCacheTtlMs &&
+                                        !hit->second.games.empty()) {
+                                        if (!status.currentPlatformId.empty() &&
+                                            status.currentPlatformId != pid &&
+                                            !status.romsAll.empty()) {
+                                            CachedPlatformRoms keep;
+                                            keep.games = std::move(status.romsAll);
+                                            keep.slug = status.currentPlatformSlug;
+                                            keep.name = status.currentPlatformName;
+                                            keep.fetchedAtMs = currentPlatformFetchedAtMs;
+                                            platformRomsCache[status.currentPlatformId] = std::move(keep);
+                                            prunePlatformCache();
+                                        }
+                                        status.romsAll = std::move(hit->second.games);
+                                        status.romsAllRevision++;
+                                        rebuildVisibleRomsLocked(true);
+                                        status.currentPlatformId = pid;
+                                        status.currentPlatformSlug = hit->second.slug.empty() ? selSlug : hit->second.slug;
+                                        status.currentPlatformName = hit->second.name.empty() ? selName : hit->second.name;
+                                        status.navStack.clear();
+                                        status.currentView = Status::View::ROMS;
+                                        currentPlatformFetchedAtMs = hit->second.fetchedAtMs;
+                                        usedCache = true;
+                                    }
+                                    platformRomsCache.erase(hit);
+                                }
+                            }
+                        }
+                        if (usedCache) {
+                            gViewTraceFrames = 8;
+                            romm::logLine("ROM fetch cache hit for platform id=" + pid);
+                            viewChangedThisFrame = true;
+                            break;
                         }
                         PendingRomFetch req{pid, selSlug, selName};
                         // Async fetch so UI can keep rendering (including throbber) while the HTTP call runs.
