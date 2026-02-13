@@ -15,9 +15,41 @@ struct HttpResponse {
     std::string body;
 };
 
+struct GamesPage {
+    std::vector<Game> games;
+    size_t offset{0};
+    size_t limit{0};
+    size_t total{0};
+    bool totalKnown{false};
+    bool hasMore{false};
+};
+
 // HTTP/JSON API client (http only; no redirects/chunked streaming).
 bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError, ErrorInfo* outInfo = nullptr);
 bool fetchGamesForPlatform(const Config& cfg, const std::string& platformId, Status& status, std::string& outError, ErrorInfo* outInfo = nullptr);
+bool fetchGamesPageForPlatform(const Config& cfg,
+                               const std::string& platformId,
+                               size_t offset,
+                               size_t limit,
+                               GamesPage& outPage,
+                               std::string& outError,
+                               ErrorInfo* outInfo = nullptr);
+bool fetchRomsIdentifiersDigest(const Config& cfg,
+                                const std::string& platformId,
+                                std::string& outDigest,
+                                std::string& outError,
+                                ErrorInfo* outInfo = nullptr);
+bool fetchPlatformsIdentifiersDigest(const Config& cfg,
+                                     std::string& outDigest,
+                                     std::string& outError,
+                                     ErrorInfo* outInfo = nullptr);
+bool searchGamesRemote(const Config& cfg,
+                       const std::string& platformId,
+                       const std::string& query,
+                       size_t limit,
+                       std::vector<Game>& outGames,
+                       std::string& outError,
+                       ErrorInfo* outInfo = nullptr);
 bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData, std::string& outError, ErrorInfo* outInfo = nullptr);
 bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError, ErrorInfo* outInfo = nullptr);
 // Shared URL parser (http:// only).

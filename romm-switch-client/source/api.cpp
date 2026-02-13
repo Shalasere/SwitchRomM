@@ -21,6 +21,9 @@
 #include <functional>
 #include <cerrno>
 #include <cmath>
+#include <algorithm>
+#include <array>
+#include <optional>
 #ifndef UNIT_TEST
 #include <sys/socket.h>
 #include <netdb.h>
@@ -34,6 +37,9 @@ namespace {
 constexpr size_t kApiRecvBuf = 8192;
 constexpr int64_t kRetryDelayFastNs = 250'000'000LL; // 250ms
 constexpr int64_t kRetryDelaySlowNs = 1'000'000'000LL; // 1s
+constexpr size_t kDefaultApiPageLimit = 300;
+constexpr size_t kDefaultRemoteSearchLimit = 250;
+constexpr size_t kMaxDigestItems = 10000;
 
 void setApiError(std::string& outError,
                  ErrorInfo* outInfo,
@@ -42,6 +48,343 @@ void setApiError(std::string& outError,
     outError = detail;
     if (outInfo) *outInfo = classifyError(detail, hint);
 }
+
+static uint64_t fnv1a64(const std::string& s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static std::string hex64(uint64_t v) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0') << std::setw(16) << v;
+    return oss.str();
+}
+
+static std::string stableDigest(const std::vector<std::string>& tokens) {
+    std::vector<std::string> sorted = tokens;
+    std::sort(sorted.begin(), sorted.end());
+    uint64_t h = 1469598103934665603ULL;
+    for (const auto& t : sorted) {
+        h ^= fnv1a64(t);
+        h *= 1099511628211ULL;
+    }
+    return hex64(h);
+}
+
+static std::string valueToken(const mini::Value& v) {
+    switch (v.type) {
+        case mini::Value::Type::String:
+            return v.str;
+        case mini::Value::Type::Number: {
+            std::ostringstream oss;
+            oss << std::setprecision(17) << v.number;
+            return oss.str();
+        }
+        case mini::Value::Type::Bool:
+            return v.boolean ? "1" : "0";
+        case mini::Value::Type::Null:
+            return "null";
+        case mini::Value::Type::Array:
+            return "array(" + std::to_string(v.array.size()) + ")";
+        case mini::Value::Type::Object:
+            return "object(" + std::to_string(v.object.size()) + ")";
+    }
+    return {};
+}
+
+static bool parseIdentifiersDigestBody(const std::string& body, std::string& outDigest, std::string& err) {
+    mini::Array arr;
+    mini::Object obj;
+    std::vector<std::string> tokens;
+    auto addToken = [&](const std::string& t) {
+        if (!t.empty() && tokens.size() < kMaxDigestItems) tokens.push_back(t);
+    };
+
+    if (mini::parse(body, arr)) {
+        for (const auto& v : arr) {
+            if (v.type == mini::Value::Type::Object) {
+                const auto& o = v.object;
+                std::string id;
+                std::array<const char*, 7> idKeys{
+                    "id", "rom_id", "platform_id", "slug", "name", "value", "key"
+                };
+                for (const char* k : idKeys) {
+                    auto it = o.find(k);
+                    if (it != o.end()) {
+                        id = valueToken(it->second);
+                        if (!id.empty()) break;
+                    }
+                }
+                std::string ver;
+                std::array<const char*, 8> verKeys{
+                    "updated_at", "modified_at", "mtime", "timestamp", "version", "checksum", "hash", "etag"
+                };
+                for (const char* k : verKeys) {
+                    auto it = o.find(k);
+                    if (it != o.end()) {
+                        ver = valueToken(it->second);
+                        if (!ver.empty()) break;
+                    }
+                }
+                if (!id.empty() || !ver.empty()) {
+                    addToken(id + "|" + ver);
+                } else {
+                    std::vector<std::string> kv;
+                    kv.reserve(o.size());
+                    for (const auto& kvp : o) kv.push_back(kvp.first + "=" + valueToken(kvp.second));
+                    addToken(stableDigest(kv));
+                }
+            } else {
+                addToken(valueToken(v));
+            }
+        }
+        outDigest = stableDigest(tokens);
+        return true;
+    }
+
+    if (!mini::parse(body, obj)) {
+        err = "Failed to parse identifiers JSON";
+        return false;
+    }
+
+    auto collectArray = [&](const char* key) -> bool {
+        auto it = obj.find(key);
+        if (it == obj.end() || it->second.type != mini::Value::Type::Array) return false;
+        for (const auto& v : it->second.array) addToken(valueToken(v));
+        return true;
+    };
+
+    if (collectArray("items") || collectArray("identifiers") || collectArray("results") || collectArray("ids")) {
+        outDigest = stableDigest(tokens);
+        return true;
+    }
+
+    for (const auto& kv : obj) {
+        addToken(kv.first + "=" + valueToken(kv.second));
+    }
+    outDigest = stableDigest(tokens);
+    return true;
+}
+
+#ifndef UNIT_TEST
+struct KeepAliveConn {
+    int fd{-1};
+    std::string host;
+    std::string port;
+    int timeoutSec{0};
+};
+
+thread_local KeepAliveConn gKeepAliveConn;
+
+static void closeKeepAliveConn() {
+    if (gKeepAliveConn.fd >= 0) {
+        close(gKeepAliveConn.fd);
+    }
+    gKeepAliveConn = KeepAliveConn{};
+}
+
+static bool openKeepAliveConn(const std::string& host,
+                              const std::string& port,
+                              int timeoutSec,
+                              std::string& err) {
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    int ret = getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
+    if (ret != 0 || !res) {
+        err = "DNS lookup failed for host: " + host;
+        if (res) freeaddrinfo(res);
+        return false;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        err = "Socket creation failed";
+        freeaddrinfo(res);
+        return false;
+    }
+
+    if (timeoutSec > 0) {
+        timeval tv{};
+        tv.tv_sec = timeoutSec;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        err = std::string("Connect failed: ") + std::strerror(errno);
+        freeaddrinfo(res);
+        close(fd);
+        return false;
+    }
+    freeaddrinfo(res);
+
+    closeKeepAliveConn();
+    gKeepAliveConn.fd = fd;
+    gKeepAliveConn.host = host;
+    gKeepAliveConn.port = port;
+    gKeepAliveConn.timeoutSec = timeoutSec;
+    return true;
+}
+
+static bool ensureKeepAliveConn(const std::string& host,
+                                const std::string& port,
+                                int timeoutSec,
+                                std::string& err) {
+    if (gKeepAliveConn.fd >= 0 &&
+        gKeepAliveConn.host == host &&
+        gKeepAliveConn.port == port &&
+        gKeepAliveConn.timeoutSec == timeoutSec) {
+        return true;
+    }
+    return openKeepAliveConn(host, port, timeoutSec, err);
+}
+
+static bool readHttpResponseKeepAlive(int fd, HttpResponse& resp, std::string& err, bool& shouldCloseConn) {
+    resp = HttpResponse{};
+    shouldCloseConn = false;
+
+    std::string raw;
+    raw.reserve(16 * 1024);
+    char buf[kApiRecvBuf];
+    size_t hdrEnd = std::string::npos;
+    while (hdrEnd == std::string::npos) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n < 0) {
+            err = (errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" :
+                  (std::string("Recv failed: ") + std::strerror(errno));
+            return false;
+        }
+        if (n == 0) {
+            err = "Connection closed before HTTP headers";
+            return false;
+        }
+        raw.append(buf, buf + n);
+        hdrEnd = raw.find("\r\n\r\n");
+    }
+
+    std::string headerBlock = raw.substr(0, hdrEnd);
+    ParsedHttpResponse parsed{};
+    if (!parseHttpResponseHeaders(headerBlock, parsed, err)) {
+        return false;
+    }
+    resp.statusCode = parsed.statusCode;
+    resp.statusText = parsed.statusText;
+    resp.headersRaw = parsed.headersRaw;
+
+    std::string headersLower = resp.headersRaw;
+    for (auto& c : headersLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (headersLower.find("connection: close") != std::string::npos) {
+        shouldCloseConn = true;
+    }
+
+    std::string body = raw.substr(hdrEnd + 4);
+    if (parsed.chunked) {
+        // Conservative handling: read until we can decode a complete chunked body.
+        std::string decoded;
+        while (!decodeChunkedBody(body, decoded)) {
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            if (n < 0) {
+                err = (errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" :
+                      (std::string("Recv failed: ") + std::strerror(errno));
+                return false;
+            }
+            if (n == 0) break;
+            body.append(buf, buf + n);
+        }
+        if (!decodeChunkedBody(body, decoded)) {
+            err = "Failed to decode chunked HTTP body";
+            return false;
+        }
+        resp.body.swap(decoded);
+        shouldCloseConn = true; // simplify connection lifecycle for chunked replies
+        return true;
+    }
+
+    if (parsed.contentLength > 0) {
+        while (body.size() < parsed.contentLength) {
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            if (n < 0) {
+                err = (errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" :
+                      (std::string("Recv failed: ") + std::strerror(errno));
+                return false;
+            }
+            if (n == 0) {
+                err = "Short HTTP body";
+                return false;
+            }
+            body.append(buf, buf + n);
+        }
+        if (body.size() > parsed.contentLength) {
+            body.resize(static_cast<size_t>(parsed.contentLength));
+        }
+        resp.body.swap(body);
+        return true;
+    }
+
+    // No framing headers: read to EOF and close.
+    while (true) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n < 0) {
+            err = (errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" :
+                  (std::string("Recv failed: ") + std::strerror(errno));
+            return false;
+        }
+        if (n == 0) break;
+        body.append(buf, buf + n);
+    }
+    resp.body.swap(body);
+    shouldCloseConn = true;
+    return true;
+}
+
+static bool httpRequestKeepAlive(const std::string& method,
+                                 const std::string& url,
+                                 const std::vector<std::pair<std::string, std::string>>& extraHeaders,
+                                 int timeoutSec,
+                                 HttpResponse& resp,
+                                 std::string& err) {
+    std::string host, portStr, path;
+    if (!parseHttpUrl(url, host, portStr, path, err)) return false;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ensureKeepAliveConn(host, portStr, timeoutSec, err)) return false;
+
+        std::ostringstream req;
+        req << method << " " << path << " HTTP/1.1\r\n";
+        req << "Host: " << host << "\r\n";
+        req << "Connection: keep-alive\r\n";
+        for (const auto& kv : extraHeaders) {
+            req << kv.first << ": " << kv.second << "\r\n";
+        }
+        req << "\r\n";
+        std::string reqStr = req.str();
+
+        if (!romm::sendAll(gKeepAliveConn.fd, reqStr.data(), reqStr.size())) {
+            closeKeepAliveConn();
+            err = "Send failed";
+            if (attempt == 0) continue;
+            return false;
+        }
+
+        bool shouldCloseConn = false;
+        if (!readHttpResponseKeepAlive(gKeepAliveConn.fd, resp, err, shouldCloseConn)) {
+            closeKeepAliveConn();
+            if (attempt == 0) continue;
+            return false;
+        }
+        if (shouldCloseConn) closeKeepAliveConn();
+        return true;
+    }
+    return false;
+}
+#endif
 }
 
 bool parseHttpUrl(const std::string& url,
@@ -145,136 +488,7 @@ bool httpRequest(const std::string& method,
                  HttpResponse& resp,
                  std::string& err)
 {
-    resp = HttpResponse{};
-    std::string host, portStr, path;
-    if (!parseHttpUrl(url, host, portStr, path, err)) {
-        return false;
-    }
-
-    struct addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* res = nullptr;
-
-    int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
-    if (ret != 0 || !res) {
-        err = "DNS lookup failed for host: " + host;
-        if (res) freeaddrinfo(res);
-        return false;
-    }
-
-    romm::UniqueFd sockFd(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
-    if (!sockFd) {
-        err = "Socket creation failed";
-        freeaddrinfo(res);
-        return false;
-    }
-
-    // Set recv/send timeout
-    if (timeoutSec > 0) {
-        timeval tv{};
-        tv.tv_sec  = timeoutSec;
-        tv.tv_usec = 0;
-        setsockopt(sockFd.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sockFd.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    }
-
-    if (connect(sockFd.fd, res->ai_addr, res->ai_addrlen) != 0) {
-        err = "Connect failed";
-        freeaddrinfo(res);
-        return false;
-    }
-    freeaddrinfo(res);
-
-    // Build request
-    std::ostringstream req;
-    req << method << " " << path << " HTTP/1.1\r\n";
-    req << "Host: " << host << "\r\n";
-    req << "Connection: close\r\n";
-    for (const auto& kv : extraHeaders) {
-        req << kv.first << ": " << kv.second << "\r\n";
-    }
-    req << "\r\n";
-    std::string reqStr = req.str();
-
-    // Send all
-    size_t totalSent = 0;
-    while (totalSent < reqStr.size()) {
-        ssize_t n = send(sockFd.fd, reqStr.data() + totalSent,
-                         reqStr.size() - totalSent, 0);
-        if (n <= 0) {
-            err = "Send failed";
-            return false;
-        }
-        totalSent += static_cast<size_t>(n);
-    }
-
-    // Receive response
-    std::string raw;
-    char buf[8192];
-    while (true) {
-        ssize_t n = recv(sockFd.fd, buf, sizeof(buf), 0);
-        if (n > 0) {
-            raw.append(buf, buf + n);
-        } else if (n == 0) {
-            break; // EOF
-        } else {
-            // timeout or error
-            err = "Recv failed or timed out";
-            return false;
-        }
-    }
-
-    if (raw.empty()) {
-        err = "Empty HTTP response";
-        return false;
-    }
-
-    // Split headers/body
-    auto hdrEnd = raw.find("\r\n\r\n");
-    if (hdrEnd == std::string::npos) {
-        err = "Malformed HTTP response (no header/body separator)";
-        return false;
-    }
-    std::string headerBlock = raw.substr(0, hdrEnd);
-    std::string body        = raw.substr(hdrEnd + 4);
-
-    // Parse status line
-    auto firstCRLF = headerBlock.find("\r\n");
-    if (firstCRLF == std::string::npos) {
-        err = "Malformed HTTP response (no status line CRLF)";
-        return false;
-    }
-    std::string statusLine = headerBlock.substr(0, firstCRLF);
-    std::istringstream sl(statusLine);
-    std::string httpVer;
-    sl >> httpVer;
-    sl >> resp.statusCode;
-    std::getline(sl, resp.statusText);
-    if (!resp.statusText.empty() && resp.statusText.front() == ' ')
-        resp.statusText.erase(resp.statusText.begin());
-
-    resp.headersRaw = headerBlock.substr(firstCRLF + 2); // everything after status line
-
-    // Detect chunked encoding
-    std::string headersLower = resp.headersRaw;
-    for (auto& c : headersLower)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-    bool chunked = (headersLower.find("transfer-encoding: chunked") != std::string::npos);
-
-    if (chunked) {
-        std::string decoded;
-        if (!decodeChunkedBody(body, decoded)) {
-            err = "Failed to decode chunked HTTP body";
-            return false;
-        }
-        resp.body.swap(decoded);
-    } else {
-        resp.body.swap(body);
-    }
-
-    return true;
+    return httpRequestKeepAlive(method, url, extraHeaders, timeoutSec, resp, err);
 }
 
 // Streaming variant: delivers body via onData, does not keep the payload in memory.
@@ -657,12 +871,17 @@ static bool parsePlatforms(const std::string& body, Status& status, std::string&
     return true;
 }
 
-static bool parseGames(const std::string& body,
-                       const std::string& platformId,
-                       Status& status,
-                       const std::string& serverUrl,
-                       std::string& err)
-{
+struct ParsedGamesPayload {
+    std::vector<Game> games;
+    size_t total{0};
+    bool totalKnown{false};
+};
+
+static bool parseGamesPayload(const std::string& body,
+                              const std::string& platformId,
+                              const std::string& serverUrl,
+                              ParsedGamesPayload& out,
+                              std::string& err) {
     auto encodePath = [](const std::string& s) {
         std::string out;
         out.reserve(s.size());
@@ -679,14 +898,33 @@ static bool parseGames(const std::string& body,
         }
         return out;
     };
+    out = ParsedGamesPayload{};
     mini::Array arr;
     mini::Object obj;
     if (!mini::parse(body, arr)) {
         if (mini::parse(body, obj)) {
-            auto it = obj.find("items");
-            if (it != obj.end() && it->second.type == mini::Value::Type::Array) {
-                arr = it->second.array;
-            } else {
+            auto setTotalIfNumber = [&](const char* key) {
+                auto it = obj.find(key);
+                if (it != obj.end() && it->second.type == mini::Value::Type::Number) {
+                    if (it->second.number >= 0) {
+                        out.total = static_cast<size_t>(it->second.number);
+                        out.totalKnown = true;
+                    }
+                }
+            };
+            setTotalIfNumber("total");
+            setTotalIfNumber("count");
+            setTotalIfNumber("num_results");
+            setTotalIfNumber("total_count");
+            auto adoptArray = [&](const char* key) -> bool {
+                auto it = obj.find(key);
+                if (it != obj.end() && it->second.type == mini::Value::Type::Array) {
+                    arr = it->second.array;
+                    return true;
+                }
+                return false;
+            };
+            if (!adoptArray("items") && !adoptArray("results") && !adoptArray("roms")) {
                 err = "Games JSON missing items array";
                 return false;
             }
@@ -696,7 +934,7 @@ static bool parseGames(const std::string& body,
         }
     }
 
-    status.roms.clear();
+    out.games.clear();
     for (auto& v : arr) {
         if (v.type != mini::Value::Type::Object) continue;
         auto& o = v.object;
@@ -769,16 +1007,16 @@ static bool parseGames(const std::string& body,
         // If the list API doesn't include per-ROM platform metadata, fall back to the selected platform.
         if (g.platformId.empty()) g.platformId = platformId;
 
-        if (!g.id.empty()) status.roms.push_back(g);
+        if (!g.id.empty()) out.games.push_back(g);
     }
 
-    status.romsReady = true;
+    if (!out.totalKnown) out.total = out.games.size();
 
-    if (!status.roms.empty()) {
-        std::string first  = previewText(status.roms[0].title);
-        std::string second = status.roms.size() > 1 ? previewText(status.roms[1].title) : "";
-        std::string third  = status.roms.size() > 2 ? previewText(status.roms[2].title) : "";
-        logLine("Parsed ROMs: " + std::to_string(status.roms.size()) + " first=" + first);
+    if (!out.games.empty()) {
+        std::string first  = previewText(out.games[0].title);
+        std::string second = out.games.size() > 1 ? previewText(out.games[1].title) : "";
+        std::string third  = out.games.size() > 2 ? previewText(out.games[2].title) : "";
+        logLine("Parsed ROMs: " + std::to_string(out.games.size()) + " first=" + first);
         if (!second.empty()) logLine(" second=" + second);
         if (!third.empty())  logLine(" third=" + third);
     }
@@ -793,9 +1031,9 @@ bool parseGamesTest(const std::string& body,
                     std::vector<Game>& outGames,
                     std::string& err)
 {
-    Status st;
-    bool ok = parseGames(body, platformId, st, serverUrl, err);
-    outGames = st.roms;
+    ParsedGamesPayload parsed;
+    bool ok = parseGamesPayload(body, platformId, serverUrl, parsed, err);
+    outGames = std::move(parsed.games);
     return ok;
 }
 
@@ -808,20 +1046,105 @@ bool parsePlatformsTest(const std::string& body,
     outPlatforms = st.platforms;
     return ok;
 }
+
+bool parseIdentifiersDigestTest(const std::string& body,
+                                std::string& outDigest,
+                                std::string& err) {
+    return parseIdentifiersDigestBody(body, outDigest, err);
+}
 #endif
+
+static std::string buildBasicAuth(const Config& cfg) {
+    if (cfg.username.empty() && cfg.password.empty()) return {};
+    return romm::util::base64Encode(cfg.username + ":" + cfg.password);
+}
+
+static std::string buildPlatformRomsQuery(const std::string& serverUrl,
+                                          const std::string& platformId,
+                                          size_t limit,
+                                          size_t offset) {
+    std::string encodedPlatformId = romm::util::urlEncode(platformId);
+    std::ostringstream q;
+    q << serverUrl
+      << "/api/roms?platform_ids=" << encodedPlatformId
+      << "&platform_id=" << encodedPlatformId
+      << "&with_char_index=false"
+      << "&with_filter_values=false"
+      << "&order_by=name&order_dir=asc"
+      << "&limit=" << limit
+      << "&offset=" << offset;
+    return q.str();
+}
+
+bool fetchPlatformsIdentifiersDigest(const Config& cfg,
+                                     std::string& outDigest,
+                                     std::string& outError,
+                                     ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
+    outDigest.clear();
+    HttpResponse resp;
+    std::string err;
+    if (!httpGetJsonWithRetry(cfg.serverUrl + "/api/platforms/identifiers",
+                              buildBasicAuth(cfg), cfg.httpTimeoutSeconds, resp, err)) {
+        setApiError(outError, outInfo, err, ErrorCategory::Network);
+        return false;
+    }
+    if (!parseIdentifiersDigestBody(resp.body, outDigest, err)) {
+        setApiError(outError, outInfo, err, ErrorCategory::Parse);
+        return false;
+    }
+    outError.clear();
+    return true;
+}
+
+bool fetchRomsIdentifiersDigest(const Config& cfg,
+                                const std::string& platformId,
+                                std::string& outDigest,
+                                std::string& outError,
+                                ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
+    outDigest.clear();
+    if (platformId.empty()) {
+        setApiError(outError, outInfo, "Missing platform id for ROM identifiers probe.", ErrorCategory::Data);
+        return false;
+    }
+    std::string encodedPlatformId = romm::util::urlEncode(platformId);
+    std::string url = cfg.serverUrl + "/api/roms/identifiers?platform_ids=" + encodedPlatformId +
+                      "&platform_id=" + encodedPlatformId;
+    HttpResponse resp;
+    std::string err;
+    if (!httpGetJsonWithRetry(url, buildBasicAuth(cfg), cfg.httpTimeoutSeconds, resp, err)) {
+        setApiError(outError, outInfo, err, ErrorCategory::Network);
+        return false;
+    }
+    if (!parseIdentifiersDigestBody(resp.body, outDigest, err)) {
+        setApiError(outError, outInfo, err, ErrorCategory::Parse);
+        return false;
+    }
+    outError.clear();
+    return true;
+}
 
 bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError, ErrorInfo* outInfo) {
     if (outInfo) *outInfo = ErrorInfo{};
-    std::string auth;
-    if (!cfg.username.empty() || !cfg.password.empty()) {
-        auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
+    static std::string sLastPlatformsDigest;
+    if (!status.platforms.empty()) {
+        std::string digest;
+        std::string probeErr;
+        if (fetchPlatformsIdentifiersDigest(cfg, digest, probeErr, nullptr) &&
+            !digest.empty() &&
+            digest == sLastPlatformsDigest) {
+            outError.clear();
+            logLine("API: platforms unchanged via identifiers probe; reusing in-memory list");
+            return true;
+        }
     }
 
     HttpResponse resp;
     std::string err;
     std::string url = cfg.serverUrl + "/api/platforms";
 
-    if (!httpGetJsonWithRetry(url, auth, cfg.httpTimeoutSeconds, resp, err)) {
+    if (!httpGetJsonWithRetry(url, buildBasicAuth(cfg), cfg.httpTimeoutSeconds, resp, err)) {
         setApiError(outError, outInfo, err, ErrorCategory::Network);
         return false;
     }
@@ -831,7 +1154,68 @@ bool fetchPlatforms(const Config& cfg, Status& status, std::string& outError, Er
         return false;
     }
 
+    std::string digest;
+    if (parseIdentifiersDigestBody(resp.body, digest, err) && !digest.empty()) {
+        sLastPlatformsDigest = digest;
+    } else {
+        std::string probeErr;
+        if (fetchPlatformsIdentifiersDigest(cfg, digest, probeErr, nullptr) && !digest.empty()) {
+            sLastPlatformsDigest = digest;
+        }
+    }
+
     logLine("API: fetched platforms (" + std::to_string(status.platforms.size()) + ")");
+    return true;
+}
+
+bool fetchGamesPageForPlatform(const Config& cfg,
+                               const std::string& platformId,
+                               size_t offset,
+                               size_t limit,
+                               GamesPage& outPage,
+                               std::string& outError,
+                               ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
+    outPage = GamesPage{};
+    if (platformId.empty()) {
+        setApiError(outError, outInfo, "Missing platform id.", ErrorCategory::Data);
+        return false;
+    }
+    if (limit == 0) limit = kDefaultApiPageLimit;
+
+    HttpResponse resp;
+    std::string err;
+    std::string url = buildPlatformRomsQuery(cfg.serverUrl, platformId, limit, offset);
+
+    if (!httpGetJsonWithRetry(url, buildBasicAuth(cfg), cfg.httpTimeoutSeconds, resp, err)) {
+        setApiError(outError, outInfo, err, ErrorCategory::Network);
+        return false;
+    }
+
+    ParsedGamesPayload parsed;
+    if (!parseGamesPayload(resp.body, platformId, cfg.serverUrl, parsed, err)) {
+        romm::logLine("ROMs response (first 256 bytes): " +
+                      resp.body.substr(0, resp.body.size() > 256 ? 256 : resp.body.size()));
+        setApiError(outError, outInfo, err, ErrorCategory::Parse);
+        return false;
+    }
+
+    outPage.games = std::move(parsed.games);
+    outPage.offset = offset;
+    outPage.limit = limit;
+    outPage.total = parsed.total;
+    outPage.totalKnown = parsed.totalKnown;
+    if (parsed.totalKnown) {
+        outPage.hasMore = (offset + outPage.games.size()) < parsed.total;
+    } else {
+        outPage.hasMore = outPage.games.size() >= limit;
+    }
+
+    logLine("API: fetched games page offset=" + std::to_string(offset) +
+            " limit=" + std::to_string(limit) +
+            " count=" + std::to_string(outPage.games.size()) +
+            " platform=" + platformId);
+    outError.clear();
     return true;
 }
 
@@ -841,41 +1225,60 @@ bool fetchGamesForPlatform(const Config& cfg,
                            std::string& outError,
                            ErrorInfo* outInfo)
 {
-    if (outInfo) *outInfo = ErrorInfo{};
-    if (platformId.empty()) {
-        setApiError(outError, outInfo, "Missing platform id.", ErrorCategory::Data);
+    GamesPage page;
+    if (!fetchGamesPageForPlatform(cfg, platformId, 0, 10000, page, outError, outInfo)) {
         return false;
     }
-    std::string auth;
-    if (!cfg.username.empty() || !cfg.password.empty()) {
-        auth = romm::util::base64Encode(cfg.username + ":" + cfg.password);
+    status.roms = std::move(page.games);
+    status.romsReady = true;
+    return true;
+}
+
+bool searchGamesRemote(const Config& cfg,
+                       const std::string& platformId,
+                       const std::string& query,
+                       size_t limit,
+                       std::vector<Game>& outGames,
+                       std::string& outError,
+                       ErrorInfo* outInfo) {
+    if (outInfo) *outInfo = ErrorInfo{};
+    outGames.clear();
+    if (platformId.empty()) {
+        setApiError(outError, outInfo, "Missing platform id for remote search.", ErrorCategory::Data);
+        return false;
     }
+    if (query.empty()) {
+        outError.clear();
+        return true;
+    }
+    if (limit == 0) limit = kDefaultRemoteSearchLimit;
+
+    std::string encodedPid = romm::util::urlEncode(platformId);
+    std::string encodedQ = romm::util::urlEncode(query);
+    std::ostringstream url;
+    url << cfg.serverUrl
+        << "/api/search/roms?q=" << encodedQ
+        << "&query=" << encodedQ
+        << "&platform_ids=" << encodedPid
+        << "&platform_id=" << encodedPid
+        << "&limit=" << limit
+        << "&offset=0";
 
     HttpResponse resp;
     std::string err;
-    // Include both modern and legacy platform filters for cross-version server compatibility.
-    std::string encodedPlatformId = romm::util::urlEncode(platformId);
-    std::string url = cfg.serverUrl +
-                      "/api/roms?platform_ids=" + encodedPlatformId +
-                      "&platform_id=" + encodedPlatformId +
-                      "&with_char_index=false" +
-                      "&with_filter_values=false" +
-                      "&order_by=name&order_dir=asc&limit=10000";
-
-    if (!httpGetJsonWithRetry(url, auth, cfg.httpTimeoutSeconds, resp, err)) {
+    if (!httpGetJsonWithRetry(url.str(), buildBasicAuth(cfg), cfg.httpTimeoutSeconds, resp, err)) {
         setApiError(outError, outInfo, err, ErrorCategory::Network);
         return false;
     }
 
-    if (!parseGames(resp.body, platformId, status, cfg.serverUrl, err)) {
-        romm::logLine("ROMs response (first 256 bytes): " +
-                      resp.body.substr(0, resp.body.size() > 256 ? 256 : resp.body.size()));
+    ParsedGamesPayload parsed;
+    if (!parseGamesPayload(resp.body, platformId, cfg.serverUrl, parsed, err)) {
         setApiError(outError, outInfo, err, ErrorCategory::Parse);
         return false;
     }
-
-    logLine("API: fetched games (" + std::to_string(status.roms.size()) +
-            ") for platform " + platformId);
+    outGames = std::move(parsed.games);
+    outError.clear();
+    logLine("API: remote search query=\"" + query + "\" results=" + std::to_string(outGames.size()));
     return true;
 }
 

@@ -210,3 +210,35 @@ TEST_CASE("parseGames preserves UTF-8 titles in model data") {
     REQUIRE(games.size() == 1);
     REQUIRE(games[0].title == u8"Pokémon — Ōkami édition");
 }
+
+TEST_CASE("parseGames accepts object payload with results array") {
+    const std::string body = R"({
+        "total": 2,
+        "results": [
+            {"id":"10","name":"Alpha","platform_id":"2","platform_slug":"switch","fs_size_bytes":1,"fs_name":"a.xci"},
+            {"id":"11","name":"Beta","platform_id":"2","platform_slug":"switch","fs_size_bytes":2,"fs_name":"b.xci"}
+        ]
+    })";
+    std::vector<romm::Game> games;
+    std::string err;
+    bool ok = romm::parseGamesTest(body, "2", "http://example.com", games, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(games.size() == 2);
+    REQUIRE(games[0].title == "Alpha");
+    REQUIRE(games[1].title == "Beta");
+}
+
+TEST_CASE("identifiers digest is stable across item order") {
+    const std::string a = R"([{"id":"1","updated_at":"2026-01-01"},{"id":"2","updated_at":"2026-01-02"}])";
+    const std::string b = R"([{"id":"2","updated_at":"2026-01-02"},{"id":"1","updated_at":"2026-01-01"}])";
+    std::string da, db, err;
+    bool oka = romm::parseIdentifiersDigestTest(a, da, err);
+    REQUIRE(oka);
+    REQUIRE(err.empty());
+    bool okb = romm::parseIdentifiersDigestTest(b, db, err);
+    REQUIRE(okb);
+    REQUIRE(err.empty());
+    REQUIRE_FALSE(da.empty());
+    REQUIRE(da == db);
+}

@@ -1573,24 +1573,66 @@ int main(int argc, char** argv) {
     int numJoy = 0;
     constexpr uint32_t kPlatformRomsCacheTtlMs = 2 * 60 * 1000; // 2 minutes
     constexpr size_t kPlatformRomsCacheMaxEntries = 2;
+    constexpr size_t kRomsFirstPageLimit = 250;
+    constexpr size_t kRomsNextPageLimit = 500;
+    constexpr size_t kRemoteSearchThreshold = 1200;
+    constexpr size_t kRemoteSearchLimit = 250;
     Config config;
     Status status;
     struct CachedPlatformRoms {
         std::vector<romm::Game> games;
         std::string slug;
         std::string name;
+        std::string identifierDigest;
         uint32_t fetchedAtMs{0};
     };
     std::unordered_map<std::string, CachedPlatformRoms> platformRomsCache;
     uint32_t currentPlatformFetchedAtMs = 0;
+    std::string currentPlatformIdentifierDigest;
+    size_t pagedFetchNextOffset = 0;
+    size_t pagedFetchPageLimit = kRomsNextPageLimit;
+    std::vector<romm::Game> remoteSearchGames;
+    bool remoteSearchActive = false;
+    std::string remoteSearchQuery;
+    std::string remoteSearchPlatformId;
+    uint64_t remoteSearchRevision = 0;
+    uint64_t remoteSearchGeneration = 0;
+    bool remoteSearchInFlight = false;
     struct PendingRomFetch {
+        enum class Mode { Probe, Page } mode{Mode::Page};
         std::string pid;
         std::string slug;
         std::string name;
+        std::string cachedIdentifierDigest;
+        size_t offset{0};
+        size_t limit{kRomsFirstPageLimit};
         uint64_t generation{0};
     };
     struct RomFetchResult {
         PendingRomFetch req;
+        bool ok{false};
+        std::vector<romm::Game> games;
+        size_t offset{0};
+        size_t limit{0};
+        bool hasMore{false};
+        size_t nextOffset{0};
+        size_t total{0};
+        bool totalKnown{false};
+        bool probeOnly{false};
+        bool probeUnchanged{false};
+        bool probeFailed{false};
+        std::string identifierDigest;
+        std::string error;
+        romm::ErrorInfo errorInfo{};
+    };
+    struct PendingRemoteSearch {
+        std::string pid;
+        std::string query;
+        size_t limit{kRemoteSearchLimit};
+        uint64_t generation{0};
+    };
+    struct RemoteSearchResult {
+        PendingRemoteSearch req;
         bool ok{false};
         std::vector<romm::Game> games;
         std::string error;
@@ -1606,6 +1648,7 @@ int main(int argc, char** argv) {
         romm::ErrorInfo errorInfo{};
     };
     romm::LatestJobWorker<PendingRomFetch, RomFetchResult> romFetchJobs;
+    romm::LatestJobWorker<PendingRemoteSearch, RemoteSearchResult> remoteSearchJobs;
     romm::LatestJobWorker<DiagProbeReq, DiagProbeResult> diagProbeJobs;
     std::string cfgError;
     romm::ErrorInfo cfgErrInfo;
@@ -1631,18 +1674,34 @@ int main(int argc, char** argv) {
     auto runRomFetch = [&](const PendingRomFetch& req) -> RomFetchResult {
         RomFetchResult out;
         out.req = req;
-
-        romm::Status tmp;
         std::string err;
         romm::ErrorInfo errInfo;
-        if (!romm::fetchGamesForPlatform(config, req.pid, tmp, err, &errInfo)) {
+
+        if (req.mode == PendingRomFetch::Mode::Probe) {
+            out.probeOnly = true;
+            std::string digest;
+            if (!romm::fetchRomsIdentifiersDigest(config, req.pid, digest, err, &errInfo)) {
+                out.ok = true;
+                out.probeFailed = true;
+                out.error = err;
+                out.errorInfo = errInfo;
+                return out;
+            }
+            out.ok = true;
+            out.identifierDigest = digest;
+            out.probeUnchanged = !digest.empty() && digest == req.cachedIdentifierDigest;
+            return out;
+        }
+
+        romm::GamesPage page;
+        if (!romm::fetchGamesPageForPlatform(config, req.pid, req.offset, req.limit, page, err, &errInfo)) {
             out.ok = false;
             out.error = err;
             out.errorInfo = errInfo;
             return out;
         }
 
-        std::vector<romm::Game> games = std::move(tmp.roms);
+        std::vector<romm::Game> games = std::move(page.games);
 
         // Guardrail: Some server versions may ignore platform_id filter and return all ROMs.
         if (!req.pid.empty()) {
@@ -1685,14 +1744,42 @@ int main(int argc, char** argv) {
                 romm::logLine("Client-side filtered ROMs by platform_slug: " +
                               std::to_string(before) + " -> " + std::to_string(games.size()));
             }
-            // Only fill missing slugs; don't overwrite per-ROM metadata.
             for (auto& r : games) {
                 if (r.platformSlug.empty()) r.platformSlug = req.slug;
             }
         }
 
+        if (req.offset == 0) {
+            std::string digest;
+            std::string digestErr;
+            if (romm::fetchRomsIdentifiersDigest(config, req.pid, digest, digestErr, nullptr)) {
+                out.identifierDigest = digest;
+            }
+        }
+
         out.ok = true;
+        out.offset = page.offset;
+        out.limit = page.limit;
+        out.hasMore = page.hasMore;
+        out.nextOffset = page.offset + page.games.size();
+        out.total = page.total;
+        out.totalKnown = page.totalKnown;
         out.games = std::move(games);
+        return out;
+    };
+
+    auto runRemoteSearch = [&](const PendingRemoteSearch& req) -> RemoteSearchResult {
+        RemoteSearchResult out;
+        out.req = req;
+        std::string err;
+        romm::ErrorInfo info;
+        if (!romm::searchGamesRemote(config, req.pid, req.query, req.limit, out.games, err, &info)) {
+            out.ok = false;
+            out.error = err;
+            out.errorInfo = info;
+            return out;
+        }
+        out.ok = true;
         return out;
     };
 
@@ -1722,20 +1809,31 @@ int main(int argc, char** argv) {
     auto rebuildVisibleRomsLocked = [&](bool resetSelection) {
         static uint64_t sIndexBuiltFor = 0;
         static std::vector<std::string> sNormalizedTitles;
+        static bool sIndexBuiltForRemote = false;
         static uint64_t sCompletionCacheBuiltFor = 0;
         static std::unordered_map<std::string, bool> sCompletionById;
+        static bool sCompletionBuiltForRemote = false;
 
-        if (sIndexBuiltFor != status.romsAllRevision || sNormalizedTitles.size() != status.romsAll.size()) {
+        const bool useRemoteSource = remoteSearchActive &&
+                                     status.currentPlatformId == remoteSearchPlatformId &&
+                                     status.romSearchQuery == remoteSearchQuery;
+        const auto& sourceRoms = useRemoteSource ? remoteSearchGames : status.romsAll;
+        const uint64_t sourceRev = useRemoteSource ? remoteSearchRevision : status.romsAllRevision;
+
+        if (sIndexBuiltFor != sourceRev || sIndexBuiltForRemote != useRemoteSource ||
+            sNormalizedTitles.size() != sourceRoms.size()) {
             sNormalizedTitles.clear();
-            sNormalizedTitles.reserve(status.romsAll.size());
-            for (const auto& g : status.romsAll) {
+            sNormalizedTitles.reserve(sourceRoms.size());
+            for (const auto& g : sourceRoms) {
                 sNormalizedTitles.push_back(normalizeSearchText(g.title));
             }
-            sIndexBuiltFor = status.romsAllRevision;
+            sIndexBuiltFor = sourceRev;
+            sIndexBuiltForRemote = useRemoteSource;
         }
-        if (sCompletionCacheBuiltFor != status.romsAllRevision) {
+        if (sCompletionCacheBuiltFor != sourceRev || sCompletionBuiltForRemote != useRemoteSource) {
             sCompletionById.clear();
-            sCompletionCacheBuiltFor = status.romsAllRevision;
+            sCompletionCacheBuiltFor = sourceRev;
+            sCompletionBuiltForRemote = useRemoteSource;
         }
 
         std::unordered_map<std::string, romm::QueueState> stateById;
@@ -1782,23 +1880,23 @@ int main(int argc, char** argv) {
         };
 
         std::vector<size_t> indices;
-        indices.reserve(status.romsAll.size());
+        indices.reserve(sourceRoms.size());
         std::string searchNorm = normalizeSearchText(status.romSearchQuery);
-        for (size_t i = 0; i < status.romsAll.size(); ++i) {
+        for (size_t i = 0; i < sourceRoms.size(); ++i) {
             if (!searchNorm.empty()) {
                 if (i >= sNormalizedTitles.size() || sNormalizedTitles[i].find(searchNorm) == std::string::npos) {
                     continue;
                 }
             }
-            if (!matchesFilter(status.romsAll[i])) continue;
+            if (!matchesFilter(sourceRoms[i])) continue;
             indices.push_back(i);
         }
 
         auto cmpTitleAsc = [&](size_t a, size_t b) {
-            const std::string& ta = (a < sNormalizedTitles.size()) ? sNormalizedTitles[a] : status.romsAll[a].title;
-            const std::string& tb = (b < sNormalizedTitles.size()) ? sNormalizedTitles[b] : status.romsAll[b].title;
+            const std::string& ta = (a < sNormalizedTitles.size()) ? sNormalizedTitles[a] : sourceRoms[a].title;
+            const std::string& tb = (b < sNormalizedTitles.size()) ? sNormalizedTitles[b] : sourceRoms[b].title;
             if (ta != tb) return ta < tb;
-            return status.romsAll[a].id < status.romsAll[b].id;
+            return sourceRoms[a].id < sourceRoms[b].id;
         };
 
         switch (status.romSort) {
@@ -1810,16 +1908,16 @@ int main(int argc, char** argv) {
                 break;
             case romm::RomSort::SizeDesc:
                 std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-                    if (status.romsAll[a].sizeBytes != status.romsAll[b].sizeBytes) {
-                        return status.romsAll[a].sizeBytes > status.romsAll[b].sizeBytes;
+                    if (sourceRoms[a].sizeBytes != sourceRoms[b].sizeBytes) {
+                        return sourceRoms[a].sizeBytes > sourceRoms[b].sizeBytes;
                     }
                     return cmpTitleAsc(a, b);
                 });
                 break;
             case romm::RomSort::SizeAsc:
                 std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-                    if (status.romsAll[a].sizeBytes != status.romsAll[b].sizeBytes) {
-                        return status.romsAll[a].sizeBytes < status.romsAll[b].sizeBytes;
+                    if (sourceRoms[a].sizeBytes != sourceRoms[b].sizeBytes) {
+                        return sourceRoms[a].sizeBytes < sourceRoms[b].sizeBytes;
                     }
                     return cmpTitleAsc(a, b);
                 });
@@ -1828,7 +1926,7 @@ int main(int argc, char** argv) {
 
         std::vector<romm::Game> rebuilt;
         rebuilt.reserve(indices.size());
-        for (size_t idx : indices) rebuilt.push_back(status.romsAll[idx]);
+        for (size_t idx : indices) rebuilt.push_back(sourceRoms[idx]);
         status.roms = std::move(rebuilt);
         status.romsRevision++;
 
@@ -1884,18 +1982,39 @@ int main(int argc, char** argv) {
         }
     };
 
-    auto submitRomFetch = [&](PendingRomFetch req, const char* busyWhat) {
+    auto submitRomFetch = [&](PendingRomFetch req, const char* busyWhat, bool startNewGeneration) {
         {
             std::lock_guard<std::mutex> lock(status.mutex);
-            status.romFetchGeneration++;
+            if (startNewGeneration) {
+                status.romFetchGeneration++;
+            }
             req.generation = status.romFetchGeneration;
             status.netBusy.store(true);
             status.netBusySinceMs.store(SDL_GetTicks());
             status.netBusyWhat = busyWhat;
         }
-        romm::logLine("Queued ROM fetch platform id=" + req.pid +
-                      (req.slug.empty() ? "" : " slug=" + req.slug));
+        if (req.mode == PendingRomFetch::Mode::Probe) {
+            romm::logLine("Queued ROM identifiers probe id=" + req.pid);
+        } else {
+            romm::logLine("Queued ROM page fetch id=" + req.pid +
+                          " offset=" + std::to_string(req.offset) +
+                          " limit=" + std::to_string(req.limit));
+        }
         romFetchJobs.submit(req);
+    };
+
+    auto submitRemoteSearch = [&](PendingRemoteSearch req) {
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            remoteSearchGeneration++;
+            req.generation = remoteSearchGeneration;
+            remoteSearchInFlight = true;
+            status.netBusy.store(true);
+            status.netBusySinceMs.store(SDL_GetTicks());
+            status.netBusyWhat = "Remote search...";
+        }
+        romm::logLine("Queued remote search query=\"" + req.query + "\"");
+        remoteSearchJobs.submit(req);
     };
 
     auto submitDiagnosticsProbe = [&]() {
@@ -1912,6 +2031,7 @@ int main(int argc, char** argv) {
     };
 
     romFetchJobs.start(runRomFetch);
+    remoteSearchJobs.start(runRemoteSearch, 120);
     diagProbeJobs.start([&](const DiagProbeReq& req) -> DiagProbeResult {
         DiagProbeResult out = runDiagProbe();
         out.generation = req.generation;
@@ -2046,64 +2166,231 @@ int main(int argc, char** argv) {
         // If a previous worker has finished, join and release it so we can start a fresh session.
         romm::reapDownloadWorkerIfDone();
         if (auto done = romFetchJobs.pollResult()) {
-            size_t finalCount = 0;
+            size_t appliedCount = 0;
             std::string firstTitle;
             std::string fetchErr;
             bool applyOk = false;
             bool applyErr = false;
+            bool queueNextPage = false;
+            PendingRomFetch nextReq;
             {
                 std::lock_guard<std::mutex> lock(status.mutex);
                 // Ignore stale results from cancelled/older generations.
-                if (done->req.generation != status.romFetchGeneration) {
-                    if (!romFetchJobs.busy()) {
+                bool staleResult = (done->req.generation != status.romFetchGeneration);
+                if (staleResult) {
+                    if (!romFetchJobs.busy() && !remoteSearchInFlight) {
                         status.netBusy.store(false);
                         status.netBusyWhat.clear();
+                    }
+                } else if (done->probeOnly) {
+                    if (done->probeFailed) {
+                        romm::logLine("ROM identifiers probe failed; falling back to full fetch: " + done->error);
+                    }
+                    bool usedProbeCache = false;
+                    if (done->probeUnchanged) {
+                        uint32_t nowMs = SDL_GetTicks();
+                        if (status.currentPlatformId == done->req.pid && !status.romsAll.empty()) {
+                            status.currentView = Status::View::ROMS;
+                            status.navStack.clear();
+                            currentPlatformFetchedAtMs = nowMs;
+                            if (!done->identifierDigest.empty()) {
+                                currentPlatformIdentifierDigest = done->identifierDigest;
+                            }
+                            usedProbeCache = true;
+                        } else {
+                            auto hit = platformRomsCache.find(done->req.pid);
+                            if (hit != platformRomsCache.end() && !hit->second.games.empty()) {
+                                if (!status.currentPlatformId.empty() &&
+                                    status.currentPlatformId != done->req.pid &&
+                                    !status.romsAll.empty()) {
+                                    CachedPlatformRoms keep;
+                                    keep.games = std::move(status.romsAll);
+                                    keep.slug = status.currentPlatformSlug;
+                                    keep.name = status.currentPlatformName;
+                                    keep.identifierDigest = currentPlatformIdentifierDigest;
+                                    keep.fetchedAtMs = currentPlatformFetchedAtMs;
+                                    platformRomsCache[status.currentPlatformId] = std::move(keep);
+                                    prunePlatformCache();
+                                }
+                                status.romsAll = std::move(hit->second.games);
+                                status.romsAllRevision++;
+                                rebuildVisibleRomsLocked(true);
+                                status.currentPlatformId = done->req.pid;
+                                status.currentPlatformSlug = hit->second.slug.empty() ? done->req.slug : hit->second.slug;
+                                status.currentPlatformName = hit->second.name.empty() ? done->req.name : hit->second.name;
+                                status.currentView = Status::View::ROMS;
+                                status.navStack.clear();
+                                currentPlatformFetchedAtMs = nowMs;
+                                currentPlatformIdentifierDigest =
+                                    !done->identifierDigest.empty() ? done->identifierDigest : hit->second.identifierDigest;
+                                usedProbeCache = true;
+                            }
+                        }
+                    }
+                    if (usedProbeCache) {
+                        status.netBusy.store(false);
+                        status.netBusyWhat.clear();
+                        applyOk = true;
+                        appliedCount = status.romsAll.size();
+                        if (!status.romsAll.empty()) firstTitle = status.romsAll[0].title;
+                    } else {
+                        PendingRomFetch req;
+                        req.mode = PendingRomFetch::Mode::Page;
+                        req.pid = done->req.pid;
+                        req.slug = done->req.slug;
+                        req.name = done->req.name;
+                        req.offset = 0;
+                        req.limit = kRomsFirstPageLimit;
+                        queueNextPage = true;
+                        nextReq = req;
+                        status.netBusyWhat = "Fetching ROMs...";
                     }
                 } else if (!done->ok) {
                     status.netBusy.store(false);
                     status.netBusyWhat.clear();
-                    status.currentView = Status::View::ERROR;
-                    status.lastError = done->error;
-                    status.lastErrorInfo = done->errorInfo.code == romm::ErrorCode::None
-                        ? romm::classifyError(done->error, romm::ErrorCategory::Network)
-                        : done->errorInfo;
                     fetchErr = done->error;
-                    applyErr = true;
-                } else {
-                    finalCount = done->games.size();
-                    if (!done->games.empty()) firstTitle = done->games[0].title;
-                    uint32_t nowMs = SDL_GetTicks();
-                    if (!status.currentPlatformId.empty() &&
-                        status.currentPlatformId != done->req.pid &&
-                        !status.romsAll.empty()) {
-                        CachedPlatformRoms keep;
-                        keep.games = std::move(status.romsAll);
-                        keep.slug = status.currentPlatformSlug;
-                        keep.name = status.currentPlatformName;
-                        keep.fetchedAtMs = currentPlatformFetchedAtMs;
-                        platformRomsCache[status.currentPlatformId] = std::move(keep);
-                        prunePlatformCache();
+                    if (done->offset == 0) {
+                        status.currentView = Status::View::ERROR;
+                        status.lastError = done->error;
+                        status.lastErrorInfo = done->errorInfo.code == romm::ErrorCode::None
+                            ? romm::classifyError(done->error, romm::ErrorCategory::Network)
+                            : done->errorInfo;
+                        applyErr = true;
+                    } else {
+                        romm::logLine("Background ROM page fetch failed offset=" +
+                                      std::to_string(done->offset) + ": " + done->error);
                     }
-                    status.romsAll = std::move(done->games);
-                    status.romsAllRevision++;
-                    rebuildVisibleRomsLocked(true);
-                    status.currentPlatformId = done->req.pid;
-                    status.currentPlatformSlug = done->req.slug;
-                    status.currentPlatformName = done->req.name;
-                    currentPlatformFetchedAtMs = nowMs;
-                    status.navStack.clear();
-                    status.currentView = Status::View::ROMS;
-                    status.netBusy.store(false);
-                    status.netBusyWhat.clear();
-                    applyOk = true;
+                } else {
+                    if (done->offset == 0) {
+                        appliedCount = done->games.size();
+                        if (!done->games.empty()) firstTitle = done->games[0].title;
+                        uint32_t nowMs = SDL_GetTicks();
+                        if (!status.currentPlatformId.empty() &&
+                            status.currentPlatformId != done->req.pid &&
+                            !status.romsAll.empty()) {
+                            CachedPlatformRoms keep;
+                            keep.games = std::move(status.romsAll);
+                            keep.slug = status.currentPlatformSlug;
+                            keep.name = status.currentPlatformName;
+                            keep.identifierDigest = currentPlatformIdentifierDigest;
+                            keep.fetchedAtMs = currentPlatformFetchedAtMs;
+                            platformRomsCache[status.currentPlatformId] = std::move(keep);
+                            prunePlatformCache();
+                        }
+                        status.romsAll = std::move(done->games);
+                        status.romsAllRevision++;
+                        rebuildVisibleRomsLocked(true);
+                        status.currentPlatformId = done->req.pid;
+                        status.currentPlatformSlug = done->req.slug;
+                        status.currentPlatformName = done->req.name;
+                        currentPlatformFetchedAtMs = nowMs;
+                        if (!done->identifierDigest.empty()) {
+                            currentPlatformIdentifierDigest = done->identifierDigest;
+                        }
+                        status.navStack.clear();
+                        status.currentView = Status::View::ROMS;
+                        remoteSearchActive = false;
+                        remoteSearchGames.clear();
+                        remoteSearchQuery.clear();
+                        remoteSearchPlatformId.clear();
+                        remoteSearchRevision++;
+                        pagedFetchNextOffset = done->nextOffset;
+                        pagedFetchPageLimit = kRomsNextPageLimit;
+                        if (done->hasMore) {
+                            status.netBusy.store(true);
+                            status.netBusyWhat = "Loading remaining ROMs...";
+                            PendingRomFetch req;
+                            req.mode = PendingRomFetch::Mode::Page;
+                            req.pid = done->req.pid;
+                            req.slug = done->req.slug;
+                            req.name = done->req.name;
+                            req.offset = pagedFetchNextOffset;
+                            req.limit = pagedFetchPageLimit;
+                            queueNextPage = true;
+                            nextReq = req;
+                        } else {
+                            status.netBusy.store(false);
+                            status.netBusyWhat.clear();
+                        }
+                        applyOk = true;
+                    } else {
+                        size_t before = status.romsAll.size();
+                        std::unordered_set<std::string> existing;
+                        existing.reserve(status.romsAll.size() + done->games.size());
+                        for (const auto& g : status.romsAll) existing.insert(g.id);
+                        for (auto& g : done->games) {
+                            if (existing.insert(g.id).second) {
+                                status.romsAll.push_back(std::move(g));
+                            }
+                        }
+                        size_t added = status.romsAll.size() - before;
+                        status.romsAllRevision++;
+                        appliedCount = added;
+                        if (done->hasMore) {
+                            pagedFetchNextOffset = done->nextOffset;
+                            PendingRomFetch req;
+                            req.mode = PendingRomFetch::Mode::Page;
+                            req.pid = done->req.pid;
+                            req.slug = done->req.slug;
+                            req.name = done->req.name;
+                            req.offset = pagedFetchNextOffset;
+                            req.limit = pagedFetchPageLimit;
+                            queueNextPage = true;
+                            nextReq = req;
+                            status.netBusy.store(true);
+                            status.netBusyWhat = "Loading remaining ROMs...";
+                        } else {
+                            status.netBusy.store(false);
+                            status.netBusyWhat.clear();
+                        }
+                        applyOk = true;
+                    }
                 }
+            }
+            if (queueNextPage) {
+                submitRomFetch(nextReq, nextReq.offset == 0 ? "Fetching ROMs..." : "Loading remaining ROMs...", false);
             }
             if (applyErr) {
                 romm::logLine("Failed to fetch ROMs: " + fetchErr);
             } else if (applyOk) {
                 gViewTraceFrames = 8;
-                romm::logLine("Fetched ROMs count=" + std::to_string(finalCount) +
+                romm::logLine("Fetched ROMs count=" + std::to_string(appliedCount) +
                               (firstTitle.empty() ? "" : " first=" + firstTitle));
+            }
+        }
+        if (auto searchDone = remoteSearchJobs.pollResult()) {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            if (searchDone->req.generation != remoteSearchGeneration) {
+                if (!romFetchJobs.busy() && !remoteSearchInFlight) {
+                    status.netBusy.store(false);
+                    status.netBusyWhat.clear();
+                }
+            } else {
+                remoteSearchInFlight = false;
+                if (searchDone->ok &&
+                    !searchDone->req.query.empty() &&
+                    searchDone->req.pid == status.currentPlatformId &&
+                    searchDone->req.query == status.romSearchQuery) {
+                    remoteSearchGames = std::move(searchDone->games);
+                    remoteSearchActive = true;
+                    remoteSearchQuery = searchDone->req.query;
+                    remoteSearchPlatformId = searchDone->req.pid;
+                    remoteSearchRevision++;
+                    status.romListOptionsRevision++;
+                    romm::logLine("Remote search applied results=" + std::to_string(remoteSearchGames.size()));
+                } else if (!searchDone->ok) {
+                    romm::logLine("Remote search failed, using local index: " + searchDone->error);
+                    remoteSearchActive = false;
+                    remoteSearchGames.clear();
+                    remoteSearchQuery.clear();
+                    remoteSearchPlatformId.clear();
+                    remoteSearchRevision++;
+                    status.romListOptionsRevision++;
+                }
+                if (!romFetchJobs.busy()) {
+                    status.netBusy.store(false);
+                    status.netBusyWhat.clear();
+                }
             }
         }
         if (auto probe = diagProbeJobs.pollResult()) {
@@ -2284,19 +2571,35 @@ int main(int argc, char** argv) {
                             }
                         }
                         bool usedCache = false;
+                        bool submittedFetch = false;
+                        PendingRomFetch fetchReq;
+                        const uint32_t nowMs = SDL_GetTicks();
                         if (!romFetchJobs.busy()) {
                             std::lock_guard<std::mutex> lock(status.mutex);
-                            uint32_t nowMs = SDL_GetTicks();
-                            if (status.currentPlatformId == pid && !status.romsAll.empty() &&
-                                (nowMs - currentPlatformFetchedAtMs) <= kPlatformRomsCacheTtlMs) {
-                                status.currentView = Status::View::ROMS;
-                                status.navStack.clear();
-                                usedCache = true;
-                            } else {
+                            remoteSearchActive = false;
+                            remoteSearchGames.clear();
+                            remoteSearchQuery.clear();
+                            remoteSearchPlatformId.clear();
+                            remoteSearchRevision++;
+                            if (status.currentPlatformId == pid && !status.romsAll.empty()) {
+                                if ((nowMs - currentPlatformFetchedAtMs) <= kPlatformRomsCacheTtlMs) {
+                                    status.currentView = Status::View::ROMS;
+                                    status.navStack.clear();
+                                    usedCache = true;
+                                } else if (!currentPlatformIdentifierDigest.empty()) {
+                                    fetchReq.mode = PendingRomFetch::Mode::Probe;
+                                    fetchReq.pid = pid;
+                                    fetchReq.slug = selSlug;
+                                    fetchReq.name = selName;
+                                    fetchReq.cachedIdentifierDigest = currentPlatformIdentifierDigest;
+                                    submittedFetch = true;
+                                }
+                            }
+                            if (!usedCache && !submittedFetch) {
                                 auto hit = platformRomsCache.find(pid);
                                 if (hit != platformRomsCache.end()) {
-                                    if ((nowMs - hit->second.fetchedAtMs) <= kPlatformRomsCacheTtlMs &&
-                                        !hit->second.games.empty()) {
+                                    bool fresh = (nowMs - hit->second.fetchedAtMs) <= kPlatformRomsCacheTtlMs;
+                                    if (fresh && !hit->second.games.empty()) {
                                         if (!status.currentPlatformId.empty() &&
                                             status.currentPlatformId != pid &&
                                             !status.romsAll.empty()) {
@@ -2304,6 +2607,7 @@ int main(int argc, char** argv) {
                                             keep.games = std::move(status.romsAll);
                                             keep.slug = status.currentPlatformSlug;
                                             keep.name = status.currentPlatformName;
+                                            keep.identifierDigest = currentPlatformIdentifierDigest;
                                             keep.fetchedAtMs = currentPlatformFetchedAtMs;
                                             platformRomsCache[status.currentPlatformId] = std::move(keep);
                                             prunePlatformCache();
@@ -2316,12 +2620,39 @@ int main(int argc, char** argv) {
                                         status.currentPlatformName = hit->second.name.empty() ? selName : hit->second.name;
                                         status.navStack.clear();
                                         status.currentView = Status::View::ROMS;
-                                        currentPlatformFetchedAtMs = hit->second.fetchedAtMs;
+                                        currentPlatformFetchedAtMs = nowMs;
+                                        currentPlatformIdentifierDigest = hit->second.identifierDigest;
                                         usedCache = true;
+                                        platformRomsCache.erase(hit);
+                                    } else if (!hit->second.identifierDigest.empty()) {
+                                        fetchReq.mode = PendingRomFetch::Mode::Probe;
+                                        fetchReq.pid = pid;
+                                        fetchReq.slug = selSlug;
+                                        fetchReq.name = selName;
+                                        fetchReq.cachedIdentifierDigest = hit->second.identifierDigest;
+                                        submittedFetch = true;
+                                    } else {
+                                        platformRomsCache.erase(hit);
                                     }
-                                    platformRomsCache.erase(hit);
                                 }
                             }
+                            if (!usedCache && !submittedFetch) {
+                                fetchReq.mode = PendingRomFetch::Mode::Page;
+                                fetchReq.pid = pid;
+                                fetchReq.slug = selSlug;
+                                fetchReq.name = selName;
+                                fetchReq.offset = 0;
+                                fetchReq.limit = kRomsFirstPageLimit;
+                                submittedFetch = true;
+                            }
+                        } else {
+                            fetchReq.mode = PendingRomFetch::Mode::Page;
+                            fetchReq.pid = pid;
+                            fetchReq.slug = selSlug;
+                            fetchReq.name = selName;
+                            fetchReq.offset = 0;
+                            fetchReq.limit = kRomsFirstPageLimit;
+                            submittedFetch = true;
                         }
                         if (usedCache) {
                             gViewTraceFrames = 8;
@@ -2329,12 +2660,18 @@ int main(int argc, char** argv) {
                             viewChangedThisFrame = true;
                             break;
                         }
-                        PendingRomFetch req{pid, selSlug, selName};
-                        // Async fetch so UI can keep rendering (including throbber) while the HTTP call runs.
-                        if (romFetchJobs.busy()) {
-                            submitRomFetch(req, "Switching platform...");
+                        if (submittedFetch) {
+                            const bool isProbe = (fetchReq.mode == PendingRomFetch::Mode::Probe);
+                            const char* busyWhat = isProbe ? "Checking changes..." : (romFetchJobs.busy() ? "Switching platform..." : "Fetching ROMs...");
+                            // Async fetch so UI can keep rendering (including throbber) while the HTTP call runs.
+                            if (isProbe) {
+                                submitRomFetch(fetchReq, busyWhat, true);
+                            } else {
+                                pagedFetchNextOffset = 0;
+                                submitRomFetch(fetchReq, busyWhat, true);
+                            }
                         } else {
-                            submitRomFetch(req, "Fetching ROMs...");
+                            romm::logLine("Platform select produced no fetch request; staying on current view.");
                         }
                         viewChangedThisFrame = true;
                     } else if (currentView == Status::View::ROMS) {
@@ -2425,20 +2762,49 @@ int main(int argc, char** argv) {
                 case romm::Action::OpenSearch: {
                     std::string curQuery;
                     bool inRoms = false;
+                    std::string platformId;
+                    size_t romCount = 0;
                     {
                         std::lock_guard<std::mutex> lock(status.mutex);
                         inRoms = (status.currentView == Status::View::ROMS);
                         curQuery = status.romSearchQuery;
+                        platformId = status.currentPlatformId;
+                        romCount = status.romsAll.size();
                     }
                     if (!inRoms) break;
                     std::string next = curQuery;
                     if (promptSearchQuery(next)) {
                         next = normalizeSearchText(next);
+                        bool submitRemote = false;
+                        PendingRemoteSearch req;
                         if (next != curQuery) {
-                            std::lock_guard<std::mutex> lock(status.mutex);
-                            status.romSearchQuery = next;
-                            status.romListOptionsRevision++;
-                            status.selectedRomIndex = 0;
+                            {
+                                std::lock_guard<std::mutex> lock(status.mutex);
+                                status.romSearchQuery = next;
+                                status.romListOptionsRevision++;
+                                status.selectedRomIndex = 0;
+                                if (next.empty()) {
+                                    remoteSearchActive = false;
+                                    remoteSearchGames.clear();
+                                    remoteSearchQuery.clear();
+                                    remoteSearchPlatformId.clear();
+                                    remoteSearchRevision++;
+                                } else if (!platformId.empty() && romCount >= kRemoteSearchThreshold) {
+                                    req.pid = platformId;
+                                    req.query = next;
+                                    req.limit = kRemoteSearchLimit;
+                                    submitRemote = true;
+                                } else {
+                                    remoteSearchActive = false;
+                                    remoteSearchGames.clear();
+                                    remoteSearchQuery.clear();
+                                    remoteSearchPlatformId.clear();
+                                    remoteSearchRevision++;
+                                }
+                            }
+                            if (submitRemote) {
+                                submitRemoteSearch(req);
+                            }
                             romm::logLine("ROM search updated: " + (next.empty() ? std::string("<cleared>") : next));
                         }
                     }
@@ -2475,12 +2841,19 @@ int main(int argc, char** argv) {
                             status.romFetchGeneration++;
                             status.netBusy.store(false);
                             status.netBusyWhat.clear();
+                            remoteSearchInFlight = false;
                             romFetchJobs.clearPending();
+                            remoteSearchJobs.clearPending();
                             romm::logLine("Cancelled ROM fetch.");
                             viewChangedThisFrame = true;
                         } else
                         if (cur == Status::View::ROMS) {
                             status.currentView = Status::View::PLATFORMS;
+                            remoteSearchActive = false;
+                            remoteSearchGames.clear();
+                            remoteSearchQuery.clear();
+                            remoteSearchPlatformId.clear();
+                            remoteSearchRevision++;
                             resetNav();
                             gViewTraceFrames = 8;
                             romm::logLine("Back to PLATFORMS.");
@@ -2642,6 +3015,7 @@ exit_app:
         speedTestThread.join();
     }
     romFetchJobs.stop();
+    remoteSearchJobs.stop();
     diagProbeJobs.stop();
     // Restore default sleep/dim behavior on exit.
     appletSetMediaPlaybackState(false);

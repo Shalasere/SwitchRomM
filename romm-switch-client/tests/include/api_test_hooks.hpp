@@ -30,4 +30,8 @@ bool parseGamesTest(const std::string& body,
 bool parsePlatformsTest(const std::string& body,
                         std::vector<Platform>& outPlatforms,
                         std::string& err);
+
+bool parseIdentifiersDigestTest(const std::string& body,
+                                std::string& outDigest,
+                                std::string& err);
 } // namespace romm
