@@ -36,8 +36,6 @@ namespace {
 
 constexpr uint64_t kDbiPartSizeBytes = 0xFFFF0000ULL; // DBI/Tinfoil split size
 constexpr uint64_t kFreeSpaceMarginBytes = 200ULL * 1024ULL * 1024ULL; // ~200MB margin
-constexpr size_t kPreflightHeaderBuf = 1024;
-constexpr int kSocketRecvBufBytes = 256 * 1024;
 constexpr size_t kStreamBufferBytes = 256 * 1024;
 constexpr int kMaxRetryBackoffMs = 2000;
 
@@ -50,17 +48,6 @@ struct DownloadContext {
 };
 
 DownloadContext gCtx; // global download context shared with worker
-
-struct ActiveSocketScope {
-    int fd{-1};
-    explicit ActiveSocketScope(int sfd) : fd(sfd) {
-        gCtx.activeSocketFd.store(sfd, std::memory_order_release);
-    }
-    ~ActiveSocketScope() {
-        int expected = fd;
-        (void)gCtx.activeSocketFd.compare_exchange_strong(expected, -1, std::memory_order_acq_rel);
-    }
-};
 
 static void recomputeTotals(Status& st) {
     uint64_t remaining = 0;
@@ -145,6 +132,7 @@ struct PreflightInfo {
     uint64_t contentLength{0};
 };
 
+#ifdef UNIT_TEST
 static void parseLengthAndRanges(const std::string& headers, PreflightInfo& info) {
     std::istringstream hs(headers);
     std::string line;
@@ -173,6 +161,7 @@ static void parseLengthAndRanges(const std::string& headers, PreflightInfo& info
         }
     }
 }
+#endif
 
 static uint64_t partSizeFor(const Config& cfg, uint64_t totalSize) {
     return cfg.fat32Safe ? kDbiPartSizeBytes : totalSize;
@@ -227,67 +216,39 @@ static bool parsePartIndex(const std::string& name, int& outIdx) {
 // Preflight: try HEAD first; if it fails or is rejected, fall back to Range: 0-0 GET.
 static bool preflight(const std::string& url, const std::string& authBasic, int timeoutSec, PreflightInfo& info) {
     info = {};
-    auto doRequest = [&](const std::string& method, const std::string& extraHeader, int& outCode, std::string& headerBlock) -> bool {
+    auto doRequest = [&](const std::string& method,
+                         bool addRange00,
+                         int& outCode,
+                         ParsedHttpResponse& outParsed) -> bool {
         outCode = 0;
-        headerBlock.clear();
-        std::string host, portStr, path, perr;
-        if (!romm::parseHttpUrl(url, host, portStr, path, perr)) return false;
-        struct addrinfo hints{};
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        struct addrinfo* res = nullptr;
-        int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
-        if (ret != 0 || !res) { if (res) freeaddrinfo(res); return false; }
-        romm::UniqueFd sock(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
-        if (!sock) { freeaddrinfo(res); return false; }
-        ActiveSocketScope active(sock.fd);
-        if (timeoutSec > 0) {
-            struct timeval tv{}; tv.tv_sec = timeoutSec;
-            setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        }
-        if (connect(sock.fd, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); return false; }
-        freeaddrinfo(res);
-        std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n";
-        if (!authBasic.empty()) req += "Authorization: Basic " + authBasic + "\r\n";
-        if (!extraHeader.empty()) req += extraHeader + "\r\n";
-        req += "\r\n";
-        if (!sendAll(sock.fd, req.c_str(), req.size())) {
+        outParsed = ParsedHttpResponse{};
+        std::vector<std::pair<std::string, std::string>> headers;
+        if (!authBasic.empty()) headers.emplace_back("Authorization", "Basic " + authBasic);
+        if (addRange00) headers.emplace_back("Range", "bytes=0-0");
+
+        HttpRequestOptions opts;
+        opts.timeoutSec = timeoutSec;
+        opts.keepAlive = false;
+        opts.decodeChunked = true;
+        opts.activeSocketFd = &gCtx.activeSocketFd;
+
+        HttpTransaction tx;
+        std::string reqErr;
+        if (!httpRequestBuffered(method, url, headers, opts, tx, reqErr)) {
             return false;
         }
-        std::string headerAccum;
-        char buf[kPreflightHeaderBuf];
-        while (true) {
-            ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            headerAccum.append(buf, buf + n);
-            if (headerAccum.find("\r\n\r\n") != std::string::npos) break;
-        }
-        auto hdrEnd = headerAccum.find("\r\n\r\n");
-        if (hdrEnd == std::string::npos) return false;
-        headerBlock = headerAccum.substr(0, hdrEnd);
-        ParsedHttpResponse parsed{};
-        std::string perrParse;
-        if (!parseHttpResponseHeaders(headerBlock, parsed, perrParse)) return false;
-        outCode = parsed.statusCode;
-        if (outCode >= 300 && outCode < 400 && !parsed.location.empty()) {
-            logLine("Redirect not supported (" + std::to_string(outCode) + ") to " + parsed.location);
+        outParsed = tx.parsed;
+        outCode = outParsed.statusCode;
+        if (outCode >= 300 && outCode < 400 && !outParsed.location.empty()) {
+            logLine("Redirect not supported (" + std::to_string(outCode) + ") to " + outParsed.location);
         }
         return true;
     };
 
     int code = 0;
-    std::string headers;
-    auto parseContentRangeTotal = [](const std::string& hdrs) -> uint64_t {
-        PreflightInfo info{};
-        parseLengthAndRanges(hdrs, info);
-        return info.contentLength;
-    };
+    ParsedHttpResponse parsed{};
     // Try HEAD
-    if (doRequest("HEAD", "", code, headers) && code >= 200 && code < 300) {
-        ParsedHttpResponse parsed{};
-        std::string perr;
-        if (!parseHttpResponseHeaders(headers, parsed, perr)) return false;
+    if (doRequest("HEAD", false, code, parsed) && code >= 200 && code < 300) {
         info.contentLength = parsed.contentLength;
         info.supportsRanges = parsed.acceptRanges;
         return info.contentLength > 0;
@@ -297,19 +258,16 @@ static bool preflight(const std::string& url, const std::string& authBasic, int 
     }
 
     // Fallback: GET with Range 0-0
-    if (!doRequest("GET", "Range: bytes=0-0", code, headers)) return false;
-    ParsedHttpResponse parsed{};
-    std::string perr;
-    if (!parseHttpResponseHeaders(headers, parsed, perr)) return false;
+    if (!doRequest("GET", true, code, parsed)) return false;
     if (code == 206 || parsed.acceptRanges) info.supportsRanges = true;
     if (!(code == 200 || code == 206)) {
         logLine("Preflight Range GET returned HTTP " + std::to_string(code));
         return false;
     }
-    uint64_t crTotal = parseContentRangeTotal(headers);
+    uint64_t crTotal = parsed.hasContentRangeTotal ? parsed.contentRangeTotal : 0;
     if (crTotal > 0) {
         info.contentLength = crTotal;
-    } else if (parsed.contentLength > 0) {
+    } else if (parsed.hasContentLength && parsed.contentLength > 0) {
         info.contentLength = parsed.contentLength;
     }
     return info.contentLength > 0;
@@ -341,184 +299,12 @@ static bool streamDownload(const std::string& url,
                            std::string& err) {
     int timeoutSec = cfg.httpTimeoutSeconds > 0 ? cfg.httpTimeoutSeconds : 10;
     if (timeoutSec > 30) timeoutSec = 30;
-    // Keep socket recv timeout short so stop requests are observed quickly.
-    int ioTickSec = timeoutSec;
-    if (ioTickSec > 1) ioTickSec = 1;
-
-    std::string host, portStr, path, perr;
-    if (!romm::parseHttpUrl(url, host, portStr, path, perr)) { err = perr; return false; }
-
-    struct addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* res = nullptr;
-    int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
-    if (ret != 0 || !res) { if (res) freeaddrinfo(res); err = "DNS failed"; return false; }
-    romm::UniqueFd sock(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
-    if (!sock) { freeaddrinfo(res); err = "Socket failed"; return false; }
-    ActiveSocketScope active(sock.fd);
-    if (ioTickSec > 0) {
-        struct timeval tv{}; tv.tv_sec = ioTickSec;
-        setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    }
-    // Bump receive buffer for faster pulls.
-    int rcvbuf = kSocketRecvBufBytes;
-    setsockopt(sock.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    if (connect(sock.fd, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); err = std::string("Connect failed: ") + std::strerror(errno); return false; }
-    freeaddrinfo(res);
-
-    std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n";
-    if (!authBasic.empty()) req += "Authorization: Basic " + authBasic + "\r\n";
-    if (useRange && startOffset > 0) {
-        req += "Range: bytes=" + std::to_string(startOffset) + "-\r\n";
-    }
-    req += "\r\n";
-    if (!sendAll(sock.fd, req.c_str(), req.size())) {
-        err = "Send failed";
-        return false;
-    }
-
-    // Read headers
-    std::string headerAccum;
-    // Large user-space buffer for faster pulls.
-    static thread_local char buf[kStreamBufferBytes];
-    bool headersDone = false;
-    size_t bodyStartOffset = 0;
-    int statusCode = 0;
-    uint64_t contentLength = 0;
-    uint64_t contentRangeStart = 0;
-    uint64_t contentRangeEnd = 0;
-    bool hasContentRange = false;
-    bool transferChunked = false;
     uint64_t expectedBody = totalSize - startOffset;
     const uint64_t kProbeBytes = 10ULL * 1024ULL * 1024ULL; // 10 MB probe for throughput log
     bool probeLogged = false;
     auto transferStart = std::chrono::steady_clock::now();
-    // Use a bounded stall timeout to avoid hanging forever on dead sockets.
-    auto stallTimeout = std::chrono::seconds(timeoutSec);
-    auto headerStart = std::chrono::steady_clock::now();
     logLine("Stream start: url=" + url + " range=" + (useRange ? "true" : "false") +
             " start=" + std::to_string(startOffset) + " expect=" + std::to_string(expectedBody));
-    while (!headersDone) {
-        ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (gCtx.stopRequested.load()) { err = "Stopped"; return false; }
-                auto now = std::chrono::steady_clock::now();
-                if (now - headerStart > stallTimeout) {
-                    err = "Header timeout";
-                    logLine("Stream header timeout url=" + url);
-                    return false;
-                }
-                continue;
-            }
-            err = std::string("Recv failed: ") + std::strerror(errno);
-            logLine("Stream header error: " + err);
-            return false;
-        }
-        if (n == 0) {
-            err = "No HTTP headers received";
-            logLine("Stream header error: " + err);
-            return false;
-        }
-        headerAccum.append(buf, buf + n);
-        auto hdrEnd = headerAccum.find("\r\n\r\n");
-        if (hdrEnd == std::string::npos) {
-            if (gCtx.stopRequested.load()) { err = "Stopped"; return false; }
-            auto now = std::chrono::steady_clock::now();
-            if (now - headerStart > stallTimeout) { err = "Header timeout"; logLine("Stream header timeout url=" + url); return false; }
-            continue;
-        }
-        headersDone = true;
-        bodyStartOffset = hdrEnd + 4;
-        std::string headers = headerAccum.substr(0, hdrEnd);
-        ParsedHttpResponse parsed{};
-        std::string perr;
-        if (!parseHttpResponseHeaders(headers, parsed, perr)) { err = perr; return false; }
-        statusCode = parsed.statusCode;
-        if (statusCode >= 300 && statusCode < 400) {
-            // Explicit redirect failure with Location if present.
-            std::string location;
-            {
-                std::istringstream hs(headers);
-                std::string line;
-                while (std::getline(hs, line)) {
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    auto colonPos = line.find(':');
-                    if (colonPos == std::string::npos) continue;
-                    std::string key = line.substr(0, colonPos);
-                    std::string val = line.substr(colonPos + 1);
-                    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
-                    std::string keyLower = key;
-                    for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    if (keyLower == "location") {
-                        location = val;
-                        break;
-                    }
-                }
-            }
-            err = "Redirect not supported (HTTP " + std::to_string(statusCode) +
-                  (location.empty() ? "" : " to " + location) + ")";
-            return false;
-        }
-        if (useRange && statusCode != 206) { err = "Range not honored (status " + std::to_string(statusCode) + ")"; return false; }
-        if (!useRange && statusCode != 200) { err = "HTTP status " + std::to_string(statusCode); return false; }
-        transferChunked = parsed.chunked;
-        contentLength = parsed.contentLength;
-        // Parse Content-Range: bytes start-end/total
-        {
-            std::istringstream hs(headers);
-            std::string line;
-            while (std::getline(hs, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                auto colonPos = line.find(':');
-                if (colonPos == std::string::npos) continue;
-                std::string key = line.substr(0, colonPos);
-                std::string val = line.substr(colonPos + 1);
-                while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
-                std::string keyLower = key;
-                for (auto& c : keyLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                if (keyLower == "content-range") {
-                    // bytes START-END/TOTAL
-                    auto bytesPos = val.find("bytes");
-                    auto dash = val.find('-', bytesPos == std::string::npos ? 0 : bytesPos);
-                    auto slash = val.find('/', dash == std::string::npos ? 0 : dash);
-                    if (dash != std::string::npos && slash != std::string::npos) {
-                        std::string startStr = val.substr(bytesPos == std::string::npos ? 0 : bytesPos + 5, dash - (bytesPos == std::string::npos ? 0 : bytesPos + 5));
-                        std::string endStr = val.substr(dash + 1, slash - dash - 1);
-                        contentRangeStart = static_cast<uint64_t>(std::strtoull(startStr.c_str(), nullptr, 10));
-                        contentRangeEnd = static_cast<uint64_t>(std::strtoull(endStr.c_str(), nullptr, 10));
-                        hasContentRange = true;
-                    }
-                }
-            }
-        }
-        if (transferChunked) {
-            err = "Chunked transfer not supported for streaming downloads";
-            logLine("Stream headers rejected (chunked) url=" + url);
-            return false;
-        }
-        if (hasContentRange) {
-            if (contentRangeStart != startOffset) {
-                err = "Content-Range start mismatch";
-                return false;
-            }
-            if (contentRangeEnd >= contentRangeStart) {
-                expectedBody = (contentRangeEnd - contentRangeStart) + 1;
-            }
-        } else if (!useRange && contentLength > 0) {
-            expectedBody = contentLength;
-        }
-        if (contentLength && expectedBody && contentLength < expectedBody) {
-            err = "Short body (Content-Length " + std::to_string(contentLength) + " < expected " + std::to_string(expectedBody) + ")";
-            return false;
-        }
-        logLine("Stream headers ok: status=" + std::to_string(statusCode) +
-                " clen=" + std::to_string(contentLength) +
-                " expected=" + std::to_string(expectedBody) +
-                (useRange ? " (range)" : ""));
-    }
 
     // Buffered writer that keeps one part file open at a time.
     FILE* partFile = nullptr;
@@ -576,59 +362,82 @@ static bool streamDownload(const std::string& url,
     };
 
     uint64_t globalOffset = startOffset;
-    // Write any body already read into buffer
-    if (bodyStartOffset < headerAccum.size()) {
-        size_t bodyBytes = headerAccum.size() - bodyStartOffset;
-        size_t toUse = static_cast<size_t>(std::min<uint64_t>((uint64_t)bodyBytes, expectedBody));
-        if (toUse > 0) {
-            if (!writeSpan(globalOffset, headerAccum.data() + bodyStartOffset, toUse)) { return false; }
-            status.currentDownloadedBytes.fetch_add(toUse);
-            status.totalDownloadedBytes.fetch_add(toUse);
-            uint64_t received = globalOffset - startOffset;
-            if (!probeLogged && received >= kProbeBytes) {
-                double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - transferStart).count();
-                if (secs <= 0.0) secs = 1e-6;
-                double mbps = (received / (1024.0 * 1024.0)) / secs; // MB/s
-                logLine("Throughput estimate ~" + std::to_string(mbps) + " MB/s (first 10MB)");
-                {
-                    std::lock_guard<std::mutex> lock(status.mutex);
-                    status.lastSpeedMBps = mbps;
-                }
-                probeLogged = true;
-            }
-        }
-    }
-
     auto lastBeat = std::chrono::steady_clock::now();
-    auto lastData = lastBeat;
     uint64_t bytesSinceBeat = 0;
     const uint64_t kLogEvery = 100ULL * 1024ULL * 1024ULL; // ~100MB
-    while (globalOffset - startOffset < expectedBody && !gCtx.stopRequested.load()) {
-        ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            if (n == 0) {
-                err = "Short read";
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (gCtx.stopRequested.load()) { err = "Stopped"; break; }
-                auto now = std::chrono::steady_clock::now();
-                if (now - lastData > stallTimeout) {
-                    err = "Timed out waiting for data";
-                    break;
-                }
-                continue;
-            } else {
-                err = std::string("Recv failed: ") + std::strerror(errno);
-            }
-            logLine("Stream recv error: " + err);
-            break;
+    ParsedHttpResponse parsedHeaders{};
+    bool headersValidated = false;
+    auto validateHeaders = [&]() -> bool {
+        if (headersValidated) return true;
+        const int statusCode = parsedHeaders.statusCode;
+        if (statusCode >= 300 && statusCode < 400) {
+            err = "Redirect not supported (HTTP " + std::to_string(statusCode) +
+                  (parsedHeaders.location.empty() ? "" : " to " + parsedHeaders.location) + ")";
+            return false;
         }
-        size_t toUse = static_cast<size_t>(std::min<uint64_t>((uint64_t)n, expectedBody - (globalOffset - startOffset)));
-        if (toUse > 0) {
-            if (!writeSpan(globalOffset, buf, toUse)) { return false; }
+        if (useRange && statusCode != 206) {
+            err = "Range not honored (status " + std::to_string(statusCode) + ")";
+            return false;
+        }
+        if (!useRange && statusCode != 200) {
+            err = "HTTP status " + std::to_string(statusCode);
+            return false;
+        }
+        if (parsedHeaders.chunked) {
+            err = "Chunked transfer not supported for streaming downloads";
+            return false;
+        }
+        if (parsedHeaders.hasContentRange) {
+            if (parsedHeaders.contentRangeStart != startOffset) {
+                err = "Content-Range start mismatch";
+                return false;
+            }
+            expectedBody = (parsedHeaders.contentRangeEnd - parsedHeaders.contentRangeStart) + 1;
+        } else if (!useRange && parsedHeaders.hasContentLength && parsedHeaders.contentLength > 0) {
+            expectedBody = parsedHeaders.contentLength;
+        }
+        if (parsedHeaders.hasContentLength && expectedBody && parsedHeaders.contentLength < expectedBody) {
+            err = "Short body (Content-Length " + std::to_string(parsedHeaders.contentLength) +
+                  " < expected " + std::to_string(expectedBody) + ")";
+            return false;
+        }
+        logLine("Stream headers ok: status=" + std::to_string(statusCode) +
+                " clen=" + std::to_string(parsedHeaders.contentLength) +
+                " expected=" + std::to_string(expectedBody) +
+                (useRange ? " (range)" : ""));
+        headersValidated = true;
+        return true;
+    };
+
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (!authBasic.empty()) headers.emplace_back("Authorization", "Basic " + authBasic);
+    if (useRange && startOffset > 0) {
+        headers.emplace_back("Range", "bytes=" + std::to_string(startOffset) + "-");
+    }
+
+    HttpRequestOptions opts;
+    opts.timeoutSec = timeoutSec;
+    opts.keepAlive = false;
+    opts.decodeChunked = false;
+    opts.cancelRequested = &gCtx.stopRequested;
+    opts.activeSocketFd = &gCtx.activeSocketFd;
+
+    std::string streamErr;
+    bool ok = httpRequestStreamed(
+        "GET", url, headers, opts, parsedHeaders,
+        [&](const char* data, size_t len) -> bool {
+            if (!validateHeaders()) return false;
+            if (len == 0) return true;
+            uint64_t receivedBefore = globalOffset - startOffset;
+            if (receivedBefore >= expectedBody) return true;
+            size_t toUse = static_cast<size_t>(
+                std::min<uint64_t>(static_cast<uint64_t>(len), expectedBody - receivedBefore));
+            if (toUse == 0) return true;
+            if (!writeSpan(globalOffset, data, toUse)) return false;
             status.currentDownloadedBytes.fetch_add(toUse);
             status.totalDownloadedBytes.fetch_add(toUse);
-            lastData = std::chrono::steady_clock::now();
             bytesSinceBeat += toUse;
+
             uint64_t received = globalOffset - startOffset;
             if (!probeLogged && received >= kProbeBytes) {
                 double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - transferStart).count();
@@ -641,6 +450,7 @@ static bool streamDownload(const std::string& url,
                 }
                 probeLogged = true;
             }
+
             auto now = std::chrono::steady_clock::now();
             if (bytesSinceBeat >= kLogEvery || now - lastBeat > std::chrono::seconds(10)) {
                 double beatSecs = std::chrono::duration<double>(now - lastBeat).count();
@@ -665,17 +475,29 @@ static bool streamDownload(const std::string& url,
                 lastBeat = now;
                 bytesSinceBeat = 0;
             }
-        }
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastData > stallTimeout) {
-            err = "Timed out waiting for data";
-            break;
-        }
+            return true;
+        },
+        streamErr);
+
+    if (!headersValidated && !validateHeaders()) {
+        closePart();
+        return false;
     }
-    sock.reset();
     closePart();
 
-    uint64_t received = globalOffset - startOffset;
+    if (!ok) {
+        if (streamErr == "Cancelled" || gCtx.stopRequested.load()) {
+            err = "Stopped";
+            return false;
+        }
+        if (err.empty()) {
+            err = !streamErr.empty() && streamErr != "Sink aborted" ? streamErr : "Stream failed";
+        }
+        logLine("Stream recv error: " + err);
+        return false;
+    }
+
+    const uint64_t received = globalOffset - startOffset;
     if (gCtx.stopRequested.load()) { err = "Stopped"; return false; }
     if (received < expectedBody) { err = "Short read"; return false; }
     if (received > expectedBody) { err = "Overflow"; return false; }

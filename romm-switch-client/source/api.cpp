@@ -34,7 +34,6 @@
 namespace romm {
 
 namespace {
-constexpr size_t kApiRecvBuf = 8192;
 constexpr int64_t kRetryDelayFastNs = 250'000'000LL; // 250ms
 constexpr int64_t kRetryDelaySlowNs = 1'000'000'000LL; // 1s
 constexpr size_t kDefaultApiPageLimit = 300;
@@ -170,221 +169,6 @@ static bool parseIdentifiersDigestBody(const std::string& body, std::string& out
     return true;
 }
 
-#ifndef UNIT_TEST
-struct KeepAliveConn {
-    int fd{-1};
-    std::string host;
-    std::string port;
-    int timeoutSec{0};
-};
-
-thread_local KeepAliveConn gKeepAliveConn;
-
-static void closeKeepAliveConn() {
-    if (gKeepAliveConn.fd >= 0) {
-        close(gKeepAliveConn.fd);
-    }
-    gKeepAliveConn = KeepAliveConn{};
-}
-
-static bool openKeepAliveConn(const std::string& host,
-                              const std::string& port,
-                              int timeoutSec,
-                              std::string& err) {
-    struct addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* res = nullptr;
-    int ret = getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
-    if (ret != 0 || !res) {
-        err = "DNS lookup failed for host: " + host;
-        if (res) freeaddrinfo(res);
-        return false;
-    }
-
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        err = "Socket creation failed";
-        freeaddrinfo(res);
-        return false;
-    }
-
-    if (timeoutSec > 0) {
-        timeval tv{};
-        tv.tv_sec = timeoutSec;
-        tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    }
-
-    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
-        err = std::string("Connect failed: ") + std::strerror(errno);
-        freeaddrinfo(res);
-        close(fd);
-        return false;
-    }
-    freeaddrinfo(res);
-
-    closeKeepAliveConn();
-    gKeepAliveConn.fd = fd;
-    gKeepAliveConn.host = host;
-    gKeepAliveConn.port = port;
-    gKeepAliveConn.timeoutSec = timeoutSec;
-    return true;
-}
-
-static bool ensureKeepAliveConn(const std::string& host,
-                                const std::string& port,
-                                int timeoutSec,
-                                std::string& err) {
-    if (gKeepAliveConn.fd >= 0 &&
-        gKeepAliveConn.host == host &&
-        gKeepAliveConn.port == port &&
-        gKeepAliveConn.timeoutSec == timeoutSec) {
-        return true;
-    }
-    return openKeepAliveConn(host, port, timeoutSec, err);
-}
-
-static bool readHttpResponseKeepAlive(int fd, HttpResponse& resp, std::string& err, bool& shouldCloseConn) {
-    resp = HttpResponse{};
-    shouldCloseConn = false;
-
-    std::string raw;
-    raw.reserve(16 * 1024);
-    char buf[kApiRecvBuf];
-    size_t hdrEnd = std::string::npos;
-    while (hdrEnd == std::string::npos) {
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
-        if (n < 0) {
-            err = (errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" :
-                  (std::string("Recv failed: ") + std::strerror(errno));
-            return false;
-        }
-        if (n == 0) {
-            err = "Connection closed before HTTP headers";
-            return false;
-        }
-        raw.append(buf, buf + n);
-        hdrEnd = raw.find("\r\n\r\n");
-    }
-
-    std::string headerBlock = raw.substr(0, hdrEnd);
-    ParsedHttpResponse parsed{};
-    if (!parseHttpResponseHeaders(headerBlock, parsed, err)) {
-        return false;
-    }
-    resp.statusCode = parsed.statusCode;
-    resp.statusText = parsed.statusText;
-    resp.headersRaw = parsed.headersRaw;
-
-    std::string headersLower = resp.headersRaw;
-    for (auto& c : headersLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (headersLower.find("connection: close") != std::string::npos) {
-        shouldCloseConn = true;
-    }
-
-    std::string body = raw.substr(hdrEnd + 4);
-    if (parsed.chunked) {
-        // Conservative handling: read until we can decode a complete chunked body.
-        std::string decoded;
-        while (!decodeChunkedBody(body, decoded)) {
-            ssize_t n = recv(fd, buf, sizeof(buf), 0);
-            if (n < 0) {
-                err = (errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" :
-                      (std::string("Recv failed: ") + std::strerror(errno));
-                return false;
-            }
-            if (n == 0) break;
-            body.append(buf, buf + n);
-        }
-        if (!decodeChunkedBody(body, decoded)) {
-            err = "Failed to decode chunked HTTP body";
-            return false;
-        }
-        resp.body.swap(decoded);
-        shouldCloseConn = true; // simplify connection lifecycle for chunked replies
-        return true;
-    }
-
-    if (parsed.contentLength > 0) {
-        while (body.size() < parsed.contentLength) {
-            ssize_t n = recv(fd, buf, sizeof(buf), 0);
-            if (n < 0) {
-                err = (errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" :
-                      (std::string("Recv failed: ") + std::strerror(errno));
-                return false;
-            }
-            if (n == 0) {
-                err = "Short HTTP body";
-                return false;
-            }
-            body.append(buf, buf + n);
-        }
-        if (body.size() > parsed.contentLength) {
-            body.resize(static_cast<size_t>(parsed.contentLength));
-        }
-        resp.body.swap(body);
-        return true;
-    }
-
-    // No framing headers: read to EOF and close.
-    while (true) {
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
-        if (n < 0) {
-            err = (errno == EAGAIN || errno == EWOULDBLOCK) ? "Recv timed out" :
-                  (std::string("Recv failed: ") + std::strerror(errno));
-            return false;
-        }
-        if (n == 0) break;
-        body.append(buf, buf + n);
-    }
-    resp.body.swap(body);
-    shouldCloseConn = true;
-    return true;
-}
-
-static bool httpRequestKeepAlive(const std::string& method,
-                                 const std::string& url,
-                                 const std::vector<std::pair<std::string, std::string>>& extraHeaders,
-                                 int timeoutSec,
-                                 HttpResponse& resp,
-                                 std::string& err) {
-    std::string host, portStr, path;
-    if (!parseHttpUrl(url, host, portStr, path, err)) return false;
-
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        if (!ensureKeepAliveConn(host, portStr, timeoutSec, err)) return false;
-
-        std::ostringstream req;
-        req << method << " " << path << " HTTP/1.1\r\n";
-        req << "Host: " << host << "\r\n";
-        req << "Connection: keep-alive\r\n";
-        for (const auto& kv : extraHeaders) {
-            req << kv.first << ": " << kv.second << "\r\n";
-        }
-        req << "\r\n";
-        std::string reqStr = req.str();
-
-        if (!romm::sendAll(gKeepAliveConn.fd, reqStr.data(), reqStr.size())) {
-            closeKeepAliveConn();
-            err = "Send failed";
-            if (attempt == 0) continue;
-            return false;
-        }
-
-        bool shouldCloseConn = false;
-        if (!readHttpResponseKeepAlive(gKeepAliveConn.fd, resp, err, shouldCloseConn)) {
-            closeKeepAliveConn();
-            if (attempt == 0) continue;
-            return false;
-        }
-        if (shouldCloseConn) closeKeepAliveConn();
-        return true;
-    }
-    return false;
-}
-#endif
 }
 
 bool parseHttpUrl(const std::string& url,
@@ -393,13 +177,20 @@ bool parseHttpUrl(const std::string& url,
                   std::string& path,
                   std::string& err)
 {
-    // TODO: support https:// via TLS in future; currently http-only.
-    if (url.rfind("http://", 0) != 0) {
-        err = "Only http:// URLs are supported (TLS not implemented)";
+    bool https = false;
+    size_t schemeLen = 0;
+    if (url.rfind("http://", 0) == 0) {
+        https = false;
+        schemeLen = 7;
+    } else if (url.rfind("https://", 0) == 0) {
+        https = true;
+        schemeLen = 8;
+    } else {
+        err = "URL must start with http:// or https://";
         return false;
     }
 
-    std::string rest = url.substr(7); // after "http://"
+    std::string rest = url.substr(schemeLen);
     std::string hostport;
     auto slash = rest.find('/');
     if (slash == std::string::npos) {
@@ -411,12 +202,12 @@ bool parseHttpUrl(const std::string& url,
     }
 
     host = hostport;
-    portStr = "80";
+    portStr = https ? "443" : "80";
     auto colon = hostport.find(':');
     if (colon != std::string::npos) {
         host = hostport.substr(0, colon);
         portStr = hostport.substr(colon + 1);
-        if (portStr.empty()) portStr = "80";
+        if (portStr.empty()) portStr = https ? "443" : "80";
     }
 
     if (host.empty()) {
@@ -488,7 +279,21 @@ bool httpRequest(const std::string& method,
                  HttpResponse& resp,
                  std::string& err)
 {
-    return httpRequestKeepAlive(method, url, extraHeaders, timeoutSec, resp, err);
+    HttpRequestOptions options;
+    options.timeoutSec = timeoutSec;
+    options.keepAlive = true;
+    options.decodeChunked = true;
+
+    HttpTransaction tx;
+    if (!romm::httpRequestBuffered(method, url, extraHeaders, options, tx, err)) {
+        return false;
+    }
+    resp = HttpResponse{};
+    resp.statusCode = tx.parsed.statusCode;
+    resp.statusText = tx.parsed.statusText;
+    resp.headersRaw = tx.parsed.headersRaw;
+    resp.body = std::move(tx.body);
+    return true;
 }
 
 // Streaming variant: delivers body via onData, does not keep the payload in memory.
@@ -500,129 +305,20 @@ bool httpRequestStream(const std::string& method,
                        const std::function<bool(const char*, size_t)>& onData,
                        std::string& err)
 {
+    HttpRequestOptions options;
+    options.timeoutSec = timeoutSec;
+    options.keepAlive = false;
+    options.decodeChunked = false;
+
+    ParsedHttpResponse parsed{};
+    if (!romm::httpRequestStreamed(method, url, extraHeaders, options, parsed, onData, err)) {
+        return false;
+    }
     resp = HttpResponse{};
-    std::string host, portStr, path;
-    if (!parseHttpUrl(url, host, portStr, path, err)) {
-        return false;
-    }
-
-    struct addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* res = nullptr;
-
-    int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
-    if (ret != 0 || !res) {
-        err = "DNS lookup failed for host: " + host;
-        if (res) freeaddrinfo(res);
-        return false;
-    }
-
-    romm::UniqueFd sockFd(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
-    if (!sockFd) {
-        err = "Socket creation failed";
-        freeaddrinfo(res);
-        return false;
-    }
-
-    if (timeoutSec > 0) {
-        timeval tv{}; tv.tv_sec = timeoutSec; tv.tv_usec = 0;
-        setsockopt(sockFd.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sockFd.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    }
-
-    if (connect(sockFd.fd, res->ai_addr, res->ai_addrlen) != 0) {
-        err = std::string("Connect failed: ") + std::strerror(errno);
-        freeaddrinfo(res);
-        return false;
-    }
-    freeaddrinfo(res);
-
-    std::ostringstream req;
-    req << method << " " << path << " HTTP/1.1\r\n";
-    req << "Host: " << host << "\r\n";
-    req << "Connection: close\r\n";
-    for (const auto& kv : extraHeaders) {
-        req << kv.first << ": " << kv.second << "\r\n";
-    }
-    req << "\r\n";
-    std::string reqStr = req.str();
-
-    if (!romm::sendAll(sockFd.fd, reqStr.data(), reqStr.size())) {
-        err = "Send failed";
-        return false;
-    }
-
-    std::string headerBuf; // only used until headers parsed
-    char buf[kApiRecvBuf];
-    bool headersDone = false;
-    size_t bytesSentToSink = 0;
-    bool chunked = false;
-    uint64_t contentLength = 0;
-
-    while (true) {
-        ssize_t n = recv(sockFd.fd, buf, sizeof(buf), 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                err = "Recv timed out";
-            } else {
-                err = std::string("Recv failed: ") + std::strerror(errno);
-            }
-            return false;
-        } else if (n == 0) {
-            break; // EOF
-        }
-
-        if (!headersDone) {
-            headerBuf.append(buf, buf + n);
-            auto hdrEnd = headerBuf.find("\r\n\r\n");
-            if (hdrEnd == std::string::npos) {
-                continue; // need more header data
-            }
-            headersDone = true;
-            size_t bodyStart = hdrEnd + 4;
-
-            std::string headerBlock = headerBuf.substr(0, hdrEnd);
-            ParsedHttpResponse parsed{};
-            if (!parseHttpResponseHeaders(headerBlock, parsed, err)) {
-                return false;
-            }
-            resp.statusCode = parsed.statusCode;
-            resp.statusText = parsed.statusText;
-            resp.headersRaw = parsed.headersRaw;
-            contentLength = parsed.contentLength;
-            chunked = parsed.chunked;
-            if (chunked) {
-                err = "Chunked encoding not supported for streaming downloads";
-                return false;
-            }
-
-            // Send any body bytes already received with the headers.
-            if (bodyStart < headerBuf.size()) {
-                size_t bodyBytes = headerBuf.size() - bodyStart;
-                if (!onData(headerBuf.data() + bodyStart, bodyBytes)) {
-                    err = "Sink aborted";
-                    return false;
-                }
-                bytesSentToSink += bodyBytes;
-            }
-            headerBuf.clear(); // free header accumulation to avoid buffering whole body
-            continue;
-        }
-
-        // After headers: stream straight to sink without buffering.
-        if (!onData(buf, static_cast<size_t>(n))) {
-            err = "Sink aborted";
-            return false;
-        }
-        bytesSentToSink += static_cast<size_t>(n);
-    }
-
-    if (contentLength > 0 && bytesSentToSink < contentLength) {
-        err = "Short read";
-        return false;
-    }
-
+    resp.statusCode = parsed.statusCode;
+    resp.statusText = parsed.statusText;
+    resp.headersRaw = parsed.headersRaw;
+    resp.body.clear();
     return true;
 }
 #else

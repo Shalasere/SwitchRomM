@@ -10,9 +10,27 @@ TEST_CASE("parseHttpUrl variants (legacy runner parity)") {
     REQUIRE(path == "/path?x=1");
 
     host.clear(); port.clear(); path.clear(); err.clear();
-    ok = romm::parseHttpUrl("https://bad.com", host, port, path, err);
+    ok = romm::parseHttpUrl("https://good.com", host, port, path, err);
+    REQUIRE(ok);
+    REQUIRE(host == "good.com");
+    REQUIRE(port == "443");
+    REQUIRE(path == "/");
+}
+
+TEST_CASE("parseHttpUrl supports https explicit port and query path") {
+    std::string host, port, path, err;
+    bool ok = romm::parseHttpUrl("https://secure.example.net:9443/api/v1?q=1", host, port, path, err);
+    REQUIRE(ok);
+    REQUIRE(host == "secure.example.net");
+    REQUIRE(port == "9443");
+    REQUIRE(path == "/api/v1?q=1");
+}
+
+TEST_CASE("parseHttpUrl rejects unsupported scheme (legacy runner parity)") {
+    std::string host, port, path, err;
+    bool ok = romm::parseHttpUrl("ftp://example.com/file", host, port, path, err);
     REQUIRE_FALSE(ok);
-    REQUIRE_FALSE(err.empty());
+    REQUIRE(err == "URL must start with http:// or https://");
 }
 
 TEST_CASE("decodeChunkedBody mirrors legacy assertions") {

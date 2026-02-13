@@ -1,7 +1,7 @@
 # Downloads
 
 ### How it works
-- One streaming HTTP GET per ROM. We stop at Content-Length. If preflight sees `Accept-Ranges: bytes`, we resume partial data (including one partial part); otherwise the ROM restarts. **HTTP only; no TLS.** Use on trusted LAN or put TLS in front of RomM.
+- One streaming HTTP GET per ROM over `http://` or `https://` (libcurl transport). We stop at Content-Length. If preflight sees `Accept-Ranges: bytes`, we resume partial data (including one partial part); otherwise the ROM restarts.
 - Chunked transfer is not supported for streaming downloads; servers/proxies must send Content-Length. Redirects are not followed.
 - Redirect failures now include the `Location` target and explicitly note that auth is not forwarded across hosts.
 - Client-side split into FAT32/DBI parts: `0xFFFF0000` (00, 01, 02 ...) inside a temp dir when `fat32_safe=true`. If `fat32_safe=false`, the ROM stays as a single part. Each temp dir has a `manifest.json` with expected part sizes and which parts/partials are complete.
@@ -40,4 +40,4 @@
 - Resume validation is size-only; add hashes or stronger checks when feasible (server doesn’t provide hashes today).
 - Optional: extra collision safeguards beyond title_id folders if future platforms need it.
 - Redirects: currently fail with Location in the log; add optional follow with safe auth handling.
-- HTTPS support when a TLS story is available.
+- Optional: expose stricter TLS pinning/verification policy controls in config (current behavior is libcurl/default trust store).

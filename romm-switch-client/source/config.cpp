@@ -29,6 +29,10 @@ static std::string toLower(std::string s) {
     return s;
 }
 
+static bool hasSupportedHttpScheme(const std::string& url) {
+    return url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0;
+}
+
 static void trim(std::string& s) {
     while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
     size_t i = 0;
@@ -304,12 +308,11 @@ bool loadConfig(Config& outCfg, std::string& outError, ErrorInfo* outInfo) {
         return false;
     }
 
-    // Enforce http-only for now (TLS not implemented).
-    if (outCfg.serverUrl.rfind("https://", 0) == 0) {
+    if (!hasSupportedHttpScheme(outCfg.serverUrl)) {
         setConfigError(outError, outInfo,
-                       "https:// not supported; use http:// or a local TLS terminator.",
+                       "server_url must start with http:// or https://.",
                        ErrorCode::ConfigUnsupported,
-                       "HTTPS is not supported in this build.");
+                       "Server URL must use http or https.");
         return false;
     }
 
@@ -338,11 +341,11 @@ bool parseEnvString(const std::string& contents, Config& outCfg, std::string& ou
                        "Required config field is missing.");
         return false;
     }
-    if (outCfg.serverUrl.rfind("https://", 0) == 0) {
+    if (!hasSupportedHttpScheme(outCfg.serverUrl)) {
         setConfigError(outError, outInfo,
-                       "https:// not supported; use http:// or a local TLS terminator.",
+                       "server_url must start with http:// or https://.",
                        ErrorCode::ConfigUnsupported,
-                       "HTTPS is not supported in this build.");
+                       "Server URL must use http or https.");
         return false;
     }
     return true;
@@ -372,11 +375,11 @@ bool parseJsonString(const std::string& contents, Config& outCfg, std::string& o
                        "Required config field is missing.");
         return false;
     }
-    if (outCfg.serverUrl.rfind("https://", 0) == 0) {
+    if (!hasSupportedHttpScheme(outCfg.serverUrl)) {
         setConfigError(outError, outInfo,
-                       "https:// not supported; use http:// or a local TLS terminator.",
+                       "server_url must start with http:// or https://.",
                        ErrorCode::ConfigUnsupported,
-                       "HTTPS is not supported in this build.");
+                       "Server URL must use http or https.");
         return false;
     }
     return true;

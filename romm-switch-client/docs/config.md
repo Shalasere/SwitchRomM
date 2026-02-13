@@ -3,7 +3,7 @@
  Put `.env` at `sdmc:/switch/romm_switch_client/.env`. `config.json` in the same directory is also read; current load order is `.env` then `config.json`, so JSON overrides `.env` on the same key. JSON supports schema migration (`schema_version`), and missing `schema_version` is treated as legacy schema and migrated to current keys.
 
 ## Keys (with defaults)
-- `SERVER_URL` (required): Base RomM URL. **HTTP only; TLS is not supported in the client.** Example: `http://192.168.1.10:8080`.
+- `SERVER_URL` (required): Base RomM URL. **Supports `http://` and `https://`.** Example: `https://192.168.1.10:8080`.
 - `USERNAME`, `PASSWORD`: Basic auth credentials. Leave empty if your server does not require them.
 - `API_TOKEN`: Reserved for future token support (unused today).
 - `PLATFORM` (optional): Platform slug to list; leave empty to browse/select in the UI.

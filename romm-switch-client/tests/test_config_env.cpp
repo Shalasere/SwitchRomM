@@ -43,15 +43,27 @@ TEST_CASE("parseEnvString rejects missing required fields") {
     REQUIRE_FALSE(err.empty());
 }
 
-TEST_CASE("parseEnvString rejects https scheme") {
+TEST_CASE("parseEnvString accepts https scheme") {
     const std::string env =
-        "server_url=https://bad\n"
+        "server_url=https://good\n"
+        "download_dir=sdmc:/romm_cache/switch\n";
+    romm::Config cfg;
+    std::string err;
+    bool ok = romm::parseEnvString(env, cfg, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(cfg.serverUrl == "https://good");
+}
+
+TEST_CASE("parseEnvString rejects unsupported scheme") {
+    const std::string env =
+        "server_url=ftp://bad\n"
         "download_dir=sdmc:/romm_cache/switch\n";
     romm::Config cfg;
     std::string err;
     bool ok = romm::parseEnvString(env, cfg, err);
     REQUIRE_FALSE(ok);
-    REQUIRE_FALSE(err.empty());
+    REQUIRE(err == "server_url must start with http:// or https://.");
 }
 
 TEST_CASE("parseEnvString normalizes booleans and log level") {
@@ -109,6 +121,21 @@ TEST_CASE("parseJsonString parses canonical schema v1") {
     REQUIRE(cfg.downloadDir == "sdmc:/romm_cache/switch");
     REQUIRE(cfg.logLevel == "debug");
     REQUIRE(cfg.httpTimeoutSeconds == 17);
+}
+
+TEST_CASE("parseJsonString accepts https server_url") {
+    const std::string json =
+        "{"
+        "\"schema_version\":1,"
+        "\"server_url\":\"https://example.com\","
+        "\"download_dir\":\"sdmc:/romm_cache/switch\""
+        "}";
+    romm::Config cfg;
+    std::string err;
+    bool ok = romm::parseJsonString(json, cfg, err);
+    REQUIRE(ok);
+    REQUIRE(err.empty());
+    REQUIRE(cfg.serverUrl == "https://example.com");
 }
 
 TEST_CASE("parseJsonString migrates legacy keys when schema is missing") {

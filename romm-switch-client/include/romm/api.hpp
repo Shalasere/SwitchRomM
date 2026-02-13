@@ -52,7 +52,7 @@ bool searchGamesRemote(const Config& cfg,
                        ErrorInfo* outInfo = nullptr);
 bool fetchBinary(const Config& cfg, const std::string& url, std::string& outData, std::string& outError, ErrorInfo* outInfo = nullptr);
 bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError, ErrorInfo* outInfo = nullptr);
-// Shared URL parser (http:// only).
+// Shared URL parser (http:// and https://).
 bool parseHttpUrl(const std::string& url,
                   std::string& host,
                   std::string& portStr,

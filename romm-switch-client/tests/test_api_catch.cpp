@@ -23,11 +23,20 @@ TEST_CASE("parseHttpUrl defaults and USER_REDACTED path") {
     REQUIRE(path == "/");  // USER_REDACTED when no path provided
 }
 
-TEST_CASE("parseHttpUrl rejects https") {
+TEST_CASE("parseHttpUrl supports https") {
     std::string host, port, path, err;
-    bool ok = romm::parseHttpUrl("https://bad.com", host, port, path, err);
+    bool ok = romm::parseHttpUrl("https://good.com", host, port, path, err);
+    REQUIRE(ok);
+    REQUIRE(host == "good.com");
+    REQUIRE(port == "443");
+    REQUIRE(path == "/");
+}
+
+TEST_CASE("parseHttpUrl rejects unsupported scheme") {
+    std::string host, port, path, err;
+    bool ok = romm::parseHttpUrl("ftp://bad.com", host, port, path, err);
     REQUIRE_FALSE(ok);
-    REQUIRE_FALSE(err.empty());
+    REQUIRE(err == "URL must start with http:// or https://");
 }
 
 TEST_CASE("parseHttpUrl missing host fails") {

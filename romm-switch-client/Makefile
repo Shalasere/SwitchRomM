@@ -31,13 +31,19 @@ APP_AUTHOR  := Shalasere
 APP_VERSION := 0.2.6
 ICON        := assets/icon.jpg
 
+CURL_CFLAGS := $(shell curl-config --cflags 2>/dev/null)
+CURL_LIBS   := $(shell curl-config --libs 2>/dev/null)
+ifeq ($(strip $(CURL_LIBS)),)
+$(error "switch-curl is required. Install it in devkitPro MSYS2: pacman -S switch-curl")
+endif
+
 #---------------------------------------------------------------------------------
 # Options for code generation (align with libnx template)
 #---------------------------------------------------------------------------------
 ARCH        := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
 CFLAGS      := -g -Wall -O2 -ffunction-sections \
-               $(ARCH) $(DEFINES)
+               $(ARCH) $(DEFINES) $(CURL_CFLAGS)
 
 CFLAGS      += $(INCLUDE) -D__SWITCH__
 
@@ -47,7 +53,7 @@ ASFLAGS     := -g $(ARCH)
 
 LDFLAGS     := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS        := -lSDL2 -lEGL -lglapi -ldrm_nouveau -lnx
+LIBS        := -lSDL2 -lEGL -lglapi -ldrm_nouveau -lnx $(CURL_LIBS)
 
 LIBDIRS     := $(PORTLIBS) $(LIBNX)
 

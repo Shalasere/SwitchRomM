@@ -2,15 +2,18 @@
 #include "romm/config.hpp"
 #include "api_test_hooks.hpp"
 
-TEST_CASE("loadConfig rejects https URLs") {
+TEST_CASE("parseHttpUrl accepts https URLs") {
     romm::Config cfg;
     std::string err;
-    // Simulate a config object with an https URL; validate check should fail.
+    // Simulate a config object with an https URL; parse should succeed.
     cfg.serverUrl = "https://example.com";
-    // loadConfig is not directly testable here (depends on SD paths), so assert that parseHttpUrl fails.
+    // loadConfig is not directly testable here (depends on SD paths), so assert parser behavior.
     std::string host, port, path, perr;
     bool ok = romm::parseHttpUrl(cfg.serverUrl, host, port, path, perr);
-    REQUIRE_FALSE(ok);
+    REQUIRE(ok);
+    REQUIRE(host == "example.com");
+    REQUIRE(port == "443");
+    REQUIRE(path == "/");
 }
 
 TEST_CASE("parseHttpUrl accepts http URLs") {

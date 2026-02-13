@@ -10,7 +10,7 @@ Two things here:
 3) Install/update packages:
    ```sh
    pacman -Syu
-   pacman -S devkitA64 switch-dev switch-tools
+   pacman -S devkitA64 switch-dev switch-tools switch-curl
    ```
 4) Verify:
    ```sh
@@ -39,7 +39,7 @@ make run                  # nxlink to a Switch in netloader mode
 ### Runtime config (.env)
 Put `.env` at `sdmc:/switch/romm_switch_client/.env` (sample):
 ```
-SERVER_URL=http://YOUR_ROMM_HOST:PORT      # HTTP only; TLS not supported by the client
+SERVER_URL=https://YOUR_ROMM_HOST:PORT     # http:// and https:// are supported
 USERNAME=your_username
 PASSWORD=your_password
 DOWNLOAD_DIR=sdmc:/romm_cache               # base cache; platform/title_id subfolders are created
@@ -82,7 +82,7 @@ Mappings are fixed in `source/input.cpp` (positional codes); UI hints match.
 - ROM list tooling: revision-keyed in-memory index for search/filter/sort without full per-frame scans.
 - Diagnostics screen: config summary, server reachability probe, SD free space, queue/history stats, last error, and exportable log summary.
 - Downloads: FAT32/DBI splits when enabled, Range resume with contiguity enforcement, temp isolation under `<download_dir>/temp/<platform>/<rom>/<file>/...`, archive bit set for multi-part.
-- Networking: HTTP only (no TLS); run on trusted LAN or put TLS in front of RomM. Redirects are not followed (Location logged).
+- Networking: HTTP and HTTPS via libcurl. Redirects are not followed (Location logged).
 - Logging: leveled (`LOG_LEVEL`); debug is noisy.
 - Font: HD44780 bitmap font from `romfs/HD44780_font.txt` with macron glyph.
 
@@ -99,7 +99,7 @@ Mappings are fixed in `source/input.cpp` (positional codes); UI hints match.
   make                 # uses host g++/make; run from MSYS2 MinGW64 on Windows
   ./romm_tests         # Catch2 runner; use -s or --list-tests for detail
   ```
-Tests cover HTTP-only URL parsing (defaults + rejects https) and strict chunked decoding (valid/malformed, extensions, missing CRLF). No Switch libs needed.
+Tests cover URL parsing for HTTP/HTTPS (including default ports) and strict chunked decoding (valid/malformed, extensions, missing CRLF). No Switch libs needed.
 - Windows (MSYS2/MinGW64): install host tools if missing:
   ```
   pacman -S gcc make
