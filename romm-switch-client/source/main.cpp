@@ -982,6 +982,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         SDL_SetRenderDrawColor(renderer, 245, 245, 245, 255);
         SDL_RenderDrawRect(renderer, &box);
         drawText(renderer, box.x + 10, box.y + 10, label, SDL_Color{245,245,245,255}, scale);
+        SDL_RenderPresent(renderer);
         return;
     }
 
