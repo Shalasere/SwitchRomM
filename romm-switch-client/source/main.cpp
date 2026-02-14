@@ -955,15 +955,40 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             pctTotal = std::clamp(pctTotal, 0.0f, 1.0f);
             pctInt = (int)(pctTotal * 100.0f);
         }
+        const bool workerRunning = snap.downloadWorkerRunning;
+        const bool queueEmpty = (snap.queueCount == 0);
+        const bool finished = (!workerRunning && queueEmpty) &&
+                              (snap.downloadCompleted || (totalBytes > 0 && totalDone >= totalBytes));
+        const bool empty = (!workerRunning && queueEmpty) &&
+                           (!snap.downloadCompleted) &&
+                           (totalBytes == 0);
+
         std::string titleLine;
-        if (!snap.currentDownloadTitle.empty()) {
-            titleLine = foldUtf8ToAscii(snap.currentDownloadTitle, true);
+        std::string label;
+        SDL_Color fill{18, 18, 18, 255};
+        SDL_Color outline{245, 245, 245, 255};
+        SDL_Color text{245, 245, 245, 255};
+
+        if (finished) {
+            titleLine = "All Items Finished!";
+            label.clear();
+            fill = {18, 56, 22, 255};
+            outline = {90, 245, 120, 255};
+        } else if (empty) {
+            titleLine = "Queue Empty";
+            label.clear();
+            fill = {64, 14, 14, 255};
+            outline = {255, 110, 110, 255};
         } else {
-            titleLine = "Downloading";
+            if (!snap.currentDownloadTitle.empty()) {
+                titleLine = foldUtf8ToAscii(snap.currentDownloadTitle, true);
+            } else {
+                titleLine = workerRunning ? "Downloading" : "Preparing...";
+            }
+            label = (totalBytes > 0)
+                ? ("Progress " + std::to_string(pctInt) + "%")
+                : "Connecting...";
         }
-        std::string label = (totalBytes > 0)
-            ? ("Progress " + std::to_string(pctInt) + "%")
-            : "Connecting...";
 
         // Size the block to match drawText()'s spacing/inset so we never clip glyphs.
         const int scale = 3;
@@ -984,19 +1009,21 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             return s.substr(0, (size_t)(maxGlyphs - 3)) + "...";
         };
         titleLine = clampToScreen(titleLine);
-        label = clampToScreen(label);
+        if (!label.empty()) label = clampToScreen(label);
 
         const int textWTitle = inset + (int)titleLine.size() * advance;
-        const int textWLabel = inset + (int)label.size() * advance;
+        const int textWLabel = label.empty() ? 0 : (inset + (int)label.size() * advance);
         const int textW = std::max(textWTitle, textWLabel);
         const int padL = 10;
         const int padR = 14;
         const int padY = 10;
         const int gapY = scale * 3;
         int w = padL + textW + padR;
-        int h = (charH * 2) + gapY + padY * 2;
+        int h = label.empty()
+            ? (charH + padY * 2)
+            : ((charH * 2) + gapY + padY * 2);
         if (w < 120) w = 120;
-        if (h < 70) h = 70;
+        if (h < 44) h = 44;
 
         x += vx * dt;
         y += vy * dt;
@@ -1008,12 +1035,14 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         SDL_Rect box{ (int)x, (int)y, w, h };
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
-        SDL_SetRenderDrawColor(renderer, 18, 18, 18, 255);
+        SDL_SetRenderDrawColor(renderer, fill.r, fill.g, fill.b, fill.a);
         SDL_RenderFillRect(renderer, &box);
-        SDL_SetRenderDrawColor(renderer, 245, 245, 245, 255);
+        SDL_SetRenderDrawColor(renderer, outline.r, outline.g, outline.b, outline.a);
         SDL_RenderDrawRect(renderer, &box);
-        drawText(renderer, box.x + padL, box.y + padY, titleLine, SDL_Color{245,245,245,255}, scale);
-        drawText(renderer, box.x + padL, box.y + padY + charH + gapY, label, SDL_Color{245,245,245,255}, scale);
+        drawText(renderer, box.x + padL, box.y + padY, titleLine, text, scale);
+        if (!label.empty()) {
+            drawText(renderer, box.x + padL, box.y + padY + charH + gapY, label, text, scale);
+        }
         SDL_RenderPresent(renderer);
         return;
     }
