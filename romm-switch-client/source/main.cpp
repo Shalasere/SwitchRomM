@@ -955,17 +955,48 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             pctTotal = std::clamp(pctTotal, 0.0f, 1.0f);
             pctInt = (int)(pctTotal * 100.0f);
         }
-        std::string label = "RomM";
-        if (totalBytes > 0) label += " " + std::to_string(pctInt) + "%";
+        std::string titleLine;
+        if (!snap.currentDownloadTitle.empty()) {
+            titleLine = foldUtf8ToAscii(snap.currentDownloadTitle, true);
+        } else {
+            titleLine = "Downloading";
+        }
+        std::string label = (totalBytes > 0)
+            ? ("Progress " + std::to_string(pctInt) + "%")
+            : "Connecting...";
 
-        // Size the block based on glyph rendering assumptions (5x7 + spacing), scale 3.
+        // Size the block to match drawText()'s spacing/inset so we never clip glyphs.
         const int scale = 3;
-        const int charW = (5 + 1) * scale;
+        const int spacing = scale;
+        const int inset = scale * 4;
+        const int advance = 5 * scale + 2 * spacing; // drawText(): +spacing, draw 5 cols, +(5*scale+spacing)
         const int charH = 7 * scale;
-        int w = (int)label.size() * charW + 18;
-        int h = charH + 16;
+        auto clampToScreen = [&](std::string s) -> std::string {
+            // Keep the bouncing block fully on-screen by limiting the rendered glyph count.
+            const int padL = 10;
+            const int padR = 14;
+            const int maxW = 1280 - 40; // leave a small outer margin
+            const int maxTextW = std::max(0, maxW - (padL + padR));
+            int maxGlyphs = (maxTextW - inset) / advance;
+            if (maxGlyphs < 0) maxGlyphs = 0;
+            if ((int)s.size() <= maxGlyphs) return s;
+            if (maxGlyphs <= 3) return std::string((size_t)std::max(0, maxGlyphs), '.');
+            return s.substr(0, (size_t)(maxGlyphs - 3)) + "...";
+        };
+        titleLine = clampToScreen(titleLine);
+        label = clampToScreen(label);
+
+        const int textWTitle = inset + (int)titleLine.size() * advance;
+        const int textWLabel = inset + (int)label.size() * advance;
+        const int textW = std::max(textWTitle, textWLabel);
+        const int padL = 10;
+        const int padR = 14;
+        const int padY = 10;
+        const int gapY = scale * 3;
+        int w = padL + textW + padR;
+        int h = (charH * 2) + gapY + padY * 2;
         if (w < 120) w = 120;
-        if (h < 44) h = 44;
+        if (h < 70) h = 70;
 
         x += vx * dt;
         y += vy * dt;
@@ -981,7 +1012,8 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         SDL_RenderFillRect(renderer, &box);
         SDL_SetRenderDrawColor(renderer, 245, 245, 245, 255);
         SDL_RenderDrawRect(renderer, &box);
-        drawText(renderer, box.x + 10, box.y + 10, label, SDL_Color{245,245,245,255}, scale);
+        drawText(renderer, box.x + padL, box.y + padY, titleLine, SDL_Color{245,245,245,255}, scale);
+        drawText(renderer, box.x + padL, box.y + padY + charH + gapY, label, SDL_Color{245,245,245,255}, scale);
         SDL_RenderPresent(renderer);
         return;
     }
