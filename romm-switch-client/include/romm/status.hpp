@@ -60,6 +60,7 @@ struct Status {
     int selectedPlatformIndex{0};
     int selectedRomIndex{0};
     int selectedQueueIndex{0};
+    bool queueReorderActive{false}; // when true in QUEUE: D-pad reorders the selected item instead of moving cursor
     // Selected platform identity (used to keep UI and behavior correlated even if indices drift).
     std::string currentPlatformId;
     std::string currentPlatformSlug;
@@ -85,6 +86,7 @@ struct Status {
     std::atomic<bool> lastDownloadFailed{false};
     std::string lastDownloadError;
     bool downloadCompleted{false};
+    bool burnInMode{false}; // burn-in prevention "black screen" overlay for DOWNLOADING
 
     // Async flags (unused/legacy)
     std::atomic<bool> platformsReady{false};

@@ -596,6 +596,8 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         std::string lastError;
         romm::ErrorInfo lastErrorInfo{};
         double lastSpeedMBps{0.0};
+        bool queueReorderActive{false};
+        bool burnInMode{false};
         bool diagnosticsServerReachableKnown{false};
         bool diagnosticsServerReachable{false};
         bool diagnosticsProbeInFlight{false};
@@ -650,6 +652,8 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.lastError = status.lastError;
         snap.lastErrorInfo = status.lastErrorInfo;
         snap.lastSpeedMBps = status.lastSpeedMBps;
+        snap.queueReorderActive = status.queueReorderActive;
+        snap.burnInMode = status.burnInMode;
         snap.diagnosticsServerReachableKnown = status.diagnosticsServerReachableKnown;
         snap.diagnosticsServerReachable = status.diagnosticsServerReachable;
         snap.diagnosticsProbeInFlight = status.diagnosticsProbeInFlight;
@@ -821,8 +825,14 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             headerBar = {120, 72, 180, 255};
             break;
         case Status::View::DOWNLOADING:
-            SDL_SetRenderDrawColor(renderer, 90, 60, 0, 255);
-            headerBar = {140, 100, 20, 255};
+            if (snap.burnInMode) {
+                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+                headerBar = {0, 0, 0, 255};
+                footerBar = {0, 0, 0, 255};
+            } else {
+                SDL_SetRenderDrawColor(renderer, 90, 60, 0, 255);
+                headerBar = {140, 100, 20, 255};
+            }
             break;
         case Status::View::ERROR:
             SDL_SetRenderDrawColor(renderer, 90, 0, 0, 255);
@@ -918,6 +928,61 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
     for (size_t i = 0; i < rightParts.size(); ++i) {
         if (i) rightInfo += "  ";
         rightInfo += rightParts[i];
+    }
+
+    if (snap.view == Status::View::DOWNLOADING && snap.burnInMode) {
+        // Burn-in prevention mode: full black screen with a bouncing "DVD logo"-style block.
+        Uint32 nowMs = SDL_GetTicks();
+        static bool init = false;
+        static float x = 120.0f, y = 120.0f;
+        static float vx = 210.0f, vy = 165.0f;
+        static Uint32 lastMs = 0;
+        if (!init) {
+            init = true;
+            lastMs = nowMs;
+        }
+        float dt = (nowMs > lastMs) ? (float)(nowMs - lastMs) / 1000.0f : 0.0f;
+        lastMs = nowMs;
+        if (dt > 0.25f) dt = 0.25f; // avoid huge jumps on hitches
+
+        uint64_t totalBytes = snap.totalDownloadBytes;
+        uint64_t totalDoneRaw = snap.totalDownloadedBytes;
+        uint64_t curDone = snap.currentDownloadedBytes;
+        uint64_t totalDone = (curDone > totalDoneRaw) ? curDone : totalDoneRaw;
+        int pctInt = 0;
+        if (totalBytes > 0) {
+            float pctTotal = (float)totalDone / (float)std::max<uint64_t>(totalBytes, 1);
+            pctTotal = std::clamp(pctTotal, 0.0f, 1.0f);
+            pctInt = (int)(pctTotal * 100.0f);
+        }
+        std::string label = "RomM";
+        if (totalBytes > 0) label += " " + std::to_string(pctInt) + "%";
+
+        // Size the block based on glyph rendering assumptions (5x7 + spacing), scale 3.
+        const int scale = 3;
+        const int charW = (5 + 1) * scale;
+        const int charH = 7 * scale;
+        int w = (int)label.size() * charW + 18;
+        int h = charH + 16;
+        if (w < 120) w = 120;
+        if (h < 44) h = 44;
+
+        x += vx * dt;
+        y += vy * dt;
+        if (x < 0) { x = 0; vx = std::fabs(vx); }
+        if (y < 0) { y = 0; vy = std::fabs(vy); }
+        if (x + w > 1280) { x = (float)(1280 - w); vx = -std::fabs(vx); }
+        if (y + h > 720) { y = (float)(720 - h); vy = -std::fabs(vy); }
+
+        SDL_Rect box{ (int)x, (int)y, w, h };
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_SetRenderDrawColor(renderer, 18, 18, 18, 255);
+        SDL_RenderFillRect(renderer, &box);
+        SDL_SetRenderDrawColor(renderer, 245, 245, 245, 255);
+        SDL_RenderDrawRect(renderer, &box);
+        drawText(renderer, box.x + 10, box.y + 10, label, SDL_Color{245,245,245,255}, scale);
+        return;
     }
 
     if (snap.view == Status::View::DOWNLOADING && totalBytes > 0) {
@@ -1454,12 +1519,18 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             controls = "A=queue+open B=back Y=queue Plus=exit";
             break;
         case Status::View::QUEUE:
-            controls = snap.downloadWorkerRunning
-                ? "X=view downloading B=back Plus=exit D-Pad=scroll hold"
-                : "X=start downloads B=back Plus=exit D-Pad=scroll hold";
+            if (snap.queueReorderActive) {
+                controls = snap.downloadWorkerRunning
+                    ? "DPad=move A=drop B=drop Minus=delete X=view downloading Plus=exit"
+                    : "DPad=move A=drop B=drop Minus=delete X=start downloads Plus=exit";
+            } else {
+                controls = snap.downloadWorkerRunning
+                    ? "A=select DPad=scroll X=view downloading B=back Plus=exit"
+                    : "A=select DPad=scroll X=start downloads B=back Plus=exit";
+            }
             break;
         case Status::View::DOWNLOADING:
-            controls = "B=back Plus=exit";
+            controls = snap.burnInMode ? "R=burn-in off B=back Plus=exit" : "R=burn-in B=back Plus=exit";
             break;
         case Status::View::ERROR:
             controls = "B=exit Plus=exit";
@@ -2435,7 +2506,30 @@ int main(int argc, char** argv) {
             } else if (status.currentView == Status::View::ROMS || status.currentView == Status::View::DETAIL) {
                 status.selectedRomIndex = std::max(0, std::min((int)status.roms.size() - 1, status.selectedRomIndex + dir));
             } else if (status.currentView == Status::View::QUEUE) {
-                status.selectedQueueIndex = std::max(0, std::min((int)status.downloadQueue.size() - 1, status.selectedQueueIndex + dir));
+                if (status.queueReorderActive) {
+                    if (status.downloadQueue.empty()) return;
+                    // Don't allow reordering across any active/non-pending prefix.
+                    int barrier = 0;
+                    while (barrier < (int)status.downloadQueue.size() &&
+                           status.downloadQueue[(size_t)barrier].state != romm::QueueState::Pending) {
+                        barrier++;
+                    }
+                    if (barrier >= (int)status.downloadQueue.size()) return;
+                    if (status.selectedQueueIndex < barrier) status.selectedQueueIndex = barrier;
+                    int idx = status.selectedQueueIndex;
+                    int next = idx + dir;
+                    if (next < barrier || next >= (int)status.downloadQueue.size()) return;
+                    // Only pending items are reorderable; keep it strict for worker safety.
+                    if (status.downloadQueue[(size_t)idx].state != romm::QueueState::Pending ||
+                        status.downloadQueue[(size_t)next].state != romm::QueueState::Pending) {
+                        return;
+                    }
+                    std::swap(status.downloadQueue[(size_t)idx], status.downloadQueue[(size_t)next]);
+                    status.selectedQueueIndex = next;
+                    status.downloadQueueRevision++;
+                } else {
+                    status.selectedQueueIndex = std::max(0, std::min((int)status.downloadQueue.size() - 1, status.selectedQueueIndex + dir));
+                }
             }
         };
         auto recomputeTotals = [&]() {
@@ -2544,6 +2638,46 @@ int main(int argc, char** argv) {
                     {
                         std::lock_guard<std::mutex> lock(status.mutex);
                         currentView = status.currentView;
+                    }
+                    if (currentView == Status::View::QUEUE) {
+                        bool didToggle = false;
+                        bool nowActive = false;
+                        {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            if (!status.downloadQueue.empty()) {
+                                if (!status.queueReorderActive) {
+                                    // Only allow reordering within the pending tail (don't cross active download prefix).
+                                    int barrier = 0;
+                                    while (barrier < (int)status.downloadQueue.size() &&
+                                           status.downloadQueue[(size_t)barrier].state != romm::QueueState::Pending) {
+                                        barrier++;
+                                    }
+                                    if (barrier >= (int)status.downloadQueue.size()) {
+                                        romm::logLine("Queue reorder: no pending items to move.");
+                                    } else {
+                                        if (status.selectedQueueIndex < barrier) status.selectedQueueIndex = barrier;
+                                        // Require pending state for selection.
+                                        if (status.downloadQueue[(size_t)status.selectedQueueIndex].state == romm::QueueState::Pending) {
+                                            status.queueReorderActive = true;
+                                            didToggle = true;
+                                            nowActive = true;
+                                        } else {
+                                            romm::logLine("Queue reorder: selected item is not pending; cannot move.");
+                                        }
+                                    }
+                                } else {
+                                    status.queueReorderActive = false;
+                                    didToggle = true;
+                                    nowActive = false;
+                                }
+                            }
+                        }
+                        if (didToggle) {
+                            if (!nowActive) persistQueueState();
+                            romm::logLine(std::string("Queue reorder ") + (nowActive ? "enabled" : "disabled") +
+                                          " idx=" + std::to_string(status.selectedQueueIndex));
+                        }
+                        break;
                     }
                     if (currentView == Status::View::PLATFORMS) {
                         int sel = -1;
@@ -2741,7 +2875,8 @@ int main(int argc, char** argv) {
                                   } else {
                                       status.romsRevision++;
                                   }
-                                  status.selectedQueueIndex = (int)status.downloadQueue.size() - 1;
+                                  status.selectedQueueIndex = 0;
+                                  status.queueReorderActive = false;
                                   status.downloadCompleted = false; // new work pending, clear stale banner
                                   status.prevQueueView = Status::View::DETAIL;
                                   status.currentView = Status::View::QUEUE;
@@ -2760,6 +2895,39 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case romm::Action::OpenSearch: {
+                    // Minus: ROM search (ROMS view) OR queue delete (QUEUE view when reorder-active).
+                    {
+                        bool didDelete = false;
+                        std::string deletedTitle;
+                        {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            if (status.currentView == Status::View::QUEUE && status.queueReorderActive) {
+                                int idx = status.selectedQueueIndex;
+                                if (idx >= 0 && idx < (int)status.downloadQueue.size()) {
+                                    const auto& qi = status.downloadQueue[(size_t)idx];
+                                    if (qi.state == romm::QueueState::Pending) {
+                                        deletedTitle = qi.game.title;
+                                        status.downloadQueue.erase(status.downloadQueue.begin() + idx);
+                                        status.downloadQueueRevision++;
+                                        status.queueReorderActive = false;
+                                        if (status.selectedQueueIndex >= (int)status.downloadQueue.size()) {
+                                            status.selectedQueueIndex = status.downloadQueue.empty() ? 0 : (int)status.downloadQueue.size() - 1;
+                                        }
+                                        didDelete = true;
+                                    } else {
+                                        romm::logLine("Queue delete ignored (only pending items can be removed).");
+                                    }
+                                }
+                            }
+                        }
+                        if (didDelete) {
+                            recomputeTotals();
+                            persistQueueState();
+                            romm::logLine("Removed from queue: " + deletedTitle);
+                        }
+                        if (didDelete) break;
+                    }
+
                     std::string curQuery;
                     bool inRoms = false;
                     std::string platformId;
@@ -2811,6 +2979,21 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case romm::Action::OpenDiagnostics: {
+                    {
+                        bool toggled = false;
+                        bool now = false;
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        if (status.currentView == Status::View::DOWNLOADING) {
+                            status.burnInMode = !status.burnInMode;
+                            toggled = true;
+                            now = status.burnInMode;
+                        }
+                        if (toggled) {
+                            romm::logLine(std::string("Burn-in prevention screen ") + (now ? "enabled" : "disabled") + ".");
+                            viewChangedThisFrame = true;
+                            break;
+                        }
+                    }
                     bool shouldProbe = false;
                     {
                         std::lock_guard<std::mutex> lock(status.mutex);
@@ -2834,6 +3017,7 @@ int main(int argc, char** argv) {
                         cur = status.currentView;
                     }
                     romm::logLine(std::string("Back pressed in view=") + viewName(cur));
+                    bool persistQueueAfter = false;
                     {
                         std::lock_guard<std::mutex> lock(status.mutex);
                         // Allow cancelling a platform ROM fetch while staying on PLATFORMS.
@@ -2865,16 +3049,26 @@ int main(int argc, char** argv) {
                             viewChangedThisFrame = true;
                         } else if (cur == Status::View::DOWNLOADING) {
                             status.currentView = Status::View::QUEUE;
+                            status.burnInMode = false;
                             gViewTraceFrames = 8;
                             romm::logLine("Back to QUEUE from DOWNLOADING.");
                             viewChangedThisFrame = true;
                         } else if (cur == Status::View::QUEUE) {
-                            Status::View dest = status.prevQueueView;
-                            if (dest == Status::View::QUEUE || dest == Status::View::DOWNLOADING) dest = Status::View::PLATFORMS;
-                            status.currentView = dest;
-                            gViewTraceFrames = 8;
-                            romm::logLine(std::string("Back from QUEUE to ") + viewName(dest) + ".");
-                            viewChangedThisFrame = true;
+                            if (status.queueReorderActive) {
+                                status.queueReorderActive = false;
+                                // Persist order changes as the user "drops" the selection.
+                                // (No per-swap disk writes; this keeps SD I/O low.)
+                                romm::logLine("Queue reorder disabled.");
+                                persistQueueAfter = true;
+                                viewChangedThisFrame = true;
+                            } else {
+                                Status::View dest = status.prevQueueView;
+                                if (dest == Status::View::QUEUE || dest == Status::View::DOWNLOADING) dest = Status::View::PLATFORMS;
+                                status.currentView = dest;
+                                gViewTraceFrames = 8;
+                                romm::logLine(std::string("Back from QUEUE to ") + viewName(dest) + ".");
+                                viewChangedThisFrame = true;
+                            }
                         } else if (cur == Status::View::PLATFORMS) {
                             romm::logLine("Back on PLATFORMS ignored.");
                         } else if (cur == Status::View::DIAGNOSTICS) {
@@ -2886,6 +3080,7 @@ int main(int argc, char** argv) {
                             running = false;
                         }
                     }
+                    if (persistQueueAfter) persistQueueState();
                     break;
                 }
                 case romm::Action::OpenQueue:
@@ -2898,8 +3093,8 @@ int main(int argc, char** argv) {
                             status.prevQueueView = status.currentView;
                         }
                         status.currentView = Status::View::QUEUE;
-                        if (status.selectedQueueIndex >= (int)status.downloadQueue.size())
-                            status.selectedQueueIndex = status.downloadQueue.empty() ? 0 : (int)status.downloadQueue.size() - 1;
+                        status.selectedQueueIndex = 0;
+                        status.queueReorderActive = false;
                         romm::logLine(std::string("Opened queue view from ") + viewName(status.prevQueueView) +
                                       " items=" + std::to_string(status.downloadQueue.size()));
                     }
@@ -2926,6 +3121,7 @@ int main(int argc, char** argv) {
                                 {
                                     std::lock_guard<std::mutex> lock(status.mutex);
                                     status.currentView = Status::View::DOWNLOADING;
+                                    status.burnInMode = false;
                                     status.currentDownloadIndex.store(0);
                                     status.currentDownloadedBytes.store(0);
                                     status.totalDownloadedBytes.store(0);
