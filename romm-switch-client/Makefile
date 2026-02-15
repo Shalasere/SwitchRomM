@@ -157,6 +157,12 @@ else
 
 DEPENDS := $(OFILES:.o=.d)
 
+# The recursive build (`make -C build -f ../Makefile`) relies on the default
+# goal being `all`. Keep it explicit so adding other helper rules above `all`
+# doesn't accidentally make the default goal an object file (and stop before
+# linking the .elf/.nro).
+.DEFAULT_GOAL := all
+
 # If build flags/version in the top-level Makefile change (e.g. APP_VERSION),
 # force object/NACP rebuilds. Without this, Make may reuse old .o files and the
 # app can report an older ROMM_APP_VERSION even after bumping APP_VERSION.
