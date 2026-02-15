@@ -3809,6 +3809,8 @@ exit_app:
     // Avoid unmounting SD here: the logger holds an ofstream, and unmounting while handles
     // are still live can destabilize hbmenu on return. libnx will clean up mounts on exit.
     romm::shutdownLogFile();
+    // Ensure libcurl/TLS cleanup runs before we tear down network services.
+    romm::httpShutdown();
     nifmExit();
     socketExit();
     return 0;

@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 
 #ifndef UNIT_TEST
@@ -351,7 +352,21 @@ struct CurlEasyHandle {
     }
 };
 
-thread_local CURL* gCurlKeepAliveEasy = nullptr;
+// Use a wrapper so thread exit cleans up keep-alive handles (important for worker threads).
+struct ThreadCurlKeepAliveEasy {
+    CURL* handle{nullptr};
+    ~ThreadCurlKeepAliveEasy() {
+        if (handle) {
+            curl_easy_cleanup(handle);
+            handle = nullptr;
+        }
+    }
+};
+thread_local ThreadCurlKeepAliveEasy gCurlKeepAliveEasy;
+
+static bool gCurlGlobalInitOk = false;
+static bool gCurlGlobalCleaned = false;
+static std::mutex gCurlGlobalMutex;
 
 struct CurlHeaderState {
     std::string raw;
@@ -393,6 +408,7 @@ static bool ensureCurlGlobalInit(std::string& err) {
     if (!initAttempted) {
         initAttempted = true;
         initOk = (curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
+        gCurlGlobalInitOk = initOk;
     }
     if (!initOk) err = "curl_global_init failed";
     return initOk;
@@ -400,12 +416,12 @@ static bool ensureCurlGlobalInit(std::string& err) {
 
 static bool acquireCurlHandle(bool keepAlive, CurlEasyHandle& out, std::string& err) {
     if (keepAlive) {
-        if (!gCurlKeepAliveEasy) gCurlKeepAliveEasy = curl_easy_init();
-        if (!gCurlKeepAliveEasy) {
+        if (!gCurlKeepAliveEasy.handle) gCurlKeepAliveEasy.handle = curl_easy_init();
+        if (!gCurlKeepAliveEasy.handle) {
             err = "curl_easy_init failed";
             return false;
         }
-        out.handle = gCurlKeepAliveEasy;
+        out.handle = gCurlKeepAliveEasy.handle;
         out.owned = false;
         curl_easy_reset(out.handle);
         return true;
@@ -885,6 +901,24 @@ bool httpRequestStreamed(const std::string& method,
     (void)onData;
     err = "httpRequestStreamed unavailable in UNIT_TEST";
     return false;
+#endif
+}
+
+void httpShutdown() {
+#ifndef UNIT_TEST
+    // Note: thread-local keep-alive handles on worker threads are cleaned up by their TLS destructor.
+    // Here we only do best-effort cleanup for the current thread + libcurl global cleanup.
+    if (gCurlKeepAliveEasy.handle) {
+        curl_easy_cleanup(gCurlKeepAliveEasy.handle);
+        gCurlKeepAliveEasy.handle = nullptr;
+    }
+    std::lock_guard<std::mutex> lock(gCurlGlobalMutex);
+    if (gCurlGlobalCleaned) return;
+    if (gCurlGlobalInitOk) {
+        curl_global_cleanup();
+    }
+    gCurlGlobalCleaned = true;
+    gCurlGlobalInitOk = false;
 #endif
 }
 

@@ -64,4 +64,8 @@ bool httpRequestStreamed(const std::string& method,
                          const std::function<bool(const char*, size_t)>& onData,
                          std::string& err);
 
+// Best-effort shutdown for the HTTP stack (libcurl TLS/global state).
+// Intended to be called during app shutdown after all background HTTP workers have stopped.
+void httpShutdown();
+
 } // namespace romm
