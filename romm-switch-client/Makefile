@@ -157,6 +157,11 @@ else
 
 DEPENDS := $(OFILES:.o=.d)
 
+# If build flags/version in the top-level Makefile change (e.g. APP_VERSION),
+# force object/NACP rebuilds. Without this, Make may reuse old .o files and the
+# app can report an older ROMM_APP_VERSION even after bumping APP_VERSION.
+$(OFILES) $(OUTPUT).nacp : $(TOPDIR)/Makefile
+
 ifeq ($(strip $(APP_JSON)),)
 all : $(OUTPUT).nro
 ifeq ($(strip $(NO_NACP)),)
