@@ -40,7 +40,9 @@ extern "C" void stbi_image_free(void *retval_from_stbi_load);
 #include "romm/logger.hpp"
 #include "romm/http_common.hpp"
 #include "romm/update.hpp"
+#include "romm/self_update.hpp"
 #include "romm/version.hpp"
+#include "romm/filesystem.hpp"
 #include "romm/errors.hpp"
 #include "romm/downloader.hpp"
 #include "romm/cover_loader.hpp"
@@ -1794,55 +1796,19 @@ int main(int argc, char** argv) {
     romm::logLine("Startup.");
 
     std::string selfNroPath;
-    std::string stagedNroPath;
+    constexpr const char* kUpdatePendingPath = "sdmc:/switch/romm_switch_client/update_pending.txt";
 
-    // Determine our running NRO path (used for staging self-updates).
-    // On Switch homebrew, argv[0] is typically the full sdmc:/... path to the .nro.
-    if (argc > 0 && argv && argv[0]) {
-        selfNroPath = argv[0];
-    }
-    if (selfNroPath.find(".nro") == std::string::npos) {
-        // Fallback to the default expected install path.
-        selfNroPath = "sdmc:/switch/romm_switch_client/romm-switch-client.nro";
-    }
-    stagedNroPath = selfNroPath + ".new";
+    // Determine our running NRO path. On Switch homebrew, argv[0] is typically sdmc:/.../app.nro.
+    // Enforce a canonical install location under /switch/ so apply-on-restart is predictable.
+    if (argc > 0 && argv && argv[0]) selfNroPath = argv[0];
+    selfNroPath = romm::canonicalSelfNroPath(selfNroPath);
     romm::logLine("Self NRO path: " + selfNroPath);
-
-    auto fileLooksLikeNro = [&](const std::string& path) -> bool {
-        std::FILE* f = std::fopen(path.c_str(), "rb");
-        if (!f) return false;
-        char magic[4]{};
-        size_t n = std::fread(magic, 1, sizeof(magic), f);
-        std::fclose(f);
-        return n == sizeof(magic) && magic[0] == 'N' && magic[1] == 'R' && magic[2] == 'O' && magic[3] == '0';
-    };
 
     // If a staged update exists from a prior session, apply it before starting the UI.
     {
-        std::error_code ec;
-        const bool stagedExists = std::filesystem::exists(stagedNroPath, ec);
-        if (!ec && stagedExists && fileLooksLikeNro(stagedNroPath)) {
-            std::string bak = selfNroPath + ".bak";
-            // Best-effort remove old backup.
-            std::filesystem::remove(bak, ec);
-            ec.clear();
-            std::filesystem::rename(selfNroPath, bak, ec);
-            if (ec) {
-                romm::logLine("Self-update apply: could not backup current NRO: " + ec.message());
-            }
-            ec.clear();
-            std::filesystem::rename(stagedNroPath, selfNroPath, ec);
-            if (ec) {
-                romm::logLine("Self-update apply failed: " + ec.message());
-                // Try to restore backup if we created one.
-                std::error_code ec2;
-                if (std::filesystem::exists(bak, ec2) && !ec2) {
-                    std::filesystem::rename(bak, selfNroPath, ec2);
-                }
-            } else {
-                romm::logLine("Self-update applied successfully.");
-            }
-        }
+        (void)romm::applyPendingSelfUpdate(selfNroPath, kUpdatePendingPath, [](const std::string& msg) {
+            romm::logLine(msg);
+        });
     }
 
     bool romfsReady = false;
@@ -1870,12 +1836,8 @@ int main(int argc, char** argv) {
     Config config;
     Status status;
     {
-        std::error_code ec;
-        bool stagedExists = std::filesystem::exists(stagedNroPath, ec) && !ec;
         std::lock_guard<std::mutex> lock(status.mutex);
-        status.updateStagedPath = stagedNroPath;
-        status.updateDownloaded = stagedExists;
-        status.updateStatus = stagedExists ? "Update staged; restart app to apply." : "Press A to check for updates.";
+        status.updateStatus = "Press A to check for updates.";
     }
     struct CachedPlatformRoms {
         std::vector<romm::Game> games;
@@ -2381,6 +2343,9 @@ int main(int argc, char** argv) {
 
     auto submitUpdateDownload = [&]() {
         UpdateDownloadReq req{};
+        const std::string updateDir = romm::computeUpdateDirFromDownloadDir(config.downloadDir);
+        romm::ensureDirectory(updateDir);
+        const std::string defaultStagedPath = romm::defaultStagedUpdatePath(updateDir);
         {
             std::lock_guard<std::mutex> lock(status.mutex);
             if (!status.updateAvailable || status.updateAssetUrl.empty()) {
@@ -2395,7 +2360,9 @@ int main(int argc, char** argv) {
             req.generation = updateGeneration;
             updateDownloadGenSubmitted = req.generation;
             req.url = status.updateAssetUrl;
-            req.outPath = stagedNroPath;
+            // Always stage to the configured cache location (not the startup-only pending path).
+            req.outPath = defaultStagedPath;
+            status.updateStagedPath = req.outPath;
             status.updateDownloadInFlight = true;
             status.updateDownloaded = false;
             status.updateError.clear();
@@ -2530,15 +2497,7 @@ int main(int argc, char** argv) {
         }
 
         // Basic sanity check: NRO magic.
-        auto fileLooksLikeNro = [&](const std::string& path) -> bool {
-            std::FILE* rf = std::fopen(path.c_str(), "rb");
-            if (!rf) return false;
-            char magic[4]{};
-            size_t rn = std::fread(magic, 1, sizeof(magic), rf);
-            std::fclose(rf);
-            return rn == sizeof(magic) && magic[0] == 'N' && magic[1] == 'R' && magic[2] == 'O' && magic[3] == '0';
-        };
-        if (!fileLooksLikeNro(tmp)) {
+        if (!romm::fileLooksLikeNro(tmp)) {
             out.ok = false;
             out.error = "Downloaded file does not look like a valid NRO.";
             out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Data);
@@ -2557,6 +2516,14 @@ int main(int argc, char** argv) {
             out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Filesystem);
             std::error_code ec2;
             std::filesystem::remove(tmp, ec2);
+            return out;
+        }
+
+        // Write the pending pointer so the update can be applied on next launch.
+        if (!romm::writeTextFileEnsureParent(kUpdatePendingPath, req.outPath)) {
+            out.ok = false;
+            out.error = std::string("Failed to record pending update (") + kUpdatePendingPath + ")";
+            out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Filesystem);
             return out;
         }
 
@@ -2623,6 +2590,30 @@ int main(int argc, char** argv) {
         romm::logLine(" server_url=" + config.serverUrl);
         romm::logLine(" download_dir=" + config.downloadDir);
         romm::logLine(std::string(" fat32_safe=") + (config.fat32Safe ? "true" : "false"));
+
+        // Updater storage lives under the download cache root to keep /switch tidy.
+        // We also keep a fixed pending pointer file under /switch/romm_switch_client/.
+        {
+            const std::string updateDir = romm::computeUpdateDirFromDownloadDir(config.downloadDir);
+            romm::ensureDirectory(updateDir);
+            const std::string defaultStagedPath = romm::defaultStagedUpdatePath(updateDir);
+            const std::string bakPath = romm::defaultBackupPath(updateDir);
+
+            std::string pending;
+            bool pendingOk = romm::readTextFileTrim(kUpdatePendingPath, pending) && !pending.empty();
+            const std::string effectiveStagedPath = pendingOk ? pending : defaultStagedPath;
+            bool stagedExists = romm::fileExists(effectiveStagedPath);
+
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.updateStagedPath = effectiveStagedPath;
+            status.updateDownloaded = pendingOk || stagedExists;
+            status.updateStatus = status.updateDownloaded ? "Update staged; restart app to apply." : status.updateStatus;
+            // Reuse fields to show where backups live; helps debugging.
+            if (status.updateDownloaded) {
+                status.updateAssetName = status.updateAssetName.empty() ? "romm-switch-client.nro" : status.updateAssetName;
+            }
+            (void)bakPath;
+        }
         // Load platform prefs and stash in status for planner use.
         {
             std::lock_guard<std::mutex> lock(status.mutex);
