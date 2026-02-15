@@ -536,7 +536,12 @@ static bool setupCurlRequest(CURL* easy,
         err = "Failed to set request URL";
         return false;
     }
-    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, options.followRedirects ? 1L : 0L);
+    if (options.followRedirects) {
+        curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 5L);
+        // Allow redirecting only to HTTP(S).
+        curl_easy_setopt(easy, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    }
     curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(easy, CURLOPT_FAILONERROR, 0L);

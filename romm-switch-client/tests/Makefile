@@ -17,6 +17,8 @@ SOURCES := ../source/api.cpp \
            ../source/filesystem.cpp \
            ../source/manifest.cpp \
            ../source/http_common.cpp \
+           ../source/update.cpp \
+           ../source/self_update.cpp \
            ../source/queue_store.cpp \
            ../source/cover_loader.cpp \
            ../source/stb_image_impl.cpp \
@@ -37,6 +39,8 @@ SOURCES := ../source/api.cpp \
            test_manifest_scan.cpp \
            test_worker_reap.cpp \
            test_queue_store.cpp \
+           test_update.cpp \
+           test_self_update.cpp \
            logger_stub.cpp
 
 all: $(TARGET)

@@ -38,6 +38,11 @@ extern "C" void stbi_image_free(void *retval_from_stbi_load);
 #include "romm/input.hpp"
 #include "romm/job_manager.hpp"
 #include "romm/logger.hpp"
+#include "romm/http_common.hpp"
+#include "romm/update.hpp"
+#include "romm/self_update.hpp"
+#include "romm/version.hpp"
+#include "romm/filesystem.hpp"
 #include "romm/errors.hpp"
 #include "romm/downloader.hpp"
 #include "romm/cover_loader.hpp"
@@ -98,6 +103,7 @@ static const char* viewName(Status::View v) {
         case Status::View::DOWNLOADING: return "DOWNLOADING";
         case Status::View::ERROR: return "ERROR";
         case Status::View::DIAGNOSTICS: return "DIAGNOSTICS";
+        case Status::View::UPDATER: return "UPDATER";
         default: return "UNKNOWN";
     }
 }
@@ -603,6 +609,20 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         bool diagnosticsProbeInFlight{false};
         uint32_t diagnosticsLastProbeMs{0};
         std::string diagnosticsLastProbeDetail;
+        bool updateCheckInFlight{false};
+        bool updateChecked{false};
+        bool updateAvailable{false};
+        std::string updateLatestTag;
+        std::string updateLatestName;
+        std::string updateLatestPublishedAt;
+        std::string updateReleaseHtmlUrl;
+        std::string updateAssetName;
+        uint64_t updateAssetSizeBytes{0};
+        bool updateDownloadInFlight{false};
+        bool updateDownloaded{false};
+        std::string updateStagedPath;
+        std::string updateStatus;
+        std::string updateError;
     } snap;
 
     static std::unordered_map<std::string, romm::QueueState> sQueueStateById;
@@ -659,6 +679,20 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         snap.diagnosticsProbeInFlight = status.diagnosticsProbeInFlight;
         snap.diagnosticsLastProbeMs = status.diagnosticsLastProbeMs;
         snap.diagnosticsLastProbeDetail = status.diagnosticsLastProbeDetail;
+        snap.updateCheckInFlight = status.updateCheckInFlight;
+        snap.updateChecked = status.updateChecked;
+        snap.updateAvailable = status.updateAvailable;
+        snap.updateLatestTag = status.updateLatestTag;
+        snap.updateLatestName = status.updateLatestName;
+        snap.updateLatestPublishedAt = status.updateLatestPublishedAt;
+        snap.updateReleaseHtmlUrl = status.updateReleaseHtmlUrl;
+        snap.updateAssetName = status.updateAssetName;
+        snap.updateAssetSizeBytes = status.updateAssetSizeBytes;
+        snap.updateDownloadInFlight = status.updateDownloadInFlight;
+        snap.updateDownloaded = status.updateDownloaded;
+        snap.updateStagedPath = status.updateStagedPath;
+        snap.updateStatus = status.updateStatus;
+        snap.updateError = status.updateError;
 
         // Copy only the visible slice for large lists to avoid per-frame O(N) copies.
         if (snap.view == Status::View::ROMS) {
@@ -799,6 +833,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             case Status::View::DOWNLOADING: romm::logLine("View: DOWNLOADING"); break;
             case Status::View::ERROR: romm::logLine("View: ERROR"); break;
             case Status::View::DIAGNOSTICS: romm::logLine("View: DIAGNOSTICS"); break;
+            case Status::View::UPDATER: romm::logLine("View: UPDATER"); break;
             default: break;
         }
         gLastLoggedView = snap.view;
@@ -841,6 +876,10 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         case Status::View::DIAGNOSTICS:
             SDL_SetRenderDrawColor(renderer, 30, 70, 40, 255);
             headerBar = {40, 120, 70, 255};
+            break;
+        case Status::View::UPDATER:
+            SDL_SetRenderDrawColor(renderer, 16, 20, 70, 255);
+            headerBar = {50, 70, 170, 255};
             break;
     }
     SDL_RenderClear(renderer);
@@ -1481,6 +1520,71 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
         drawText(renderer, box.x + 16, box.y + box.h - 52,
                  "A=export summary to log  B=back  R=refresh probe",
                  fg, 2);
+    } else if (snap.view == Status::View::UPDATER) {
+        header = "UPDATER";
+        SDL_Color fg{255,255,255,255};
+        SDL_Color sub{220,230,255,255};
+        SDL_Color warn{255,210,160,255};
+        SDL_Color ok{190,255,210,255};
+        SDL_Color bad{255,170,170,255};
+
+        SDL_Rect box{64, 96, 1280 - 128, 720 - 96 - 64 - 48};
+        SDL_SetRenderDrawColor(renderer, 10, 12, 40, 230);
+        SDL_RenderFillRect(renderer, &box);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 90);
+        SDL_RenderDrawRect(renderer, &box);
+
+        int y = box.y + 18;
+        drawText(renderer, box.x + 16, y, "Update", fg, 2); y += 26;
+        drawText(renderer, box.x + 16, y, std::string("Current: v") + romm::appVersion(), sub, 2); y += 24;
+
+        std::string latestLine = "Latest: (not checked)";
+        if (snap.updateCheckInFlight) {
+            latestLine = "Latest: checking...";
+        } else if (snap.updateChecked) {
+            latestLine = "Latest: " + (snap.updateLatestTag.empty() ? std::string("(unknown)") : snap.updateLatestTag);
+            if (!snap.updateLatestPublishedAt.empty()) {
+                latestLine += "  " + ellipsize(snap.updateLatestPublishedAt, 20);
+            }
+        }
+        drawText(renderer, box.x + 16, y, latestLine, sub, 2); y += 30;
+
+        if (!snap.updateError.empty()) {
+            drawText(renderer, box.x + 16, y, "Error: " + ellipsize(snap.updateError, 64), bad, 2); y += 26;
+        } else if (!snap.updateStatus.empty()) {
+            drawText(renderer, box.x + 16, y, "Status: " + ellipsize(snap.updateStatus, 64), warn, 2); y += 26;
+        }
+
+        if (snap.updateChecked) {
+            if (snap.updateAvailable) {
+                std::string up = "Update available.";
+                if (!snap.updateLatestName.empty()) up += "  " + ellipsize(snap.updateLatestName, 40);
+                drawText(renderer, box.x + 16, y, up, ok, 2); y += 24;
+                if (!snap.updateAssetName.empty()) {
+                    drawText(renderer, box.x + 16, y,
+                             "Asset: " + ellipsize(snap.updateAssetName, 42) +
+                             "  " + humanSize(snap.updateAssetSizeBytes),
+                             sub, 2);
+                    y += 24;
+                }
+            } else {
+                drawText(renderer, box.x + 16, y, "You're up to date.", ok, 2); y += 24;
+            }
+        }
+
+        if (snap.updateDownloaded) {
+            drawText(renderer, box.x + 16, y, "Update downloaded.", ok, 2); y += 24;
+            if (!snap.updateStagedPath.empty()) {
+                drawText(renderer, box.x + 16, y, "Staged: " + ellipsize(snap.updateStagedPath, 62), sub, 2); y += 24;
+            }
+            drawText(renderer, box.x + 16, y, "Restart the app to apply.", warn, 2); y += 24;
+        } else if (snap.updateDownloadInFlight) {
+            drawText(renderer, box.x + 16, y, "Downloading update...", warn, 2); y += 24;
+        }
+
+        drawText(renderer, box.x + 16, box.y + box.h - 52,
+                 "A=check updates  X=download update  B=back  Plus=exit",
+                 fg, 2);
     } else if (snap.view == Status::View::ERROR) {
         header = "ERROR";
         SDL_Color fg{255,255,255,255};
@@ -1572,7 +1676,7 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
 
     switch (snap.view) {
         case Status::View::PLATFORMS:
-            controls = "A=open platform B=back Y=queue R=diagnostics Plus=exit D-Pad=scroll hold";
+            controls = "A=open platform B=back Y=queue R=diagnostics L=updater Plus=exit D-Pad=scroll hold";
             break;
         case Status::View::ROMS:
             controls = "A=details B=back Y=queue Minus=search DPad L/R=filter/sort";
@@ -1599,6 +1703,9 @@ static void renderStatus(SDL_Renderer* renderer, const Status& status, const Con
             break;
         case Status::View::DIAGNOSTICS:
             controls = "A=export summary B=back R=refresh Plus=exit";
+            break;
+        case Status::View::UPDATER:
+            controls = "A=check X=download B=back Plus=exit";
             break;
         default:
             controls = "Plus=exit";
@@ -1688,6 +1795,22 @@ int main(int argc, char** argv) {
     romm::initLogFile();
     romm::logLine("Startup.");
 
+    std::string selfNroPath;
+    constexpr const char* kUpdatePendingPath = "sdmc:/switch/romm_switch_client/update_pending.txt";
+
+    // Determine our running NRO path. On Switch homebrew, argv[0] is typically sdmc:/.../app.nro.
+    // Enforce a canonical install location under /switch/ so apply-on-restart is predictable.
+    if (argc > 0 && argv && argv[0]) selfNroPath = argv[0];
+    selfNroPath = romm::canonicalSelfNroPath(selfNroPath);
+    romm::logLine("Self NRO path: " + selfNroPath);
+
+    // If a staged update exists from a prior session, apply it before starting the UI.
+    {
+        (void)romm::applyPendingSelfUpdate(selfNroPath, kUpdatePendingPath, [](const std::string& msg) {
+            romm::logLine(msg);
+        });
+    }
+
     bool romfsReady = false;
     Result rromfs = romfsInit();
     if (R_SUCCEEDED(rromfs)) {
@@ -1712,6 +1835,10 @@ int main(int argc, char** argv) {
     constexpr size_t kRemoteSearchLimit = 250;
     Config config;
     Status status;
+    {
+        std::lock_guard<std::mutex> lock(status.mutex);
+        status.updateStatus = "Press A to check for updates.";
+    }
     struct CachedPlatformRoms {
         std::vector<romm::Game> games;
         std::string slug;
@@ -1780,9 +1907,39 @@ int main(int argc, char** argv) {
         std::string detail;
         romm::ErrorInfo errorInfo{};
     };
+    struct UpdateCheckReq {
+        uint64_t generation{0};
+    };
+    struct UpdateCheckResult {
+        uint64_t generation{0};
+        bool ok{false};
+        romm::GitHubRelease release;
+        romm::GitHubAsset asset;
+        bool updateAvailable{false};
+        std::string error;
+        romm::ErrorInfo errorInfo{};
+    };
+    struct UpdateDownloadReq {
+        uint64_t generation{0};
+        std::string url;
+        std::string outPath;
+    };
+    struct UpdateDownloadResult {
+        uint64_t generation{0};
+        bool ok{false};
+        std::string outPath;
+        uint64_t bytes{0};
+        std::string error;
+        romm::ErrorInfo errorInfo{};
+    };
     romm::LatestJobWorker<PendingRomFetch, RomFetchResult> romFetchJobs;
     romm::LatestJobWorker<PendingRemoteSearch, RemoteSearchResult> remoteSearchJobs;
     romm::LatestJobWorker<DiagProbeReq, DiagProbeResult> diagProbeJobs;
+    romm::LatestJobWorker<UpdateCheckReq, UpdateCheckResult> updateCheckJobs;
+    romm::LatestJobWorker<UpdateDownloadReq, UpdateDownloadResult> updateDownloadJobs;
+    uint64_t updateGeneration = 0;
+    uint64_t updateCheckGenSubmitted = 0;
+    uint64_t updateDownloadGenSubmitted = 0;
     std::string cfgError;
     romm::ErrorInfo cfgErrInfo;
     bool running = true;
@@ -2163,11 +2320,214 @@ int main(int argc, char** argv) {
         diagProbeJobs.submit(req);
     };
 
+    constexpr const char* kUpdateRepoOwner = "Shalasere";
+    constexpr const char* kUpdateRepoName = "SwitchRomM";
+    const std::string kUpdateLatestUrl =
+        std::string("https://api.github.com/repos/") + kUpdateRepoOwner + "/" + kUpdateRepoName + "/releases/latest";
+
+    auto submitUpdateCheck = [&]() {
+        UpdateCheckReq req{};
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            updateGeneration++;
+            req.generation = updateGeneration;
+            updateCheckGenSubmitted = req.generation;
+            status.updateCheckInFlight = true;
+            status.updateChecked = false;
+            status.updateAvailable = false;
+            status.updateError.clear();
+            status.updateStatus = "Checking GitHub releases...";
+        }
+        updateCheckJobs.submit(req);
+    };
+
+    auto submitUpdateDownload = [&]() {
+        UpdateDownloadReq req{};
+        const std::string updateDir = romm::computeUpdateDirFromDownloadDir(config.downloadDir);
+        romm::ensureDirectory(updateDir);
+        const std::string defaultStagedPath = romm::defaultStagedUpdatePath(updateDir);
+        {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            if (!status.updateAvailable || status.updateAssetUrl.empty()) {
+                status.updateStatus = "No update available to download.";
+                return;
+            }
+            if (status.updateDownloadInFlight) {
+                status.updateStatus = "Update download already in progress.";
+                return;
+            }
+            updateGeneration++;
+            req.generation = updateGeneration;
+            updateDownloadGenSubmitted = req.generation;
+            req.url = status.updateAssetUrl;
+            // Always stage to the configured cache location (not the startup-only pending path).
+            req.outPath = defaultStagedPath;
+            status.updateStagedPath = req.outPath;
+            status.updateDownloadInFlight = true;
+            status.updateDownloaded = false;
+            status.updateError.clear();
+            status.updateStatus = "Downloading update...";
+        }
+        updateDownloadJobs.submit(req);
+    };
+
     romFetchJobs.start(runRomFetch);
     remoteSearchJobs.start(runRemoteSearch, 120);
     diagProbeJobs.start([&](const DiagProbeReq& req) -> DiagProbeResult {
         DiagProbeResult out = runDiagProbe();
         out.generation = req.generation;
+        return out;
+    });
+    updateCheckJobs.start([&](const UpdateCheckReq& req) -> UpdateCheckResult {
+        UpdateCheckResult out;
+        out.generation = req.generation;
+        std::string err;
+        romm::HttpTransaction tx;
+        romm::HttpRequestOptions opt;
+        opt.timeoutSec = (config.httpTimeoutSeconds > 0) ? config.httpTimeoutSeconds : 20;
+        opt.keepAlive = true;
+        opt.decodeChunked = true;
+        opt.maxBodyBytes = 2 * 1024 * 1024;
+
+        std::vector<std::pair<std::string, std::string>> headers;
+        headers.emplace_back("User-Agent", "romm-switch-client");
+        headers.emplace_back("Accept", "application/vnd.github+json");
+
+        if (!romm::httpRequestBuffered("GET", kUpdateLatestUrl, headers, opt, tx, err)) {
+            out.ok = false;
+            out.error = err;
+            out.errorInfo = romm::classifyError(err, romm::ErrorCategory::Network);
+            return out;
+        }
+        if (tx.parsed.statusCode != 200) {
+            out.ok = false;
+            out.error = "GitHub latest release request failed (HTTP " + std::to_string(tx.parsed.statusCode) + ")";
+            out.errorInfo.category = romm::ErrorCategory::Network;
+            out.errorInfo.code = romm::ErrorCode::HttpStatus;
+            out.errorInfo.httpStatus = tx.parsed.statusCode;
+            out.errorInfo.retryable = false;
+            out.errorInfo.userMessage = "GitHub API request failed.";
+            out.errorInfo.detail = out.error;
+            return out;
+        }
+
+        romm::GitHubRelease rel;
+        if (!romm::parseGitHubLatestReleaseJson(tx.body, rel, err)) {
+            out.ok = false;
+            out.error = err;
+            out.errorInfo = romm::classifyError(err, romm::ErrorCategory::Data);
+            return out;
+        }
+        romm::GitHubAsset asset;
+        if (!romm::pickReleaseNroAsset(rel, asset, err, "romm-switch-client.nro")) {
+            out.ok = false;
+            out.release = rel;
+            out.error = err;
+            out.errorInfo = romm::classifyError(err, romm::ErrorCategory::Data);
+            return out;
+        }
+
+        out.ok = true;
+        out.release = std::move(rel);
+        out.asset = std::move(asset);
+        out.updateAvailable = (romm::compareVersions(out.release.tagName, romm::appVersion()) > 0);
+        return out;
+    });
+    updateDownloadJobs.start([&](const UpdateDownloadReq& req) -> UpdateDownloadResult {
+        UpdateDownloadResult out;
+        out.generation = req.generation;
+        out.outPath = req.outPath;
+        std::string err;
+
+        const std::string tmp = req.outPath + ".part";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) {
+            out.ok = false;
+            out.error = "Failed to open update temp file for write: " + tmp;
+            out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Filesystem);
+            return out;
+        }
+
+        romm::HttpRequestOptions opt;
+        opt.timeoutSec = (config.httpTimeoutSeconds > 0) ? config.httpTimeoutSeconds : 20;
+        opt.keepAlive = false;
+        opt.decodeChunked = true;
+        opt.followRedirects = true; // GitHub asset downloads commonly redirect to a CDN host
+
+        std::vector<std::pair<std::string, std::string>> headers;
+        headers.emplace_back("User-Agent", "romm-switch-client");
+        romm::ParsedHttpResponse parsed;
+
+        uint64_t bytes = 0;
+        bool ok = romm::httpRequestStreamed("GET",
+                                            req.url,
+                                            headers,
+                                            opt,
+                                            parsed,
+                                            [&](const char* data, size_t n) -> bool {
+                                                if (!data || n == 0) return true;
+                                                size_t w = std::fwrite(data, 1, n, f);
+                                                if (w != n) return false;
+                                                bytes += (uint64_t)n;
+                                                return true;
+                                            },
+                                            err);
+        std::fclose(f);
+        out.bytes = bytes;
+        if (!ok) {
+            out.ok = false;
+            out.error = err.empty() ? "Update download failed." : err;
+            out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Network);
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return out;
+        }
+        if (parsed.statusCode != 200) {
+            out.ok = false;
+            out.error = "Update download failed (HTTP " + std::to_string(parsed.statusCode) + ")";
+            out.errorInfo.category = romm::ErrorCategory::Network;
+            out.errorInfo.code = romm::ErrorCode::HttpStatus;
+            out.errorInfo.httpStatus = parsed.statusCode;
+            out.errorInfo.retryable = false;
+            out.errorInfo.userMessage = "Download request failed.";
+            out.errorInfo.detail = out.error;
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return out;
+        }
+
+        // Basic sanity check: NRO magic.
+        if (!romm::fileLooksLikeNro(tmp)) {
+            out.ok = false;
+            out.error = "Downloaded file does not look like a valid NRO.";
+            out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Data);
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return out;
+        }
+
+        std::error_code ec;
+        std::filesystem::remove(req.outPath, ec); // overwrite any prior staged file
+        ec.clear();
+        std::filesystem::rename(tmp, req.outPath, ec);
+        if (ec) {
+            out.ok = false;
+            out.error = "Failed to finalize staged update: " + ec.message();
+            out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Filesystem);
+            std::error_code ec2;
+            std::filesystem::remove(tmp, ec2);
+            return out;
+        }
+
+        // Write the pending pointer so the update can be applied on next launch.
+        if (!romm::writeTextFileEnsureParent(kUpdatePendingPath, req.outPath)) {
+            out.ok = false;
+            out.error = std::string("Failed to record pending update (") + kUpdatePendingPath + ")";
+            out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Filesystem);
+            return out;
+        }
+
+        out.ok = true;
         return out;
     });
 
@@ -2230,6 +2590,30 @@ int main(int argc, char** argv) {
         romm::logLine(" server_url=" + config.serverUrl);
         romm::logLine(" download_dir=" + config.downloadDir);
         romm::logLine(std::string(" fat32_safe=") + (config.fat32Safe ? "true" : "false"));
+
+        // Updater storage lives under the download cache root to keep /switch tidy.
+        // We also keep a fixed pending pointer file under /switch/romm_switch_client/.
+        {
+            const std::string updateDir = romm::computeUpdateDirFromDownloadDir(config.downloadDir);
+            romm::ensureDirectory(updateDir);
+            const std::string defaultStagedPath = romm::defaultStagedUpdatePath(updateDir);
+            const std::string bakPath = romm::defaultBackupPath(updateDir);
+
+            std::string pending;
+            bool pendingOk = romm::readTextFileTrim(kUpdatePendingPath, pending) && !pending.empty();
+            const std::string effectiveStagedPath = pendingOk ? pending : defaultStagedPath;
+            bool stagedExists = romm::fileExists(effectiveStagedPath);
+
+            std::lock_guard<std::mutex> lock(status.mutex);
+            status.updateStagedPath = effectiveStagedPath;
+            status.updateDownloaded = pendingOk || stagedExists;
+            status.updateStatus = status.updateDownloaded ? "Update staged; restart app to apply." : status.updateStatus;
+            // Reuse fields to show where backups live; helps debugging.
+            if (status.updateDownloaded) {
+                status.updateAssetName = status.updateAssetName.empty() ? "romm-switch-client.nro" : status.updateAssetName;
+            }
+            (void)bakPath;
+        }
         // Load platform prefs and stash in status for planner use.
         {
             std::lock_guard<std::mutex> lock(status.mutex);
@@ -2538,6 +2922,44 @@ int main(int argc, char** argv) {
                     : probe->detail + " (" + romm::errorCodeLabel(probe->errorInfo.code) + ")";
             }
         }
+        if (auto upd = updateCheckJobs.pollResult()) {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            if (upd->generation == updateCheckGenSubmitted) {
+                status.updateCheckInFlight = false;
+                status.updateChecked = upd->ok;
+                status.updateError.clear();
+                status.updateStatus.clear();
+                if (!upd->ok) {
+                    status.updateError = upd->error.empty() ? "Update check failed." : upd->error;
+                    status.updateStatus = "Press A to retry.";
+                } else {
+                    status.updateLatestTag = upd->release.tagName;
+                    status.updateLatestName = upd->release.name;
+                    status.updateLatestPublishedAt = upd->release.publishedAt;
+                    status.updateReleaseHtmlUrl = upd->release.htmlUrl;
+                    status.updateAssetName = upd->asset.name;
+                    status.updateAssetUrl = upd->asset.downloadUrl;
+                    status.updateAssetSizeBytes = upd->asset.sizeBytes;
+                    status.updateAvailable = upd->updateAvailable;
+                    status.updateStatus = upd->updateAvailable ? "Update available." : "Up to date.";
+                }
+            }
+        }
+        if (auto dl = updateDownloadJobs.pollResult()) {
+            std::lock_guard<std::mutex> lock(status.mutex);
+            if (dl->generation == updateDownloadGenSubmitted) {
+                status.updateDownloadInFlight = false;
+                status.updateError.clear();
+                if (!dl->ok) {
+                    status.updateDownloaded = false;
+                    status.updateError = dl->error.empty() ? "Update download failed." : dl->error;
+                    status.updateStatus = "Download failed. Press X to retry.";
+                } else {
+                    status.updateDownloaded = true;
+                    status.updateStatus = "Download complete. Restart app to apply.";
+                }
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(status.mutex);
             bool needRebuild = false;
@@ -2700,6 +3122,11 @@ int main(int argc, char** argv) {
                     {
                         std::lock_guard<std::mutex> lock(status.mutex);
                         currentView = status.currentView;
+                    }
+                    if (currentView == Status::View::UPDATER) {
+                        submitUpdateCheck();
+                        viewChangedThisFrame = true;
+                        break;
                     }
                     if (currentView == Status::View::QUEUE) {
                         bool didToggle = false;
@@ -3071,6 +3498,23 @@ int main(int argc, char** argv) {
                     if (shouldProbe) submitDiagnosticsProbe();
                     break;
                 }
+                case romm::Action::OpenUpdater: {
+                    bool opened = false;
+                    {
+                        std::lock_guard<std::mutex> lock(status.mutex);
+                        if (status.currentView == Status::View::PLATFORMS) {
+                            status.prevUpdaterView = status.currentView;
+                            status.currentView = Status::View::UPDATER;
+                            opened = true;
+                        }
+                    }
+                    if (opened) {
+                        romm::logLine("Opened UPDATER view.");
+                        gViewTraceFrames = 6;
+                        viewChangedThisFrame = true;
+                    }
+                    break;
+                }
                 case romm::Action::Back: {
                     // B/Back: navigate up one level or return from queue
                     Status::View cur;
@@ -3138,6 +3582,11 @@ int main(int argc, char** argv) {
                             gViewTraceFrames = 8;
                             romm::logLine(std::string("Back from DIAGNOSTICS to ") + viewName(status.currentView) + ".");
                             viewChangedThisFrame = true;
+                        } else if (cur == Status::View::UPDATER) {
+                            status.currentView = status.prevUpdaterView;
+                            gViewTraceFrames = 8;
+                            romm::logLine(std::string("Back from UPDATER to ") + viewName(status.currentView) + ".");
+                            viewChangedThisFrame = true;
                         } else if (cur == Status::View::ERROR) {
                             running = false;
                         }
@@ -3164,6 +3613,18 @@ int main(int argc, char** argv) {
                     viewChangedThisFrame = true;
                     break;
                 case romm::Action::StartDownload:
+                    {
+                        Status::View v;
+                        {
+                            std::lock_guard<std::mutex> lock(status.mutex);
+                            v = status.currentView;
+                        }
+                        if (v == Status::View::UPDATER) {
+                            submitUpdateDownload();
+                            viewChangedThisFrame = true;
+                            break;
+                        }
+                    }
                     // X in QUEUE: start downloads and show downloading view
                     // TODO(queue UX): dedupe entries and surface per-item failures/history in UI.
                     {

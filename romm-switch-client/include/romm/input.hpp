@@ -13,6 +13,7 @@ enum class Action {
     Select,
     OpenSearch,
     OpenDiagnostics,
+    OpenUpdater,
     OpenQueue,
     Back,
     StartDownload,

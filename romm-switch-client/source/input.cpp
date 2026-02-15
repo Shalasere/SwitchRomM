@@ -18,6 +18,7 @@ Action translateEvent(const SDL_Event& e) {
     // - X (top)    -> start downloads
     // - Minus      -> search
     // - R          -> diagnostics
+    // - L          -> updater
     //
     // SDL positional codes (with SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS=0):
     // - A = bottom (B on Nintendo)
@@ -49,6 +50,7 @@ Action translateEvent(const SDL_Event& e) {
             case SDL_CONTROLLER_BUTTON_Y: act = Action::StartDownload; break;   // top (X) -> start downloads
             case SDL_CONTROLLER_BUTTON_BACK: act = Action::OpenSearch; break;   // Minus -> search
             case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: act = Action::OpenDiagnostics; break; // R -> diagnostics
+            case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: act = Action::OpenUpdater; break; // L -> updater
             case SDL_CONTROLLER_BUTTON_START: act = Action::Quit; break;        // Plus -> exit app
             default: break;
         }

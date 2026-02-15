@@ -39,6 +39,7 @@ struct HttpRequestOptions {
     bool keepAlive{false};
     bool decodeChunked{true};
     size_t maxBodyBytes{0}; // 0 = unlimited
+    bool followRedirects{false}; // off by default (avoid auth leaks / unexpected cross-host redirects)
     std::atomic<bool>* cancelRequested{nullptr};
     std::atomic<int>* activeSocketFd{nullptr};
 };
