@@ -3791,6 +3791,9 @@ exit_app:
     romFetchJobs.stop();
     remoteSearchJobs.stop();
     diagProbeJobs.stop();
+    // Stop updater workers explicitly before tearing down sockets/NIFM.
+    updateCheckJobs.stop();
+    updateDownloadJobs.stop();
     // Restore default sleep/dim behavior on exit.
     appletSetMediaPlaybackState(false);
     appletSetAutoSleepDisabled(false);
@@ -3803,7 +3806,9 @@ exit_app:
     gCoverLoader.stop();
     psmExit();
     timeExit();
-    fsdevUnmountAll();
+    // Avoid unmounting SD here: the logger holds an ofstream, and unmounting while handles
+    // are still live can destabilize hbmenu on return. libnx will clean up mounts on exit.
+    romm::shutdownLogFile();
     nifmExit();
     socketExit();
     return 0;

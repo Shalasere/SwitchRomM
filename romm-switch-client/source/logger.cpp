@@ -35,6 +35,16 @@ void initLogFile() {
     }
 }
 
+void shutdownLogFile() {
+    std::lock_guard<std::mutex> lock(gLogMutex);
+    gLogReady = false;
+    gLogBytes = 0;
+    if (gLogFile.is_open()) {
+        gLogFile.flush();
+        gLogFile.close();
+    }
+}
+
 void setLogLevel(LogLevel level) { gMinLevel = level; }
 
 void setLogLevelFromString(const std::string& level) {
