@@ -1923,6 +1923,7 @@ int main(int argc, char** argv) {
         uint64_t generation{0};
         std::string url;
         std::string outPath;
+        uint64_t expectedSizeBytes{0};
     };
     struct UpdateDownloadResult {
         uint64_t generation{0};
@@ -2362,6 +2363,7 @@ int main(int argc, char** argv) {
             req.url = status.updateAssetUrl;
             // Always stage to the configured cache location (not the startup-only pending path).
             req.outPath = defaultStagedPath;
+            req.expectedSizeBytes = status.updateAssetSizeBytes;
             status.updateStagedPath = req.outPath;
             status.updateDownloadInFlight = true;
             status.updateDownloaded = false;
@@ -2456,6 +2458,7 @@ int main(int argc, char** argv) {
 
         std::vector<std::pair<std::string, std::string>> headers;
         headers.emplace_back("User-Agent", "romm-switch-client");
+        headers.emplace_back("Accept", "application/octet-stream");
         romm::ParsedHttpResponse parsed;
 
         uint64_t bytes = 0;
@@ -2496,13 +2499,65 @@ int main(int argc, char** argv) {
             return out;
         }
 
+        // Optional sanity check: ensure byte size matches the GitHub asset metadata.
+        // If this fails, keep the payload for inspection; it may be an error page.
+        bool sizeMismatch = (req.expectedSizeBytes > 0 && bytes != req.expectedSizeBytes);
+
         // Basic sanity check: NRO magic.
-        if (!romm::fileLooksLikeNro(tmp)) {
-            out.ok = false;
-            out.error = "Downloaded file does not look like a valid NRO.";
-            out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Data);
+        if (!romm::fileLooksLikeNro(tmp) || sizeMismatch) {
+            // Read a small prefix so we can diagnose HTML/JSON error pages on-device.
+            std::string prefixHex;
+            std::string prefixAscii;
+            {
+                std::FILE* rf = std::fopen(tmp.c_str(), "rb");
+                if (rf) {
+                    unsigned char buf[64]{};
+                    size_t rn = std::fread(buf, 1, sizeof(buf), rf);
+                    std::fclose(rf);
+                    prefixHex.reserve(rn * 3);
+                    prefixAscii.reserve(rn);
+                    static const char* kHex = "0123456789ABCDEF";
+                    for (size_t i = 0; i < rn; ++i) {
+                        unsigned char b = buf[i];
+                        prefixHex.push_back(kHex[(b >> 4) & 0xF]);
+                        prefixHex.push_back(kHex[b & 0xF]);
+                        if (i + 1 < rn) prefixHex.push_back(' ');
+                        unsigned char c = buf[i];
+                        prefixAscii.push_back((c >= 32 && c < 127) ? static_cast<char>(c) : '.');
+                    }
+                }
+            }
+
+            // Keep the bad payload for inspection instead of deleting it.
+            const std::string bad = req.outPath + ".bad";
             std::error_code ec;
-            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(bad, ec);
+            ec.clear();
+            std::filesystem::rename(tmp, bad, ec);
+            if (ec) {
+                // If rename failed, fall back to deleting the temp to avoid leaving junk behind.
+                std::error_code ec2;
+                std::filesystem::remove(tmp, ec2);
+            }
+
+            out.ok = false;
+            if (sizeMismatch) {
+                out.error = "Downloaded update size mismatch (got " + std::to_string(bytes) +
+                            ", expected " + std::to_string(req.expectedSizeBytes) + ").";
+            } else {
+                out.error = "Downloaded file does not look like a valid NRO.";
+            }
+            if (!prefixHex.empty()) {
+                out.error += " Prefix(hex): " + prefixHex;
+                out.error += " Prefix(ascii): " + prefixAscii;
+            }
+            out.error += " Saved as: " + bad;
+
+            // Dump headers to log for support.
+            if (!parsed.headersRaw.empty()) {
+                romm::logLine("Update download headers:\n" + parsed.headersRaw);
+            }
+            out.errorInfo = romm::classifyError(out.error, romm::ErrorCategory::Data);
             return out;
         }
 
