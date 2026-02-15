@@ -28,7 +28,7 @@ ROMFS       := romfs
 
 APP_TITLE   := RomM Switch Client
 APP_AUTHOR  := Shalasere
-APP_VERSION := 0.2.7
+APP_VERSION := 0.2.8
 ICON        := assets/icon.jpg
 
 CURL_CFLAGS := $(shell curl-config --cflags 2>/dev/null)
