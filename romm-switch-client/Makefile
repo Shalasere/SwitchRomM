@@ -45,7 +45,7 @@ ARCH        := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS      := -g -Wall -O2 -ffunction-sections \
                $(ARCH) $(DEFINES) $(CURL_CFLAGS)
 
-CFLAGS      += $(INCLUDE) -D__SWITCH__
+CFLAGS      += $(INCLUDE) -D__SWITCH__ -DROMM_APP_VERSION=\"$(APP_VERSION)\"
 
 CXXFLAGS    := $(CFLAGS) -std=gnu++17 -fno-rtti -fno-exceptions
 

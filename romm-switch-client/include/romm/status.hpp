@@ -42,7 +42,7 @@ struct Status {
     bool validCredentials{false};
 
     // Current UI/view state
-    enum class View { PLATFORMS, ROMS, DETAIL, QUEUE, ERROR, DOWNLOADING, DIAGNOSTICS } currentView{View::PLATFORMS};
+    enum class View { PLATFORMS, ROMS, DETAIL, QUEUE, ERROR, DOWNLOADING, DIAGNOSTICS, UPDATER } currentView{View::PLATFORMS};
 
     // Data loaded from API
     std::vector<Platform> platforms;
@@ -68,6 +68,7 @@ struct Status {
     std::vector<View> navStack; // simple stack for PLATFORMS -> ROMS -> DETAIL navigation
     View prevQueueView{View::ROMS}; // where to return when leaving queue
     View prevDiagnosticsView{View::PLATFORMS}; // where to return when leaving diagnostics
+    View prevUpdaterView{View::PLATFORMS}; // where to return when leaving updater
 
     // Download queue and progress
     std::vector<QueueItem> downloadQueue;
@@ -113,6 +114,23 @@ struct Status {
     uint64_t diagnosticsProbeGeneration{0};
     uint32_t diagnosticsLastProbeMs{0};
     std::string diagnosticsLastProbeDetail;
+
+    // Updater state (GitHub latest release check + staged .nro download)
+    bool updateCheckInFlight{false};
+    bool updateChecked{false};
+    bool updateAvailable{false};
+    std::string updateLatestTag;
+    std::string updateLatestName;
+    std::string updateLatestPublishedAt;
+    std::string updateReleaseHtmlUrl;
+    std::string updateAssetName;
+    std::string updateAssetUrl;
+    uint64_t updateAssetSizeBytes{0};
+    bool updateDownloadInFlight{false};
+    bool updateDownloaded{false};
+    std::string updateStagedPath;
+    std::string updateStatus;
+    std::string updateError;
 };
 
 // Helper to run a callable while holding the status mutex, returning its result.
