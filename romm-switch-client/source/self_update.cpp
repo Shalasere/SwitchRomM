@@ -59,10 +59,17 @@ void removeFileBestEffort(const std::string& path) {
 bool fileLooksLikeNro(const std::string& path) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
-    char magic[4]{};
-    size_t n = std::fread(magic, 1, sizeof(magic), f);
+    // NRO files have the "NRO0" magic at offset 0x10 (preceded by a small startup header).
+    // Some tools may produce files with "NRO0" at offset 0; accept both.
+    unsigned char hdr[0x14]{};
+    size_t n = std::fread(hdr, 1, sizeof(hdr), f);
     std::fclose(f);
-    return n == sizeof(magic) && magic[0] == 'N' && magic[1] == 'R' && magic[2] == 'O' && magic[3] == '0';
+    if (n < 4) return false;
+    auto isMagicAt = [&](size_t off) -> bool {
+        if (n < off + 4) return false;
+        return hdr[off + 0] == 'N' && hdr[off + 1] == 'R' && hdr[off + 2] == 'O' && hdr[off + 3] == '0';
+    };
+    return isMagicAt(0) || isMagicAt(0x10);
 }
 
 std::string computeUpdateDirFromDownloadDir(const std::string& downloadDir) {
@@ -138,4 +145,3 @@ ApplySelfUpdateResult applyPendingSelfUpdate(const std::string& selfNroPath,
 }
 
 } // namespace romm
-

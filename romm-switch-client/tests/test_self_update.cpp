@@ -66,6 +66,19 @@ TEST_CASE("self_update: computeUpdateDirFromDownloadDir") {
             "sdmc:/romm_cache/app_update");
 }
 
+TEST_CASE("self_update: fileLooksLikeNro accepts magic at offset 0x10") {
+    auto dir = makeTempDir();
+    auto p = (dir / "test.nro").string();
+    // Minimal NRO-like header: 0x10 bytes of junk, then "NRO0".
+    std::string data(0x10, '\0');
+    data += "NRO0";
+    data += "rest";
+    writeAll(p, data);
+    REQUIRE(romm::fileLooksLikeNro(p));
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 TEST_CASE("self_update: readTextFileTrim trims whitespace") {
     auto dir = makeTempDir();
     auto p = (dir / "pending.txt").string();
@@ -167,7 +180,11 @@ TEST_CASE("self_update: applyPendingSelfUpdate applies staged file and keeps onl
     writeAll(bak, "OLD_BAK");
 
     auto staged = (updateDir / "romm-switch-client.nro.new").string();
-    writeAll(staged, std::string("NRO0") + "NEW_SELF");
+    // Match real NRO structure (magic at 0x10).
+    std::string nro(0x10, '\0');
+    nro += "NRO0";
+    nro += "NEW_SELF";
+    writeAll(staged, nro);
     writeAll(staged + ".part", "partial");
 
     auto pending = (dir / "update_pending.txt").string();
@@ -182,8 +199,8 @@ TEST_CASE("self_update: applyPendingSelfUpdate applies staged file and keeps onl
     REQUIRE_FALSE(std::filesystem::exists(staged));
     REQUIRE_FALSE(std::filesystem::exists(staged + ".part"));
 
-    // Self now has the NRO magic.
-    REQUIRE(readAll(self).rfind("NRO0", 0) == 0);
+    // Self now looks like an NRO (magic at 0x10 is accepted).
+    REQUIRE(romm::fileLooksLikeNro(self));
     // Backup contains the previous self content, not the old backup content.
     REQUIRE(readAll(bak) == "OLD_SELF");
 
