@@ -1109,7 +1109,7 @@ bool enrichGameWithFiles(const Config& cfg, Game& g, std::string& outError, Erro
         }
         std::string finalUrl = absolutizeUrl(downloadUrlField);
         if (finalUrl.empty() && !fid.empty() && !fname.empty()) {
-            finalUrl = cfg.serverUrl + "/api/romsfiles/" + fid + "/content/" + romm::util::urlEncode(fname);
+            finalUrl = cfg.serverUrl + "/api/roms/" + fid + "/files/content/" + romm::util::urlEncode(fname);
         }
 
         if (fname.empty() || fid.empty() || fsize == 0 || finalUrl.empty()) {
